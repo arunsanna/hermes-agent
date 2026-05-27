@@ -768,13 +768,76 @@ class _CodexCompletionsAdapter:
                 # new failure mode for auxiliary calls.
                 pass
 
+        # Collect output items and text deltas during streaming. The Codex
+        # backend can return empty or None response.output from
+        # get_final_response() even when items were streamed.
+        collected_output_items: List[Any] = []
+        collected_text_deltas: List[str] = []
+        has_function_calls = False
+
+        def _response_from_collected_stream() -> Optional[Any]:
+            if collected_output_items:
+                return SimpleNamespace(
+                    status="completed",
+                    output=list(collected_output_items),
+                )
+            if collected_text_deltas and not has_function_calls:
+                assembled = "".join(collected_text_deltas)
+                return SimpleNamespace(
+                    status="completed",
+                    output=[SimpleNamespace(
+                        type="message", role="assistant", status="completed",
+                        content=[SimpleNamespace(type="output_text", text=assembled)],
+                    )],
+                )
+            return None
+
+        def _item_get(obj: Any, key: str, default: Any = None) -> Any:
+            val = getattr(obj, key, None)
+            if val is None and isinstance(obj, dict):
+                val = obj.get(key, default)
+            return val if val is not None else default
+
+        def _ingest_response_output(final_response: Any) -> None:
+            output_items = getattr(final_response, "output", None)
+            if not isinstance(output_items, list):
+                output_items = []
+            for item in output_items:
+                item_type = _item_get(item, "type")
+                if item_type == "message":
+                    for part in (_item_get(item, "content") or []):
+                        ptype = _item_get(part, "type")
+                        if ptype in {"output_text", "text"}:
+                            text_parts.append(_item_get(part, "text", ""))
+                elif item_type == "function_call":
+                    tool_calls_raw.append(SimpleNamespace(
+                        id=_item_get(item, "call_id", ""),
+                        type="function",
+                        function=SimpleNamespace(
+                            name=_item_get(item, "name", ""),
+                            arguments=_item_get(item, "arguments", "{}"),
+                        ),
+                    ))
+
+        def _build_chat_response() -> Any:
+            content = "".join(text_parts).strip() or None
+            message = SimpleNamespace(
+                role="assistant",
+                content=content,
+                tool_calls=tool_calls_raw or None,
+            )
+            choice = SimpleNamespace(
+                index=0,
+                message=message,
+                finish_reason="stop" if not tool_calls_raw else "tool_calls",
+            )
+            return SimpleNamespace(
+                choices=[choice],
+                model=model,
+                usage=usage,
+            )
+
         try:
-            # Collect output items and text deltas during streaming —
-            # the Codex backend can return empty response.output from
-            # get_final_response() even when items were streamed.
-            collected_output_items: List[Any] = []
-            collected_text_deltas: List[str] = []
-            has_function_calls = False
             if total_timeout:
                 timeout_timer = threading.Timer(float(total_timeout), _close_client_on_timeout)
                 timeout_timer.daemon = True
@@ -795,56 +858,28 @@ class _CodexCompletionsAdapter:
                     elif "function_call" in _etype:
                         has_function_calls = True
                 _check_cancelled()
-                final = stream.get_final_response()
+                try:
+                    final = stream.get_final_response()
+                except TypeError as exc:
+                    if "'NoneType' object is not iterable" not in str(exc):
+                        raise
+                    final = _response_from_collected_stream()
+                    if final is None:
+                        raise
 
             # Backfill empty output from collected stream events
             _output = getattr(final, "output", None)
-            if isinstance(_output, list) and not _output:
-                if collected_output_items:
-                    final.output = list(collected_output_items)
+            if not isinstance(_output, list) or not _output:
+                backfilled = _response_from_collected_stream()
+                if backfilled is not None:
+                    final.output = backfilled.output
                     logger.debug(
-                        "Codex auxiliary: backfilled %d output items from stream events",
-                        len(collected_output_items),
-                    )
-                elif collected_text_deltas and not has_function_calls:
-                    # Only synthesize text when no tool calls were streamed —
-                    # a function_call response with incidental text should not
-                    # be collapsed into a plain-text message.
-                    assembled = "".join(collected_text_deltas)
-                    final.output = [SimpleNamespace(
-                        type="message", role="assistant", status="completed",
-                        content=[SimpleNamespace(type="output_text", text=assembled)],
-                    )]
-                    logger.debug(
-                        "Codex auxiliary: synthesized from %d deltas (%d chars)",
-                        len(collected_text_deltas), len(assembled),
+                        "Codex auxiliary: backfilled final output from stream events"
                     )
 
-            # Extract text and tool calls from the Responses output.
-            # Items may be SDK objects (attrs) or dicts (raw/fallback paths),
-            # so use a helper that handles both shapes.
-            def _item_get(obj: Any, key: str, default: Any = None) -> Any:
-                val = getattr(obj, key, None)
-                if val is None and isinstance(obj, dict):
-                    val = obj.get(key, default)
-                return val if val is not None else default
-
-            for item in getattr(final, "output", []):
-                item_type = _item_get(item, "type")
-                if item_type == "message":
-                    for part in (_item_get(item, "content") or []):
-                        ptype = _item_get(part, "type")
-                        if ptype in {"output_text", "text"}:
-                            text_parts.append(_item_get(part, "text", ""))
-                elif item_type == "function_call":
-                    tool_calls_raw.append(SimpleNamespace(
-                        id=_item_get(item, "call_id", ""),
-                        type="function",
-                        function=SimpleNamespace(
-                            name=_item_get(item, "name", ""),
-                            arguments=_item_get(item, "arguments", "{}"),
-                        ),
-                    ))
+            # Extract text and tool calls from the Responses output. Items may
+            # be SDK objects (attrs) or dicts (raw/fallback paths).
+            _ingest_response_output(final)
 
             resp_usage = getattr(final, "usage", None)
             if resp_usage:
@@ -856,30 +891,21 @@ class _CodexCompletionsAdapter:
         except Exception as exc:
             if timed_out.is_set():
                 raise TimeoutError(_timeout_message()) from exc
+            if isinstance(exc, TypeError) and "'NoneType' object is not iterable" in str(exc):
+                recovered = _response_from_collected_stream()
+                if recovered is not None:
+                    logger.debug(
+                        "Codex auxiliary Responses stream recovered after SDK NoneType iterator error"
+                    )
+                    _ingest_response_output(recovered)
+                    return _build_chat_response()
             logger.debug("Codex auxiliary Responses API call failed: %s", exc)
             raise
         finally:
             if timeout_timer is not None:
                 timeout_timer.cancel()
 
-        content = "".join(text_parts).strip() or None
-
-        # Build a response that looks like chat.completions
-        message = SimpleNamespace(
-            role="assistant",
-            content=content,
-            tool_calls=tool_calls_raw or None,
-        )
-        choice = SimpleNamespace(
-            index=0,
-            message=message,
-            finish_reason="stop" if not tool_calls_raw else "tool_calls",
-        )
-        return SimpleNamespace(
-            choices=[choice],
-            model=model,
-            usage=usage,
-        )
+        return _build_chat_response()
 
 
 class _CodexChatShim:

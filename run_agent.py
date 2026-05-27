@@ -7102,6 +7102,26 @@ class AIAgent:
         # returns empty output (e.g. chatgpt.com backend-api sends
         # response.incomplete instead of response.completed).
         self._codex_streamed_text_parts: list = []
+
+        def _response_from_collected_stream(collected_output_items: list):
+            if collected_output_items:
+                return SimpleNamespace(
+                    status="completed",
+                    output=list(collected_output_items),
+                )
+            if self._codex_streamed_text_parts and not has_tool_calls:
+                assembled = "".join(self._codex_streamed_text_parts)
+                return SimpleNamespace(
+                    status="completed",
+                    output=[SimpleNamespace(
+                        type="message",
+                        role="assistant",
+                        status="completed",
+                        content=[SimpleNamespace(type="output_text", text=assembled)],
+                    )],
+                )
+            return None
+
         for attempt in range(max_stream_retries + 1):
             if self._interrupt_requested:
                 raise InterruptedError("Agent interrupted before Codex stream retry")
@@ -7155,29 +7175,34 @@ class AIAgent:
                                 sum(len(p) for p in self._codex_streamed_text_parts),
                                 self._client_log_context(),
                             )
-                    final_response = stream.get_final_response()
+                    try:
+                        final_response = stream.get_final_response()
+                    except TypeError as exc:
+                        if "'NoneType' object is not iterable" not in str(exc):
+                            raise
+                        backfilled_response = _response_from_collected_stream(collected_output_items)
+                        if backfilled_response is not None:
+                            logger.debug(
+                                "Codex stream: recovered final response after SDK NoneType output iterator error"
+                            )
+                            return backfilled_response
+                        logger.debug(
+                            "Codex stream finalization hit SDK NoneType output iterator error; "
+                            "falling back to create(stream=True). %s err=%s",
+                            self._client_log_context(),
+                            exc,
+                        )
+                        return self._run_codex_create_stream_fallback(api_kwargs, client=active_client)
                     # PATCH: ChatGPT Codex backend streams valid output items
                     # but get_final_response() can return an empty output list.
                     # Backfill from collected items or synthesize from deltas.
                     _out = getattr(final_response, "output", None)
-                    if isinstance(_out, list) and not _out:
-                        if collected_output_items:
-                            final_response.output = list(collected_output_items)
+                    if not isinstance(_out, list) or not _out:
+                        backfilled_response = _response_from_collected_stream(collected_output_items)
+                        if backfilled_response is not None:
+                            final_response.output = backfilled_response.output
                             logger.debug(
-                                "Codex stream: backfilled %d output items from stream events",
-                                len(collected_output_items),
-                            )
-                        elif self._codex_streamed_text_parts and not has_tool_calls:
-                            assembled = "".join(self._codex_streamed_text_parts)
-                            final_response.output = [SimpleNamespace(
-                                type="message",
-                                role="assistant",
-                                status="completed",
-                                content=[SimpleNamespace(type="output_text", text=assembled)],
-                            )]
-                            logger.debug(
-                                "Codex stream: synthesized output from %d text deltas (%d chars)",
-                                len(self._codex_streamed_text_parts), len(assembled),
+                                "Codex stream: backfilled final response output from stream events"
                             )
                     return final_response
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
@@ -7244,6 +7269,21 @@ class AIAgent:
                     )
                     return self._run_codex_create_stream_fallback(api_kwargs, client=active_client)
                 raise
+            except TypeError as exc:
+                if "'NoneType' object is not iterable" not in str(exc):
+                    raise
+                backfilled_response = _response_from_collected_stream(collected_output_items)
+                if backfilled_response is not None:
+                    logger.debug(
+                        "Codex stream: recovered response after SDK NoneType stream iterator error"
+                    )
+                    return backfilled_response
+                logger.debug(
+                    "Codex stream hit SDK NoneType iterator error; falling back to create(stream=True). %s err=%s",
+                    self._client_log_context(),
+                    exc,
+                )
+                return self._run_codex_create_stream_fallback(api_kwargs, client=active_client)
 
     def _run_codex_create_stream_fallback(self, api_kwargs: dict, client: Any = None):
         """Fallback path for stream completion edge cases on Codex-style Responses backends."""
@@ -7292,7 +7332,7 @@ class AIAgent:
                 if terminal_response is not None:
                     # Backfill empty output from collected stream events
                     _out = getattr(terminal_response, "output", None)
-                    if isinstance(_out, list) and not _out:
+                    if not isinstance(_out, list) or not _out:
                         if collected_output_items:
                             terminal_response.output = list(collected_output_items)
                             logger.debug(
@@ -7311,6 +7351,33 @@ class AIAgent:
                                 len(collected_text_deltas), len(assembled),
                             )
                     return terminal_response
+        except TypeError as exc:
+            if "'NoneType' object is not iterable" not in str(exc):
+                raise
+            if collected_output_items:
+                logger.debug(
+                    "Codex fallback stream: recovered %d output items after SDK NoneType iterator error",
+                    len(collected_output_items),
+                )
+                return SimpleNamespace(
+                    status="completed",
+                    output=list(collected_output_items),
+                )
+            if collected_text_deltas:
+                assembled = "".join(collected_text_deltas)
+                logger.debug(
+                    "Codex fallback stream: synthesized from %d deltas after SDK NoneType iterator error",
+                    len(collected_text_deltas),
+                )
+                return SimpleNamespace(
+                    status="completed",
+                    output=[SimpleNamespace(
+                        type="message", role="assistant",
+                        status="completed",
+                        content=[SimpleNamespace(type="output_text", text=assembled)],
+                    )],
+                )
+            raise
         finally:
             close_fn = getattr(stream_or_response, "close", None)
             if callable(close_fn):
