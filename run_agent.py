@@ -9843,6 +9843,7 @@ class AIAgent:
             # AWS Bedrock runtime endpoints — defense-in-depth when
             # ``provider`` is unset but ``base_url`` still names Bedrock.
             or "bedrock-runtime." in base
+            or "api.z.ai" in base
         )
 
     def _is_qwen_portal(self) -> bool:

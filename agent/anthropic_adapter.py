@@ -987,7 +987,17 @@ def resolve_anthropic_token() -> Optional[str]:
 
     # 4. Regular API key, or a legacy OAuth token saved in ANTHROPIC_API_KEY.
     # This remains as a compatibility fallback for pre-migration Hermes configs.
+    # Check os.environ first, then fall back to .hermes/home/.env so that
+    # keys placed there (e.g. ZAI coding plan key for Anthropic-compat
+    # endpoints) are found even when the parent process (Switchboard
+    # gateway) does not export the var into the child process environment.
     api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        try:
+            from hermes_cli.config import get_env_value
+            api_key = (get_env_value("ANTHROPIC_API_KEY") or "").strip()
+        except Exception:
+            pass
     if api_key:
         return api_key
 
