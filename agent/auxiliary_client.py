@@ -1348,11 +1348,11 @@ def _resolve_xai_oauth_for_aux() -> Optional[Tuple[str, str]]:
 
 
 def _read_codex_access_token() -> Optional[str]:
-    """Read a valid, non-expired Codex OAuth access token from Hermes auth store.
+    """Read a valid, non-expired Codex OAuth access token from Codex CLI auth.
 
     If a credential pool exists but currently has no selectable runtime entry
     (for example all pool slots are marked exhausted), fall back to the
-    profile's auth.json token instead of hard-failing. This keeps explicit
+    Codex CLI auth token instead of hard-failing. This keeps explicit
     fallback-to-Codex working when the pool state is stale but the stored OAuth
     token is still valid.
     """

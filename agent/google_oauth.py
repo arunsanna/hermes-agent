@@ -10,7 +10,13 @@ Synthesized from:
 - clawdbot/extensions/google/ — refresh-token rotation, VPC-SC handling reference
 - PRs #10176 (@sliverp) and #10779 (@newarthur) — PKCE module structure, cross-process lock
 
-Storage (``~/.hermes/auth/google_oauth.json``, chmod 0o600):
+Storage:
+
+Hermes first reuses the official Gemini CLI OAuth file when present
+(``~/.gemini/oauth_creds.json``). This keeps Gemini CLI login as the source of
+truth for the ``google-gemini-cli`` provider. If the Gemini CLI file is absent,
+Hermes falls back to its managed file (``~/.hermes/auth/google_oauth.json``,
+chmod 0o600):
 
     {
       "refresh": "refreshToken|projectId|managedProjectId",
@@ -21,7 +27,8 @@ Storage (``~/.hermes/auth/google_oauth.json``, chmod 0o600):
 
 The ``refresh`` field packs the refresh_token together with the resolved GCP
 project IDs so subsequent sessions don't need to re-discover the project.
-This matches opencode-gemini-auth's storage contract exactly.
+This Hermes-managed shape matches opencode-gemini-auth's storage contract
+exactly.
 
 The packed format stays parseable even if no project IDs are present — just
 a bare refresh_token is treated as "packed with empty IDs".
@@ -155,6 +162,10 @@ class GoogleOAuthError(RuntimeError):
 
 def _credentials_path() -> Path:
     return get_hermes_home() / "auth" / "google_oauth.json"
+
+
+def _gemini_cli_credentials_path() -> Path:
+    return Path.home() / ".gemini" / "oauth_creds.json"
 
 
 def _lock_path() -> Path:
@@ -426,6 +437,8 @@ class GoogleCredentials:
     email: str = ""
     project_id: str = ""
     managed_project_id: str = ""
+    source_format: str = "hermes"
+    source_path: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -441,6 +454,15 @@ class GoogleCredentials:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "GoogleCredentials":
+        if "access_token" in data or "refresh_token" in data or "expiry_date" in data:
+            return cls(
+                access_token=str(data.get("access_token", "") or ""),
+                refresh_token=str(data.get("refresh_token", "") or ""),
+                expires_ms=int(data.get("expiry_date", 0) or 0),
+                email=str(data.get("email", "") or ""),
+                source_format="gemini-cli",
+            )
+
         refresh_packed = str(data.get("refresh", "") or "")
         parts = RefreshParts.parse(refresh_packed)
         return cls(
@@ -467,11 +489,22 @@ class GoogleCredentials:
 
 def load_credentials() -> Optional[GoogleCredentials]:
     """Load credentials from disk. Returns None if missing or corrupt."""
-    path = _credentials_path()
+    paths = (_gemini_cli_credentials_path(), _credentials_path())
+    for path in paths:
+        creds = _load_credentials_from_path(path)
+        if creds is not None:
+            return creds
+    return None
+
+
+def _load_credentials_from_path(path: Path) -> Optional[GoogleCredentials]:
     if not path.exists():
         return None
     try:
-        with _credentials_lock():
+        if path == _credentials_path():
+            with _credentials_lock():
+                raw = path.read_text(encoding="utf-8")
+        else:
             raw = path.read_text(encoding="utf-8")
         data = json.loads(raw)
     except (json.JSONDecodeError, OSError, IOError) as exc:
@@ -482,11 +515,15 @@ def load_credentials() -> Optional[GoogleCredentials]:
     creds = GoogleCredentials.from_dict(data)
     if not creds.access_token:
         return None
+    creds.source_path = str(path)
     return creds
 
 
 def save_credentials(creds: GoogleCredentials) -> Path:
     """Atomically write creds to disk with 0o600 permissions."""
+    if creds.source_format == "gemini-cli" and creds.source_path:
+        return _save_gemini_cli_credentials(creds, Path(creds.source_path))
+
     path = _credentials_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     # Tighten parent dir to 0o700 so siblings can't traverse to the creds file.
@@ -519,6 +556,51 @@ def save_credentials(creds: GoogleCredentials) -> Path:
                     tmp_path.unlink()
             except OSError:
                 pass
+    return path
+
+
+def _save_gemini_cli_credentials(creds: GoogleCredentials, path: Path) -> Path:
+    """Update the existing Gemini CLI OAuth file without changing its schema."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path.parent, 0o700)
+    except OSError:
+        pass
+
+    payload: Dict[str, Any] = {}
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(existing, dict):
+                payload.update(existing)
+        except (json.JSONDecodeError, OSError, IOError) as exc:
+            logger.warning("Failed to read Gemini CLI OAuth credentials at %s: %s", path, exc)
+
+    payload["access_token"] = creds.access_token
+    payload["refresh_token"] = creds.refresh_token
+    payload["expiry_date"] = int(creds.expires_ms)
+    payload.setdefault("token_type", "Bearer")
+    payload.setdefault("scope", OAUTH_SCOPES)
+
+    serialized = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    tmp_path = path.with_suffix(f".tmp.{os.getpid()}.{secrets.token_hex(4)}")
+    try:
+        fd = os.open(
+            str(tmp_path),
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            stat.S_IRUSR | stat.S_IWUSR,
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(serialized)
+            fh.flush()
+            os.fsync(fh.fileno())
+        atomic_replace(tmp_path, path)
+    finally:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
     return path
 
 
@@ -692,9 +774,10 @@ def get_valid_access_token(*, force_refresh: bool = False) -> str:
                 logger.warning(
                     "Google OAuth refresh token invalid (revoked/expired). "
                     "Clearing credentials at %s — user must re-login.",
-                    _credentials_path(),
+                    creds.source_path or str(_credentials_path()),
                 )
-                clear_credentials()
+                if creds.source_format != "gemini-cli":
+                    clear_credentials()
             raise
 
         new_access = str(resp.get("access_token", "") or "").strip()

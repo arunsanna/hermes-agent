@@ -611,6 +611,9 @@ def build_anthropic_client(
             "anthropic-beta": ",".join(all_betas),
             "user-agent": f"claude-cli/{_get_claude_code_version()} (external, cli)",
             "x-app": "cli",
+            "x-app-name": "claude-code",
+            "x-app-ver": _get_claude_code_version(),
+            "x-anthropic-billing-header": f"cc_version={_get_claude_code_version()}",
         }
     else:
         # Regular API key → x-api-key header + common betas
@@ -963,22 +966,28 @@ def resolve_anthropic_token() -> Optional[str]:
     Returns the token string or None.
     """
     creds = read_claude_code_credentials()
+    ignore_env_tokens = os.getenv(
+        "HERMES_SWITCHBOARD_DEFAULT_ANTHROPIC",
+        "",
+    ).strip().lower() in {"1", "true", "yes", "on"}
 
     # 1. Hermes-managed OAuth/setup token env var
-    token = os.getenv("ANTHROPIC_TOKEN", "").strip()
-    if token:
-        preferred = _prefer_refreshable_claude_code_token(token, creds)
-        if preferred:
-            return preferred
-        return token
+    if not ignore_env_tokens:
+        token = os.getenv("ANTHROPIC_TOKEN", "").strip()
+        if token:
+            preferred = _prefer_refreshable_claude_code_token(token, creds)
+            if preferred:
+                return preferred
+            return token
 
     # 2. CLAUDE_CODE_OAUTH_TOKEN (used by Claude Code for setup-tokens)
-    cc_token = os.getenv("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
-    if cc_token:
-        preferred = _prefer_refreshable_claude_code_token(cc_token, creds)
-        if preferred:
-            return preferred
-        return cc_token
+    if not ignore_env_tokens:
+        cc_token = os.getenv("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+        if cc_token:
+            preferred = _prefer_refreshable_claude_code_token(cc_token, creds)
+            if preferred:
+                return preferred
+            return cc_token
 
     # 3. Claude Code credential file
     resolved_claude_token = _resolve_claude_code_token_from_credentials(creds)
@@ -991,15 +1000,16 @@ def resolve_anthropic_token() -> Optional[str]:
     # keys placed there (e.g. ZAI coding plan key for Anthropic-compat
     # endpoints) are found even when the parent process (Switchboard
     # gateway) does not export the var into the child process environment.
-    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
-    if not api_key:
-        try:
-            from hermes_cli.config import get_env_value
-            api_key = (get_env_value("ANTHROPIC_API_KEY") or "").strip()
-        except Exception:
-            pass
-    if api_key:
-        return api_key
+    if not ignore_env_tokens:
+        api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+        if not api_key:
+            try:
+                from hermes_cli.config import get_env_value
+                api_key = (get_env_value("ANTHROPIC_API_KEY") or "").strip()
+            except Exception:
+                pass
+        if api_key:
+            return api_key
 
     return None
 
@@ -2092,5 +2102,3 @@ def build_anthropic_kwargs(
         kwargs["extra_headers"] = {"anthropic-beta": ",".join(betas)}
 
     return kwargs
-
-

@@ -1037,7 +1037,12 @@ def resolve_runtime_provider(
     if explicit_runtime:
         return explicit_runtime
 
-    should_use_pool = provider != "openrouter"
+    default_anthropic_for_switchboard = (
+        provider == "anthropic"
+        and os.getenv("HERMES_SWITCHBOARD_DEFAULT_ANTHROPIC", "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+    should_use_pool = provider != "openrouter" and not default_anthropic_for_switchboard
     if provider == "openrouter":
         cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
         cfg_base_url = str(model_cfg.get("base_url") or "").strip()
