@@ -372,6 +372,16 @@ class TestSpawnEnvSecretStripping:
         env = self._capture_spawn_env(monkeypatch)
         assert env.get("OPENAI_API_KEY") == "sk-codex-needs-this"
 
+    def test_gateway_rust_log_filter_does_not_reach_codex(self, monkeypatch):
+        monkeypatch.setenv(
+            "RUST_LOG",
+            "info,gateway_rs_hermes_timing=info,gateway_rs_feed=debug",
+        )
+
+        env = self._capture_spawn_env(monkeypatch)
+
+        assert env["RUST_LOG"] == "warn"
+
     def test_home_still_preserved_through_helper(self, monkeypatch):
         """Regression guard: routing through hermes_subprocess_env must not
         rewrite HOME (codex's shell tool spawns gh/git/aws that need it)."""
