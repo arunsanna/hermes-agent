@@ -430,12 +430,12 @@ def test_build_api_kwargs_codex_clamps_minimal_effort(monkeypatch):
 
 
 def test_build_api_kwargs_codex_preserves_supported_efforts(monkeypatch):
-    """Effort levels natively supported by the Responses API pass through unchanged."""
+    """Terra effort levels supported by the Responses API pass through unchanged."""
     _patch_agent_bootstrap(monkeypatch)
 
-    for effort in ("low", "medium", "high", "xhigh", "max"):
+    for effort in ("low", "medium", "high", "xhigh", "max", "ultra"):
         agent = run_agent.AIAgent(
-            model="gpt-5-codex",
+            model="gpt-5.6-terra",
             base_url="https://chatgpt.com/backend-api/codex",
             api_key="codex-token",
             quiet_mode=True,
