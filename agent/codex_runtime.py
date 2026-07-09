@@ -302,8 +302,18 @@ def run_codex_app_server_turn(
             except Exception:
                 logger.debug("codex tool-progress callback raised", exc_info=True)
 
+        reasoning_effort = None
+        reasoning_config = getattr(agent, "reasoning_config", None)
+        if (
+            isinstance(reasoning_config, dict)
+            and reasoning_config.get("enabled") is not False
+        ):
+            reasoning_effort = str(reasoning_config.get("effort") or "").strip() or None
+
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
+            model=str(getattr(agent, "model", "") or "").strip() or None,
+            reasoning_effort=reasoning_effort,
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,

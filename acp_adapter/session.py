@@ -385,7 +385,7 @@ class SessionManager:
             except Exception:
                 logger.debug("Failed to cleanup ACP sessions from DB", exc_info=True)
 
-    def save_session(self, session_id: str) -> None:
+    def save_session(self, session_id: str) -> bool:
         """Persist the current state of a session to the database.
 
         Called by the server after prompt completion, slash commands that
@@ -394,7 +394,8 @@ class SessionManager:
         with self._lock:
             state = self._sessions.get(session_id)
         if state is not None:
-            self._persist(state)
+            return self._persist(state)
+        return False
 
     # ---- persistence via SessionDB ------------------------------------------
 
@@ -420,7 +421,7 @@ class SessionManager:
             logger.debug("SessionDB unavailable for ACP persistence", exc_info=True)
             return None
 
-    def _persist(self, state: SessionState) -> None:
+    def _persist(self, state: SessionState) -> bool:
         """Write session state to the database.
 
         Creates the session record if it doesn't exist, then replaces all
@@ -428,7 +429,7 @@ class SessionManager:
         """
         db = self._get_db()
         if db is None:
-            return
+            return True
 
         # Ensure model is a plain string (not a MagicMock or other proxy).
         model_str = str(state.model) if state.model else None
@@ -456,10 +457,7 @@ class SessionManager:
                 )
             else:
                 # Update model_config (contains cwd) if changed.
-                try:
-                    db.update_session_meta(state.session_id, cwd_json, model_str)
-                except Exception:
-                    logger.debug("Failed to update ACP session metadata", exc_info=True)
+                db.update_session_meta(state.session_id, cwd_json, model_str)
 
             # When the agent owns persistence to this same SessionDB it has
             # already flushed the live transcript incrementally during
@@ -502,8 +500,10 @@ class SessionManager:
                 db.replace_messages(
                     state.session_id, state.history, active_only=has_archived
                 )
+            return True
         except Exception:
             logger.warning("Failed to persist ACP session %s", state.session_id, exc_info=True)
+            return False
 
     def _restore(self, session_id: str) -> Optional[SessionState]:
         """Load a session from the database into memory, recreating the AIAgent."""
@@ -608,6 +608,7 @@ class SessionManager:
         from run_agent import AIAgent
         from hermes_cli.config import load_config
         from hermes_cli.runtime_provider import resolve_runtime_provider
+        from hermes_constants import parse_reasoning_effort
 
         config = load_config()
         model_cfg = config.get("model")
@@ -624,6 +625,28 @@ class SessionManager:
             for name, cfg in (config.get("mcp_servers") or {}).items()
             if not isinstance(cfg, dict) or cfg.get("enabled", True) is not False
         ]
+        agent_cfg = config.get("agent")
+        configured_reasoning_effort = (
+            str(agent_cfg.get("reasoning_effort") or "")
+            if isinstance(agent_cfg, dict)
+            else ""
+        )
+        session_reasoning_effort = (
+            os.environ.get("HERMES_SESSION_REASONING_EFFORT") or ""
+        ).strip().lower()
+        requested_reasoning_effort = (
+            session_reasoning_effort or configured_reasoning_effort
+        ).strip().lower()
+        reasoning_config = (
+            {"enabled": True, "effort": requested_reasoning_effort}
+            if requested_reasoning_effort in {"max", "ultra"}
+            else parse_reasoning_effort(requested_reasoning_effort)
+        )
+        effective_reasoning_effort = (
+            str(reasoning_config.get("effort") or "").lower()
+            if isinstance(reasoning_config, dict)
+            else ""
+        )
 
         kwargs = {
             "platform": "acp",
@@ -635,14 +658,22 @@ class SessionManager:
             "session_id": session_id,
             "session_db": self._get_db(),
             "model": model or default_model,
+            "reasoning_config": reasoning_config,
         }
 
         try:
             runtime = resolve_runtime_provider(requested=requested_provider or config_provider)
+            runtime_provider = runtime.get("provider")
+            runtime_api_mode = api_mode or runtime.get("api_mode")
+            if (
+                effective_reasoning_effort in {"max", "ultra"}
+                and runtime_provider == "openai-codex"
+            ):
+                runtime_api_mode = "codex_app_server"
             kwargs.update(
                 {
-                    "provider": runtime.get("provider"),
-                    "api_mode": api_mode or runtime.get("api_mode"),
+                    "provider": runtime_provider,
+                    "api_mode": runtime_api_mode,
                     "base_url": base_url or runtime.get("base_url"),
                     "api_key": runtime.get("api_key"),
                     "command": runtime.get("command"),

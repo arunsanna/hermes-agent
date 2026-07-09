@@ -49,11 +49,11 @@ def fake_session(monkeypatch):
     )
 
 
-def _make_codex_agent():
+def _make_codex_agent(**overrides):
     """Construct an AIAgent in codex_app_server mode without contacting any
     real provider. We pass api_mode explicitly so the constructor takes the
     fast path for direct credentials."""
-    return run_agent.AIAgent(
+    kwargs = dict(
         api_key="stub",
         base_url="https://stub.invalid",
         provider="openai",
@@ -62,6 +62,8 @@ def _make_codex_agent():
         skip_context_files=True,
         skip_memory=True,
     )
+    kwargs.update(overrides)
+    return run_agent.AIAgent(**kwargs)
 
 
 class TestApiModeAccepted:
@@ -326,6 +328,19 @@ class TestRunConversationCodexPath:
 
         assert captured["cwd"] == str(tmp_path)
 
+    def test_model_and_ultra_effort_seed_codex_app_server(self, monkeypatch):
+        captured = self._capture_routing_agent(monkeypatch)
+        agent = _make_codex_agent(
+            model="gpt-5.6-terra",
+            reasoning_config={"enabled": True, "effort": "ultra"},
+        )
+
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            agent.run_conversation("hi")
+
+        assert captured["model"] == "gpt-5.6-terra"
+        assert captured["reasoning_effort"] == "ultra"
+
     def _capture_routing_agent(self, monkeypatch):
         """Build a codex agent with a CodexAppServerSession stub that captures
         the request_routing passed at construction time, so we can assert how
@@ -400,7 +415,7 @@ class TestRunConversationCodexPath:
         with patch(
             "hermes_cli.config.load_config",
             return_value={"approvals": {"mode": "manual"}},
-        ):
+        ), patch("tools.approval.is_approval_bypass_active", return_value=False):
             agent = _make_codex_agent()
             with patch.object(
                 agent, "_spawn_background_review", return_value=None
@@ -718,4 +733,3 @@ class TestCodexToolProgressBridge:
 
         assert "on_event" in captured_init and captured_init["on_event"] is not None
         assert ("tool.started", "exec_command", "pytest") in events
-

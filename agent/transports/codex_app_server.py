@@ -88,6 +88,11 @@ class CodexAppServerClient:
         # stripped while provider creds still flow, matching copilot_acp_client
         # (#29157 sibling spawn-site gap).
         spawn_env = hermes_subprocess_env(inherit_credentials=True)
+        # Gateway's Rust tracing filter is intentionally verbose and is meant
+        # for gateway-rs only. Inheriting it makes Codex emit enormous startup
+        # traces while loading plugins/MCPs and can stall thread/start. Keep
+        # the child quiet unless this caller explicitly overrides RUST_LOG.
+        spawn_env["RUST_LOG"] = "warn"
         if env:
             spawn_env.update(env)
         if codex_home:
@@ -124,8 +129,6 @@ class CodexAppServerClient:
             )
 
         cmd = [codex_bin, "app-server"] + app_server_args
-        # Codex emits tracing to stderr; default WARN keeps it quiet for users.
-        spawn_env.setdefault("RUST_LOG", "warn")
 
         self._proc = subprocess.Popen(
             cmd,
