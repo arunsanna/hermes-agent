@@ -997,6 +997,181 @@ class TestSessionConfiguration:
         assert state.agent.base_url == "https://anthropic.example/v1"
         assert runtime_calls[-1] == "anthropic"
 
+    @pytest.mark.asyncio
+    async def test_set_session_model_routes_switchboard_terra_ultra_to_app_server(
+        self, tmp_path, monkeypatch
+    ):
+        def fake_resolve_runtime_provider(requested=None, **kwargs):
+            provider = requested or "openrouter"
+            return {
+                "provider": provider,
+                "api_mode": "codex_responses" if provider == "openai-codex" else "chat_completions",
+                "base_url": f"https://{provider}.example/v1",
+                "api_key": f"{provider}-key",
+                "command": None,
+                "args": [],
+            }
+
+        def fake_agent(**kwargs):
+            return SimpleNamespace(
+                model=kwargs.get("model"),
+                provider=kwargs.get("provider"),
+                base_url=kwargs.get("base_url"),
+                api_mode=kwargs.get("api_mode"),
+                reasoning_config=kwargs.get("reasoning_config"),
+            )
+
+        monkeypatch.setenv("HERMES_SESSION_REASONING_EFFORT", "ultra")
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {
+                "model": {"provider": "openai-codex", "default": "gpt-5.5"},
+                "mcp_servers": {},
+            },
+        )
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            fake_resolve_runtime_provider,
+        )
+        manager = SessionManager(db=SessionDB(tmp_path / "state.db"))
+
+        with patch("run_agent.AIAgent", side_effect=fake_agent):
+            acp_agent = HermesACPAgent(session_manager=manager)
+            state = manager.create_session(cwd="/tmp")
+            result = await acp_agent.set_session_model(
+                model_id="openai-codex:gpt-5.6-terra",
+                session_id=state.session_id,
+            )
+
+        assert isinstance(result, SetSessionModelResponse)
+        assert state.model == "gpt-5.6-terra"
+        assert state.agent.provider == "openai-codex"
+        assert state.agent.api_mode == "codex_app_server"
+        assert state.agent.reasoning_config == {"enabled": True, "effort": "ultra"}
+
+    def test_explicit_current_provider_skips_auto_detection(self):
+        with patch(
+            "hermes_cli.models.detect_provider_for_model",
+            side_effect=AssertionError("explicit provider must not be auto-detected"),
+        ):
+            selection = HermesACPAgent._resolve_model_selection(
+                "openai-codex:gpt-5.6-terra",
+                "openai-codex",
+            )
+
+        assert selection == ("openai-codex", "gpt-5.6-terra")
+
+    @pytest.mark.asyncio
+    async def test_failed_model_rebuild_keeps_previous_agent_and_model(self):
+        previous_agent = SimpleNamespace(
+            model="gpt-5.5",
+            provider="openai-codex",
+            base_url="https://chatgpt.com/backend-api/codex",
+            api_mode="codex_responses",
+        )
+        manager = SessionManager(agent_factory=lambda: previous_agent, db=None)
+        acp_agent = HermesACPAgent(session_manager=manager)
+        state = manager.create_session(cwd="/tmp")
+
+        def fail_agent_rebuild():
+            raise RuntimeError("agent rebuild failed")
+
+        manager._agent_factory = fail_agent_rebuild
+
+        with pytest.raises(RuntimeError, match="agent rebuild failed"):
+            await acp_agent.set_session_model(
+                model_id="openai-codex:gpt-5.6-terra",
+                session_id=state.session_id,
+            )
+
+        assert state.model == "gpt-5.5"
+        assert state.agent is previous_agent
+
+    @pytest.mark.asyncio
+    async def test_successful_model_switch_disposes_previous_codex_runtime(self):
+        class FakeCodexSession:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        class FakeAgent:
+            def __init__(self, model):
+                self.model = model
+                self.provider = "openai-codex"
+                self.base_url = "https://chatgpt.com/backend-api/codex"
+                self.api_mode = "codex_app_server"
+                self._codex_session = FakeCodexSession()
+                self.clients_released = False
+                self.shared_resources_destroyed = False
+
+            def release_clients(self):
+                self.clients_released = True
+
+            def close(self):
+                self.shared_resources_destroyed = True
+
+        previous_agent = FakeAgent("gpt-5.5")
+        new_agent = FakeAgent("gpt-5.6-terra")
+        agents = iter((previous_agent, new_agent))
+        manager = SessionManager(agent_factory=lambda: next(agents), db=None)
+        acp_agent = HermesACPAgent(session_manager=manager)
+        state = manager.create_session(cwd="/tmp")
+        previous_codex_session = previous_agent._codex_session
+
+        result = await acp_agent.set_session_model(
+            model_id="openai-codex:gpt-5.6-terra",
+            session_id=state.session_id,
+        )
+
+        assert isinstance(result, SetSessionModelResponse)
+        assert state.agent is new_agent
+        assert previous_codex_session.closed is True
+        assert previous_agent._codex_session is None
+        assert previous_agent.clients_released is True
+        assert previous_agent.shared_resources_destroyed is False
+        assert new_agent.clients_released is False
+
+    @pytest.mark.asyncio
+    async def test_persistence_failure_rolls_back_and_disposes_new_agent(self):
+        class FakeAgent:
+            def __init__(self, model):
+                self.model = model
+                self.provider = "openai-codex"
+                self.base_url = "https://chatgpt.com/backend-api/codex"
+                self.api_mode = "codex_app_server"
+                self.clients_released = False
+                self.shared_resources_destroyed = False
+
+            def release_clients(self):
+                self.clients_released = True
+
+            def close(self):
+                self.shared_resources_destroyed = True
+
+        previous_agent = FakeAgent("gpt-5.5")
+        new_agent = FakeAgent("gpt-5.6-terra")
+        agents = iter((previous_agent, new_agent))
+        manager = SessionManager(agent_factory=lambda: next(agents), db=None)
+        acp_agent = HermesACPAgent(session_manager=manager)
+        state = manager.create_session(cwd="/tmp")
+        manager.save_session = MagicMock(side_effect=(False, True))
+
+        with pytest.raises(RuntimeError, match="Failed to persist ACP model switch"):
+            await acp_agent.set_session_model(
+                model_id="openai-codex:gpt-5.6-terra",
+                session_id=state.session_id,
+            )
+
+        assert state.model == "gpt-5.5"
+        assert state.agent is previous_agent
+        assert previous_agent.clients_released is False
+        assert previous_agent.shared_resources_destroyed is False
+        assert new_agent.clients_released is True
+        assert new_agent.shared_resources_destroyed is False
+        assert manager.save_session.call_count == 2
+
 
 # ---------------------------------------------------------------------------
 # prompt

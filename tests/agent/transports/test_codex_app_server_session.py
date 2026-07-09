@@ -161,6 +161,29 @@ class TestLifecycle:
         assert params["cwd"] == "/tmp"
         assert "permissions" not in params  # see session.ensure_started() comment
 
+    def test_model_and_reasoning_effort_become_app_server_config_args(self):
+        captured = {}
+        client = FakeClient()
+
+        def client_factory(**kwargs):
+            captured.update(kwargs)
+            return client
+
+        session = CodexAppServerSession(
+            cwd="/tmp",
+            model="gpt-5.6-terra",
+            reasoning_effort="ultra",
+            client_factory=client_factory,
+        )
+        session.ensure_started()
+
+        assert captured["extra_args"] == [
+            "-c",
+            "model=gpt-5.6-terra",
+            "-c",
+            "model_reasoning_effort=ultra",
+        ]
+
     def test_close_idempotent(self):
         client = FakeClient()
         s = make_session(client)
