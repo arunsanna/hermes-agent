@@ -604,6 +604,7 @@ class SessionManager:
         from run_agent import AIAgent
         from hermes_cli.config import load_config
         from hermes_cli.runtime_provider import resolve_runtime_provider
+        from hermes_constants import parse_reasoning_effort
 
         config = load_config()
         model_cfg = config.get("model")
@@ -620,6 +621,22 @@ class SessionManager:
             for name, cfg in (config.get("mcp_servers") or {}).items()
             if not isinstance(cfg, dict) or cfg.get("enabled", True) is not False
         ]
+        agent_cfg = config.get("agent")
+        configured_reasoning_effort = (
+            str(agent_cfg.get("reasoning_effort") or "")
+            if isinstance(agent_cfg, dict)
+            else ""
+        )
+        session_reasoning_effort = (
+            os.environ.get("HERMES_SESSION_REASONING_EFFORT") or ""
+        ).strip().lower()
+        reasoning_config = (
+            {"enabled": True, "effort": session_reasoning_effort}
+            if session_reasoning_effort in {"max", "ultra"}
+            else parse_reasoning_effort(
+                session_reasoning_effort or configured_reasoning_effort
+            )
+        )
 
         kwargs = {
             "platform": "acp",
@@ -631,6 +648,7 @@ class SessionManager:
             "session_id": session_id,
             "session_db": self._get_db(),
             "model": model or default_model,
+            "reasoning_config": reasoning_config,
         }
 
         try:

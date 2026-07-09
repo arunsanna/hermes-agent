@@ -81,6 +81,7 @@ class TestCreateSession:
                     "default": "fake-model",
                     "provider": "fake-provider",
                 },
+                "agent": {"reasoning_effort": "xhigh"},
                 "mcp_servers": {},
             },
             raising=False,
@@ -92,6 +93,7 @@ class TestCreateSession:
                     "default": "fake-model",
                     "provider": "fake-provider",
                 },
+                "agent": {"reasoning_effort": "xhigh"},
                 "mcp_servers": {},
             },
         )
@@ -105,10 +107,15 @@ class TestCreateSession:
             },
         )
         monkeypatch.setattr("acp_adapter.session._register_task_cwd", lambda task_id, cwd: None)
+        monkeypatch.setenv("HERMES_SESSION_REASONING_EFFORT", "ultra")
 
         state = SessionManager(db=None).create_session(cwd="/tmp/project")
 
         assert state.agent.session_cwd == "/tmp/project"
+        assert state.agent.kwargs["reasoning_config"] == {
+            "enabled": True,
+            "effort": "ultra",
+        }
 
 
 
