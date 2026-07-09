@@ -153,6 +153,11 @@ _OAUTH_REFRESH_FAILURE_HINTS = (
     "oauth",
 )
 
+# Cold Codex startup may initialize configured plugins and MCP servers before
+# replying to thread/start. Keep this startup-only deadline above the generic
+# request default; live profiles with several integrations can exceed 15s.
+_THREAD_START_TIMEOUT_SECONDS = 30.0
+
 
 def _classify_oauth_failure(*parts: str) -> Optional[str]:
     """Return a user-friendly re-auth hint if any of the provided strings
@@ -280,7 +285,11 @@ class CodexAppServerSession:
         # Users who want a write-capable profile configure it in their
         # ~/.codex/config.toml the same way they would for any codex usage.
         params: dict[str, Any] = {"cwd": self._cwd}
-        result = self._client.request("thread/start", params, timeout=15)
+        result = self._client.request(
+            "thread/start",
+            params,
+            timeout=_THREAD_START_TIMEOUT_SECONDS,
+        )
         # Cross-fill thread.id/sessionId — different codex versions have
         # serialized this under either key. Mirrors openclaw beta.8's
         # tolerance fix so future codex drops/renames don't KeyError us

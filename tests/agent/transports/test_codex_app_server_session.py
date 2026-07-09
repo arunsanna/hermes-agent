@@ -30,6 +30,7 @@ class FakeClient:
         self.codex_bin = codex_bin
         self.codex_home = codex_home
         self.requests: list[tuple[str, dict]] = []
+        self.request_timeouts: list[tuple[str, float]] = []
         self.notifications_responses: list[dict] = []
         self.responses: list[tuple[Any, dict]] = []
         self.error_responses: list[tuple[Any, int, str]] = []
@@ -47,6 +48,7 @@ class FakeClient:
 
     def request(self, method: str, params: Optional[dict] = None, timeout: float = 30.0):
         self.requests.append((method, params or {}))
+        self.request_timeouts.append((method, timeout))
         if self._request_handler is not None:
             return self._request_handler(method, params or {})
         # Sensible defaults for protocol methods used by the session
@@ -160,6 +162,13 @@ class TestLifecycle:
         method, params = next(r for r in client.requests if r[0] == "thread/start")
         assert params["cwd"] == "/tmp"
         assert "permissions" not in params  # see session.ensure_started() comment
+
+    def test_thread_start_allows_cold_plugin_initialization(self):
+        client = FakeClient()
+        make_session(client).ensure_started()
+
+        timeout = next(value for method, value in client.request_timeouts if method == "thread/start")
+        assert timeout == 30.0
 
     def test_model_and_reasoning_effort_become_app_server_config_args(self):
         captured = {}
