@@ -81,6 +81,26 @@ from tools.approval import (
 
 logger = logging.getLogger(__name__)
 
+
+def _dispose_replaced_agent(agent: Any) -> None:
+    """Release agent-owned clients without touching shared session resources."""
+    if agent is None:
+        return
+    try:
+        attrs = getattr(agent, "__dict__", {})
+        codex_session = attrs.get("_codex_session") if isinstance(attrs, dict) else None
+        if codex_session is not None:
+            codex_session.close()
+            agent._codex_session = None
+    except Exception:
+        logger.debug("Failed to close replaced Codex app-server session", exc_info=True)
+    try:
+        release_clients = getattr(agent, "release_clients", None)
+        if callable(release_clients):
+            release_clients()
+    except Exception:
+        logger.debug("Failed to release replaced ACP agent clients", exc_info=True)
+
 try:
     from hermes_cli import __version__ as HERMES_VERSION
 except Exception:
@@ -651,8 +671,13 @@ class HermesACPAgent(acp.Agent):
         try:
             from hermes_cli.models import detect_provider_for_model, parse_model_input
 
-            target_provider, new_model = parse_model_input(new_model, current_provider)
-            if target_provider == current_provider:
+            raw_selection = new_model
+            target_provider, new_model = parse_model_input(raw_selection, current_provider)
+            # ``parse_model_input`` strips a recognized ``provider:`` prefix.
+            # That explicit choice is authoritative even when it names the
+            # current provider; auto-detection must not remap the model.
+            has_explicit_provider = new_model != raw_selection
+            if not has_explicit_provider and target_provider == current_provider:
                 detected = detect_provider_for_model(new_model, current_provider)
                 if detected:
                     target_provider, new_model = detected
@@ -660,6 +685,26 @@ class HermesACPAgent(acp.Agent):
             logger.debug("Provider detection failed, using model as-is", exc_info=True)
 
         return target_provider, new_model
+
+    def _commit_model_switch(
+        self,
+        state: SessionState,
+        *,
+        model: str,
+        new_agent: Any,
+    ) -> None:
+        """Persist a replacement before retiring the previous live agent."""
+        previous_model = state.model
+        previous_agent = state.agent
+        state.model = model
+        state.agent = new_agent
+        if not self.session_manager.save_session(state.session_id):
+            state.model = previous_model
+            state.agent = previous_agent
+            self.session_manager.save_session(state.session_id)
+            _dispose_replaced_agent(new_agent)
+            raise RuntimeError("Failed to persist ACP model switch")
+        _dispose_replaced_agent(previous_agent)
 
     @staticmethod
     def _build_usage_update(state: SessionState) -> UsageUpdate | None:
@@ -1772,14 +1817,13 @@ class HermesACPAgent(acp.Agent):
         current_provider = getattr(state.agent, "provider", None) or "openrouter"
         target_provider, new_model = self._resolve_model_selection(args, current_provider)
 
-        state.model = new_model
-        state.agent = self.session_manager._make_agent(
+        new_agent = self.session_manager._make_agent(
             session_id=state.session_id,
             cwd=state.cwd,
             model=new_model,
             requested_provider=target_provider,
         )
-        self.session_manager.save_session(state.session_id)
+        self._commit_model_switch(state, model=new_model, new_agent=new_agent)
         provider_label = getattr(state.agent, "provider", None) or target_provider or current_provider
         logger.info("Session %s: model switched to %s", state.session_id, new_model)
         return f"Model switched to: {new_model}\nProvider: {provider_label}"
@@ -2003,11 +2047,10 @@ class HermesACPAgent(acp.Agent):
                 model_id,
                 current_provider or "openrouter",
             )
-            state.model = resolved_model
             provider_changed = bool(current_provider and requested_provider != current_provider)
             current_base_url = None if provider_changed else getattr(state.agent, "base_url", None)
             current_api_mode = None if provider_changed else getattr(state.agent, "api_mode", None)
-            state.agent = self.session_manager._make_agent(
+            new_agent = self.session_manager._make_agent(
                 session_id=session_id,
                 cwd=state.cwd,
                 model=resolved_model,
@@ -2015,7 +2058,7 @@ class HermesACPAgent(acp.Agent):
                 base_url=current_base_url,
                 api_mode=current_api_mode,
             )
-            self.session_manager.save_session(session_id)
+            self._commit_model_switch(state, model=resolved_model, new_agent=new_agent)
             logger.info(
                 "Session %s: model switched to %s via provider %s",
                 session_id,
