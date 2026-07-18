@@ -1078,6 +1078,55 @@ class TestSessionRetirement:
         assert r.interrupted is False
         assert r.should_retire is False
 
+    def test_post_tool_watchdog_drains_queued_activity_at_timeout_boundary(self):
+        """A queued liveness event wins over the quiet-timeout boundary.
+
+        Regression: the watchdog checked elapsed time before polling the
+        notification queue, so it could interrupt even though reasoning or
+        another item was already waiting to be consumed.
+        """
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "commandExecution", "id": "ex1",
+                "command": "echo hi", "cwd": "/tmp",
+                "status": "completed", "aggregatedOutput": "hi",
+                "exitCode": 0, "commandActions": [],
+            },
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "item/completed",
+            item={"type": "reasoning", "id": "r1", "content": ["thinking..."]},
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        # Advance past the quiet timeout exactly as the loop starts its next
+        # iteration. The reasoning event is already queued and must be read
+        # before the watchdog decides the turn is silent.
+        clock_values = iter([1000.0, 1000.0, 1000.0, 1000.2])
+
+        def monotonic():
+            return next(clock_values, 1000.2)
+
+        s = make_session(client)
+        with patch.object(session_mod.time, "monotonic", side_effect=monotonic):
+            r = s.run_turn(
+                "tool then queued reasoning then done",
+                turn_timeout=30.0,
+                notification_poll_timeout=0.0,
+                post_tool_quiet_timeout=0.15,
+            )
+        assert r.interrupted is False
+        assert r.should_retire is False
+        assert not any(
+            method == "turn/interrupt" for (method, _) in client.requests
+        )
+
     def test_turn_aborted_marker_in_text_is_terminal(self):
         """If codex emits `<turn_aborted>` in agent text and never sends
         turn/completed, we still exit promptly instead of burning the
