@@ -496,24 +496,6 @@ class CodexAppServerSession:
                 result.should_retire = True
                 break
 
-            # Post-tool watchdog: if a tool completion was the most recent
-            # signal and codex has been silent past the quiet timeout, give
-            # up on this turn instead of waiting for the outer deadline.
-            if (
-                last_tool_completion_at is not None
-                and (time.monotonic() - last_tool_completion_at)
-                    > post_tool_quiet_timeout
-            ):
-                self._issue_interrupt(result.turn_id)
-                result.interrupted = True
-                result.error = (
-                    f"codex went silent for "
-                    f"{post_tool_quiet_timeout:.0f}s after a tool result; "
-                    f"retiring app-server session."
-                )
-                result.should_retire = True
-                break
-
             # Drain any server-initiated requests (approvals) before
             # reading notifications, so the codex side isn't blocked.
             sreq = self._client.take_server_request(timeout=0)
@@ -553,6 +535,24 @@ class CodexAppServerSession:
                 timeout=notification_poll_timeout
             )
             if note is None:
+                # Only declare the turn quiet after checking both inbound
+                # queues. A notification or approval request may already be
+                # waiting when the threshold is crossed; checking the clock
+                # first would interrupt a live turn at that boundary.
+                if (
+                    last_tool_completion_at is not None
+                    and (time.monotonic() - last_tool_completion_at)
+                        > post_tool_quiet_timeout
+                ):
+                    self._issue_interrupt(result.turn_id)
+                    result.interrupted = True
+                    result.error = (
+                        f"codex went silent for "
+                        f"{post_tool_quiet_timeout:.0f}s after a tool result; "
+                        f"retiring app-server session."
+                    )
+                    result.should_retire = True
+                    break
                 continue
 
             method = note.get("method", "")
