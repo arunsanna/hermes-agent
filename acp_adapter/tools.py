@@ -1040,6 +1040,44 @@ def _build_tool_complete_content(
 # ---------------------------------------------------------------------------
 
 
+def _delegate_raw_input(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Bounded machine-readable rawInput for a delegate_task dispatch.
+
+    Keeps only goal/role identity (goals truncated) and drops per-task
+    ``context`` bodies so persisted wire frames stay small.
+    """
+    out: Dict[str, Any] = {"tool": "delegate_task"}
+    args: Dict[str, Any] = {}
+    tasks = arguments.get("tasks")
+    if isinstance(tasks, list) and tasks:
+        bounded = []
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            entry: Dict[str, Any] = {}
+            goal = str(task.get("goal") or "").strip()
+            role = str(task.get("role") or "").strip()
+            if goal:
+                entry["goal"] = _truncate_text(goal, limit=400)
+            if role:
+                entry["role"] = role
+            if entry:
+                bounded.append(entry)
+        if bounded:
+            args["tasks"] = bounded
+    else:
+        goal = str(arguments.get("goal") or "").strip()
+        if goal:
+            args["goal"] = _truncate_text(goal, limit=400)
+        role = str(arguments.get("role") or "").strip()
+        if role:
+            args["role"] = role
+    if arguments.get("background"):
+        args["background"] = True
+    out["arguments"] = args
+    return out
+
+
 def build_tool_start(
     tool_call_id: str,
     tool_name: str,
@@ -1250,6 +1288,12 @@ def _build_tool_start(
             content = [_text("Delegating task" + (f":\n{_truncate_text(goal, limit=800)}" if goal else ""))]
         return acp.start_tool_call(
             tool_call_id, title, kind=kind, content=content, locations=locations,
+            # Machine-readable identity + bounded structure for ACP clients
+            # (Switchboard classifies subagent dispatches off rawInput.tool and
+            # builds per-child cards from goal/role/tasks). Deliberately omits
+            # `context` bodies — they can be large and the wire frame is
+            # persisted verbatim by clients.
+            raw_input=_delegate_raw_input(arguments),
         )
 
     if tool_name == "session_search":
