@@ -65,6 +65,7 @@ from acp.schema import (
 from acp_adapter.auth import TERMINAL_SETUP_AUTH_METHOD_ID, build_auth_methods, detect_provider
 from acp_adapter.events import (
     _build_plan_update_from_todo_result,
+    flush_open_tool_calls,
     make_message_cb,
     make_step_cb,
     make_thinking_cb,
@@ -1610,7 +1611,15 @@ class HermesACPAgent(acp.Agent):
             with state.runtime_lock:
                 state.is_running = False
                 state.current_prompt_text = ""
+            if conn:
+                flush_open_tool_calls(conn, session_id, loop, tool_call_ids, tool_call_meta)
             return PromptResponse(stop_reason="end_turn")
+
+        # The turn is over: close any tool calls whose completion never made it
+        # through the name-keyed FIFO pairing (long-turn steering/compression
+        # drift), so clients never keep stuck in-progress items past end_turn.
+        if conn:
+            flush_open_tool_calls(conn, session_id, loop, tool_call_ids, tool_call_meta)
 
         if result.get("messages"):
             state.history = result["messages"]
