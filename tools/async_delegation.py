@@ -69,15 +69,29 @@ class _DaemonThreadPoolExecutor(ThreadPoolExecutor):
         num_threads = len(self._threads)
         if num_threads < self._max_workers:
             thread_name = "%s_%d" % (self._thread_name_prefix or self, num_threads)
-            t = threading.Thread(
-                name=thread_name,
-                target=_worker,
-                args=(
+            # Python 3.14 refactored ThreadPoolExecutor: _worker now takes
+            # (executor_ref, worker_context, work_queue) and __init__ no longer
+            # stores _initializer/_initargs (they live in the worker context).
+            # The old copied ≤3.13 shape raised AttributeError here, which made
+            # dispatch_async_delegation_batch fall back to running every batch
+            # synchronously ("async pool at capacity" in the logs).
+            if hasattr(self, "_create_worker_context"):
+                worker_args = (
+                    weakref.ref(self, weakref_cb),
+                    self._create_worker_context(),
+                    self._work_queue,
+                )
+            else:
+                worker_args = (
                     weakref.ref(self, weakref_cb),
                     self._work_queue,
                     self._initializer,
                     self._initargs,
-                ),
+                )
+            t = threading.Thread(
+                name=thread_name,
+                target=_worker,
+                args=worker_args,
                 daemon=True,
             )
             t.start()
