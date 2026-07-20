@@ -543,6 +543,139 @@ class HermesACPAgent(acp.Agent):
         super().__init__()
         self.session_manager = session_manager or SessionManager()
         self._conn: Optional[acp.Client] = None
+        self._delegation_watcher_task: Optional[asyncio.Task] = None
+
+    # ---- Background delegation completions -----------------------------------
+
+    def _ensure_delegation_watcher(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Start the completion watcher once, on the running loop."""
+        if self._delegation_watcher_task is not None:
+            return
+        if os.environ.get("HERMES_ACP_BACKGROUND_COMPLETIONS", "1").strip().lower() in {
+            "0",
+            "false",
+            "off",
+        }:
+            return
+        self._delegation_watcher_task = loop.create_task(self._async_delegation_watcher())
+
+    async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
+        """Drain background-delegation completions back into their sessions.
+
+        ``delegate_task(background=true)`` results land on the shared
+        ``process_registry.completion_queue``, which nothing in the ACP
+        process consumed — a background child finishing after its turn ended
+        was silently lost. Mirrors gateway/run.py's watcher: route by
+        ``session_key`` (== the ACP session id, bound via ``set_session_vars``
+        during ``prompt()``), append the formatted notification to session
+        history so the agent sees it on its next turn, and emit an
+        out-of-turn tool frame pair so ACP clients render it immediately
+        (Switchboard shows these as a continuation turn).
+
+        Injection is deferred while a turn is running: ``prompt()`` REPLACES
+        ``state.history`` with the agent's result at turn end, so an append
+        mid-turn would be lost — busy-session events are requeued and retried
+        on the next tick.
+        """
+        try:
+            from tools.process_registry import (
+                format_process_notification,
+                process_registry as _pr,
+            )
+        except Exception:
+            logger.exception("Delegation watcher disabled: process_registry unavailable")
+            return
+        while True:
+            try:
+                await self._drain_completion_queue_once(_pr, format_process_notification)
+            except Exception:
+                logger.exception("Async delegation watcher error")
+            await asyncio.sleep(interval)
+
+    async def _drain_completion_queue_once(self, pr, formatter) -> None:
+        """One watcher tick: route completions, requeue what isn't ours yet."""
+        drained = []
+        while not pr.completion_queue.empty():
+            try:
+                drained.append(pr.completion_queue.get_nowait())
+            except Exception:
+                break
+
+        requeue = []
+        for evt in drained:
+            if evt.get("type") != "async_delegation":
+                # Owned by other drain patterns (watch events etc.); keep
+                # them available like the gateway watcher does.
+                requeue.append(evt)
+                continue
+            session_id = str(evt.get("session_key") or "")
+            state = self.session_manager.get_session(session_id) if session_id else None
+            if state is None:
+                logger.warning(
+                    "Dropping async delegation %s: no ACP session for key %r",
+                    evt.get("delegation_id"),
+                    session_id,
+                )
+                continue
+            busy = False
+            with state.runtime_lock:
+                if state.is_running:
+                    busy = True
+                else:
+                    text = formatter(evt)
+                    if text:
+                        state.history.append({"role": "user", "content": text})
+            if busy:
+                requeue.append(evt)
+                continue
+            self.session_manager.save_session(session_id)
+            await self._notify_background_completion(session_id, evt)
+        for evt in requeue:
+            pr.completion_queue.put(evt)
+
+    async def _notify_background_completion(self, session_id: str, evt: dict) -> None:
+        """Emit an out-of-turn tool frame pair for a finished background child."""
+        conn = self._conn
+        if conn is None:
+            return
+        from acp_adapter.tools import _text as _tool_text, make_tool_call_id
+
+        goal = str(evt.get("goal") or "").strip()
+        status_raw = str(evt.get("status") or "completed").strip().lower()
+        ok = status_raw in {"completed", "complete", "success", "done", ""}
+        title = "background delegation " + ("completed" if ok else status_raw)
+        if goal:
+            title += ": " + (goal[:100] + ("…" if len(goal) > 100 else ""))
+        body = str(evt.get("summary") or evt.get("error") or "").strip()
+        tc_id = make_tool_call_id()
+        raw_arguments = {"background": True}
+        if goal:
+            raw_arguments["goal"] = goal[:400]
+        if evt.get("delegation_id"):
+            raw_arguments["delegationId"] = evt.get("delegation_id")
+        if evt.get("model"):
+            raw_arguments["model"] = evt.get("model")
+        try:
+            await conn.session_update(
+                session_id,
+                acp.start_tool_call(
+                    tc_id,
+                    title,
+                    kind="execute",
+                    raw_input={"tool": "subagent", "arguments": raw_arguments},
+                ),
+            )
+            await conn.session_update(
+                session_id,
+                acp.update_tool_call(
+                    tc_id,
+                    kind="execute",
+                    status="completed" if ok else "failed",
+                    content=[_tool_text(body)] if body else None,
+                ),
+            )
+        except Exception:
+            logger.debug("Failed to send background completion frames", exc_info=True)
 
     # ---- Connection lifecycle -----------------------------------------------
 
@@ -1434,6 +1567,7 @@ class HermesACPAgent(acp.Agent):
 
         conn = self._conn
         loop = asyncio.get_running_loop()
+        self._ensure_delegation_watcher(loop)
 
         if state.cancel_event:
             state.cancel_event.clear()
