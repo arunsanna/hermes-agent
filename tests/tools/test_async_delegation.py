@@ -221,6 +221,115 @@ def test_completed_records_pruned_to_cap():
     assert len(ad.list_async_delegations()) <= ad._MAX_RETAINED_COMPLETED
 
 
+def test_running_for_session_filters_by_session_and_since_timestamp():
+    gate = threading.Event()
+
+    def blocker():
+        gate.wait(timeout=5)
+        return {"status": "completed", "summary": "done"}
+
+    old = ad.dispatch_async_delegation(
+        goal="old", context=None, toolsets=None, role="leaf", model="m",
+        session_key="session-a", runner=blocker, max_async_children=3,
+    )
+    since = time.time()
+    other = ad.dispatch_async_delegation(
+        goal="other", context=None, toolsets=None, role="leaf", model="m",
+        session_key="session-b", runner=blocker, max_async_children=3,
+    )
+    current = ad.dispatch_async_delegation(
+        goal="current", context=None, toolsets=None, role="leaf", model="m",
+        session_key="session-a", runner=blocker, max_async_children=3,
+    )
+
+    all_for_session = ad.running_for_session("session-a")
+    current_for_session = ad.running_for_session("session-a", since)
+
+    assert {record["delegation_id"] for record in all_for_session} == {
+        old["delegation_id"], current["delegation_id"],
+    }
+    assert [record["delegation_id"] for record in current_for_session] == [
+        current["delegation_id"]
+    ]
+    assert other["delegation_id"] not in {
+        record["delegation_id"] for record in all_for_session
+    }
+    assert all("interrupt_fn" not in record for record in all_for_session)
+    assert all("done_event" not in record for record in all_for_session)
+    gate.set()
+
+
+def test_join_reports_completed_and_pending_with_one_shared_deadline():
+    completed_gate = threading.Event()
+    pending_gate = threading.Event()
+
+    def complete_runner():
+        completed_gate.wait(timeout=5)
+        return {"status": "completed", "summary": "done"}
+
+    def pending_runner():
+        pending_gate.wait(timeout=5)
+        return {"status": "completed", "summary": "late"}
+
+    completed = ad.dispatch_async_delegation(
+        goal="completed", context=None, toolsets=None, role="leaf", model="m",
+        session_key="session-a", runner=complete_runner,
+        max_async_children=2,
+    )
+    pending = ad.dispatch_async_delegation(
+        goal="pending", context=None, toolsets=None, role="leaf", model="m",
+        session_key="session-a", runner=pending_runner,
+        max_async_children=2,
+    )
+    completed_gate.set()
+
+    started = time.monotonic()
+    joined = ad.join(
+        [completed["delegation_id"], pending["delegation_id"]], timeout=0.05
+    )
+    elapsed = time.monotonic() - started
+
+    assert joined == {
+        "completed": [completed["delegation_id"]],
+        "pending": [pending["delegation_id"]],
+    }
+    assert elapsed < 0.2
+    pending_gate.set()
+
+
+def test_done_event_is_set_only_after_completion_event_is_enqueued(monkeypatch):
+    observed_during_put = []
+    real_queue = process_registry.completion_queue
+
+    class _ObservingQueue:
+        def put(self, event):
+            with ad._records_lock:
+                done_event = ad._records[event["delegation_id"]]["done_event"]
+                observed_during_put.append(done_event.is_set())
+            real_queue.put(event)
+
+        def empty(self):
+            return real_queue.empty()
+
+        def get_nowait(self):
+            return real_queue.get_nowait()
+
+    monkeypatch.setattr(process_registry, "completion_queue", _ObservingQueue())
+    result = ad.dispatch_async_delegation(
+        goal="ordered", context=None, toolsets=None, role="leaf", model="m",
+        session_key="session-a",
+        runner=lambda: {"status": "completed", "summary": "done"},
+        max_async_children=1,
+    )
+
+    assert _drain_one() is not None
+    with ad._records_lock:
+        done_event = ad._records[result["delegation_id"]]["done_event"]
+    assert observed_during_put == [False]
+    assert done_event.is_set()
+    assert "done_event" not in ad.list_async_delegations()[0]
+
+
 # ---------------------------------------------------------------------------
 # Integration: delegate_task(background=True) routing
 # ---------------------------------------------------------------------------
@@ -611,5 +720,3 @@ def test_gateway_cli_origin_event_left_unrouted():
     evt = _make_async_evt(session_key="")
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
-
-

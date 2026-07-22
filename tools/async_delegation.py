@@ -143,6 +143,61 @@ def active_count() -> int:
         return sum(1 for r in _records.values() if r.get("status") == "running")
 
 
+def _record_snapshot(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a record copy without thread-only, non-serialisable fields."""
+    return {
+        key: value
+        for key, value in record.items()
+        if key not in ("interrupt_fn", "done_event")
+    }
+
+
+def running_for_session(
+    session_key: str, since_ts: Optional[float] = None
+) -> List[Dict[str, Any]]:
+    """Snapshot running delegations for one session, optionally since a time."""
+    with _records_lock:
+        return [
+            _record_snapshot(record)
+            for record in _records.values()
+            if record.get("status") == "running"
+            and record.get("session_key") == session_key
+            and (
+                since_ts is None
+                or (record.get("dispatched_at") or 0) >= since_ts
+            )
+        ]
+
+
+def join(delegation_ids: List[str], timeout: float) -> Dict[str, List[str]]:
+    """Wait for delegation completion events using one shared deadline."""
+    with _records_lock:
+        events = [
+            (delegation_id, _records[delegation_id].get("done_event"))
+            for delegation_id in delegation_ids
+            if delegation_id in _records
+        ]
+
+    deadline = time.monotonic() + max(0.0, timeout)
+    for _, done_event in events:
+        if isinstance(done_event, threading.Event):
+            done_event.wait(max(0.0, deadline - time.monotonic()))
+
+    completed = [
+        delegation_id
+        for delegation_id, done_event in events
+        if isinstance(done_event, threading.Event) and done_event.is_set()
+    ]
+    return {
+        "completed": completed,
+        "pending": [
+            delegation_id
+            for delegation_id, done_event in events
+            if not isinstance(done_event, threading.Event) or not done_event.is_set()
+        ],
+    }
+
+
 def _new_delegation_id() -> str:
     return f"deleg_{uuid.uuid4().hex[:8]}"
 
@@ -220,6 +275,7 @@ def dispatch_async_delegation(
         "dispatched_at": dispatched_at,
         "completed_at": None,
         "interrupt_fn": interrupt_fn,
+        "done_event": threading.Event(),
     }
     # Capacity check and record insert under ONE lock hold — checking
     # active_count() separately would let two concurrent dispatches (e.g.
@@ -294,7 +350,10 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
         event_record = dict(record)
         _prune_completed_locked()
 
-    _push_completion_event(event_record, result, status)
+    try:
+        _push_completion_event(event_record, result, status)
+    finally:
+        event_record["done_event"].set()
 
 
 def _push_completion_event(
@@ -404,6 +463,7 @@ def dispatch_async_delegation_batch(
         "dispatched_at": dispatched_at,
         "completed_at": None,
         "interrupt_fn": interrupt_fn,
+        "done_event": threading.Event(),
         "is_batch": True,
     }
     with _records_lock:
@@ -482,55 +542,58 @@ def _finalize_batch(
         _prune_completed_locked()
 
     try:
-        from tools.process_registry import process_registry
-    except Exception as exc:  # pragma: no cover
-        logger.error(
-            "Async delegation batch %s finished but process_registry import "
-            "failed; result lost: %s",
-            delegation_id, exc,
-        )
-        return
+        try:
+            from tools.process_registry import process_registry
+        except Exception as exc:  # pragma: no cover
+            logger.error(
+                "Async delegation batch %s finished but process_registry import "
+                "failed; result lost: %s",
+                delegation_id, exc,
+            )
+            return
 
-    dispatched_at = event_record.get("dispatched_at") or time.time()
-    completed_at = event_record.get("completed_at") or time.time()
-    evt = {
-        "type": "async_delegation",
-        "delegation_id": delegation_id,
-        "session_key": event_record.get("session_key", ""),
-        "goal": event_record.get("goal", ""),
-        "goals": event_record.get("goals"),
-        "context": event_record.get("context"),
-        "toolsets": event_record.get("toolsets"),
-        "role": event_record.get("role"),
-        "model": event_record.get("model"),
-        "status": status,
-        "is_batch": True,
-        # The full per-task results list — the formatter renders a
-        # consolidated multi-task block from this.
-        "results": combined.get("results") or [],
-        "error": combined.get("error"),
-        "total_duration_seconds": combined.get("total_duration_seconds"),
-        "dispatched_at": dispatched_at,
-        "completed_at": completed_at,
-    }
-    try:
-        process_registry.completion_queue.put(evt)
-    except Exception as exc:  # pragma: no cover
-        logger.error(
-            "Async delegation batch %s: failed to enqueue completion event; "
-            "result lost: %s",
-            delegation_id, exc,
-        )
+        dispatched_at = event_record.get("dispatched_at") or time.time()
+        completed_at = event_record.get("completed_at") or time.time()
+        evt = {
+            "type": "async_delegation",
+            "delegation_id": delegation_id,
+            "session_key": event_record.get("session_key", ""),
+            "goal": event_record.get("goal", ""),
+            "goals": event_record.get("goals"),
+            "context": event_record.get("context"),
+            "toolsets": event_record.get("toolsets"),
+            "role": event_record.get("role"),
+            "model": event_record.get("model"),
+            "status": status,
+            "is_batch": True,
+            # The full per-task results list — the formatter renders a
+            # consolidated multi-task block from this.
+            "results": combined.get("results") or [],
+            "error": combined.get("error"),
+            "total_duration_seconds": combined.get("total_duration_seconds"),
+            "dispatched_at": dispatched_at,
+            "completed_at": completed_at,
+        }
+        try:
+            process_registry.completion_queue.put(evt)
+        except Exception as exc:  # pragma: no cover
+            logger.error(
+                "Async delegation batch %s: failed to enqueue completion event; "
+                "result lost: %s",
+                delegation_id, exc,
+            )
+    finally:
+        event_record["done_event"].set()
 
 
 def list_async_delegations() -> List[Dict[str, Any]]:
     """Snapshot of async delegations (running + recently completed).
 
-    Safe to call from any thread. Excludes the non-serialisable interrupt_fn.
+    Safe to call from any thread. Excludes non-serialisable thread fields.
     """
     with _records_lock:
         return [
-            {k: v for k, v in r.items() if k != "interrupt_fn"}
+            _record_snapshot(r)
             for r in _records.values()
         ]
 
