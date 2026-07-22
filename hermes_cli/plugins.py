@@ -1844,11 +1844,24 @@ class PluginManager:
     # Hook invocation
     # -----------------------------------------------------------------------
 
-    def invoke_hook(self, hook_name: str, **kwargs: Any) -> List[Any]:
+    def invoke_hook(
+        self, hook_name: str, *, _timeout_s: Optional[float] = None, **kwargs: Any
+    ) -> List[Any]:
         """Call all registered callbacks for *hook_name*.
 
         Each callback is wrapped in its own try/except so a misbehaving
         plugin cannot break the core agent loop.
+
+        ``_timeout_s`` (keyword-only, opt-in) bounds each callback: when set,
+        the callback runs on a daemon worker thread and is abandoned if it does
+        not finish within the timeout. This exists because a hook callback that
+        blocks on an unbounded network/daemon read (observability relays,
+        external-memory sync) otherwise freezes the synchronous ``finalize_turn``
+        tail — and with it the ACP ``session/prompt`` response the gateway is
+        waiting on — indefinitely, until the gateway's 300s stall watchdog
+        force-fails the turn. Turn-critical, response-gating hook call sites pass
+        a timeout; the default (``None``) keeps the prior unbounded behavior so
+        the per-turn ``pre_llm_call`` context-injection path is unchanged.
 
         Returns a list of non-``None`` return values from callbacks.
 
@@ -1868,6 +1881,46 @@ class PluginManager:
         callbacks = self._hooks.get(hook_name, [])
         results: List[Any] = []
         for cb in callbacks:
+            if _timeout_s and _timeout_s > 0:
+                # Bounded execution: run on a daemon worker and abandon it if it
+                # exceeds the timeout. A hung callback thread is left to leak
+                # (it cannot be safely killed in CPython) but the turn proceeds.
+                box: Dict[str, Any] = {}
+
+                def _run(_cb=cb, _box=box):
+                    try:
+                        _box["ret"] = _cb(**kwargs)
+                    except Exception as _exc:  # noqa: BLE001 — surfaced below
+                        _box["exc"] = _exc
+
+                worker = threading.Thread(
+                    target=_run,
+                    name=f"hook-{hook_name}",
+                    daemon=True,
+                )
+                worker.start()
+                worker.join(_timeout_s)
+                if worker.is_alive():
+                    logger.warning(
+                        "Hook '%s' callback %s exceeded %.1fs timeout; "
+                        "abandoning (turn continues)",
+                        hook_name,
+                        getattr(cb, "__name__", repr(cb)),
+                        _timeout_s,
+                    )
+                    continue
+                if "exc" in box:
+                    logger.warning(
+                        "Hook '%s' callback %s raised: %s",
+                        hook_name,
+                        getattr(cb, "__name__", repr(cb)),
+                        box["exc"],
+                    )
+                    continue
+                ret = box.get("ret")
+                if ret is not None:
+                    results.append(ret)
+                continue
             try:
                 ret = cb(**kwargs)
                 if ret is not None:
@@ -2001,12 +2054,17 @@ def discover_plugins(force: bool = False) -> None:
     get_plugin_manager().discover_and_load(force=force)
 
 
-def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
+def invoke_hook(
+    hook_name: str, *, _timeout_s: Optional[float] = None, **kwargs: Any
+) -> List[Any]:
     """Invoke a lifecycle hook on all loaded plugins.
+
+    ``_timeout_s`` (keyword-only, opt-in) bounds each callback — see
+    ``PluginManager.invoke_hook``. Omit it to keep the prior unbounded behavior.
 
     Returns a list of non-``None`` return values from plugin callbacks.
     """
-    return get_plugin_manager().invoke_hook(hook_name, **kwargs)
+    return get_plugin_manager().invoke_hook(hook_name, _timeout_s=_timeout_s, **kwargs)
 
 
 def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
