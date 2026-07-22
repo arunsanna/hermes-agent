@@ -88,6 +88,19 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertNotIn("acp_args", props["tasks"]["items"]["properties"])
         self.assertNotIn("maxItems", props["tasks"])  # removed — limit is now runtime-configurable
 
+    def test_background_schema_explains_detach_and_acp_join_contract(self):
+        description = DELEGATE_TASK_SCHEMA["parameters"]["properties"][
+            "background"
+        ]["description"]
+
+        self.assertIn("detached", description.lower())
+        self.assertIn("later turn", description.lower())
+        self.assertIn("ACP", description)
+        self.assertIn("awaited and consolidated", description)
+        self.assertIn("synchronous", description.lower())
+        self.assertIn("this reply", description.lower())
+        self.assertNotIn("Do not wait or poll", description)
+
     def test_schema_description_advertises_runtime_limits(self):
         """The model must see the user's actual concurrency / spawn-depth caps,
         not the framework defaults. Without this, models that read 'default 3'
