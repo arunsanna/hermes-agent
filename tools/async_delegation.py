@@ -624,6 +624,61 @@ def has_live_for_session(
         )
 
 
+def _record_snapshot(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a record copy without thread-only, non-serialisable fields."""
+    return {
+        key: value
+        for key, value in record.items()
+        if key not in ("interrupt_fn", "done_event")
+    }
+
+
+def running_for_session(
+    session_key: str, since_ts: Optional[float] = None
+) -> List[Dict[str, Any]]:
+    """Snapshot running delegations for one session, optionally since a time."""
+    with _records_lock:
+        return [
+            _record_snapshot(record)
+            for record in _records.values()
+            if record.get("status") in {"running", "finalizing"}
+            and record.get("session_key") == session_key
+            and (
+                since_ts is None
+                or (record.get("dispatched_at") or 0) >= since_ts
+            )
+        ]
+
+
+def join(delegation_ids: List[str], timeout: float) -> Dict[str, List[str]]:
+    """Wait for delegation completion events using one shared deadline."""
+    with _records_lock:
+        events = [
+            (delegation_id, _records[delegation_id].get("done_event"))
+            for delegation_id in delegation_ids
+            if delegation_id in _records
+        ]
+
+    deadline = time.monotonic() + max(0.0, timeout)
+    for _, done_event in events:
+        if isinstance(done_event, threading.Event):
+            done_event.wait(max(0.0, deadline - time.monotonic()))
+
+    completed = [
+        delegation_id
+        for delegation_id, done_event in events
+        if isinstance(done_event, threading.Event) and done_event.is_set()
+    ]
+    return {
+        "completed": completed,
+        "pending": [
+            delegation_id
+            for delegation_id, done_event in events
+            if not isinstance(done_event, threading.Event) or not done_event.is_set()
+        ],
+    }
+
+
 def _new_delegation_id() -> str:
     return f"deleg_{uuid.uuid4().hex[:8]}"
 
@@ -754,6 +809,7 @@ def dispatch_async_delegation(
         "_progress_token": None,
         "_progress_ts": dispatched_at,
         "_interrupted_at": None,
+        "done_event": threading.Event(),
     }
     # Capacity check and record insert under ONE lock hold — checking
     # active_count() separately would let two concurrent dispatches (e.g.
@@ -827,8 +883,12 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
         return
     event_record, _interrupt_fn = claimed
 
-    _push_completion_event(event_record, result, status)
-    _finish_finalization(delegation_id, status)
+    # finally: a failed push must still finalize, or `join()` waiters block
+    # until their deadline on a delegation that is already dead.
+    try:
+        _push_completion_event(event_record, result, status)
+    finally:
+        _finish_finalization(delegation_id, status)
 
 
 def _begin_finalization(
@@ -855,9 +915,15 @@ def _begin_finalization(
 def _finish_finalization(delegation_id: str, status: str) -> None:
     with _records_lock:
         record = _records.get(delegation_id)
+        done_event = record.get("done_event") if record is not None else None
         if record is not None:
             record["status"] = status
         _prune_completed_locked()
+    # Wake `join()` waiters last, and outside the lock. This is the single
+    # terminal chokepoint for every finalize path (normal, batch, stalled),
+    # so joiners can never be left waiting on a record that already ended.
+    if isinstance(done_event, threading.Event):
+        done_event.set()
 
 
 def _push_completion_event(
@@ -989,6 +1055,7 @@ def dispatch_async_delegation_batch(
         "dispatched_at": dispatched_at,
         "completed_at": None,
         "interrupt_fn": interrupt_fn,
+        "done_event": threading.Event(),
         "is_batch": True,
         "progress_fn": progress_fn,
         "_progress_token": None,
@@ -1070,8 +1137,10 @@ def _finalize_batch(
         return
     event_record, _interrupt_fn = claimed
 
-    _push_batch_completion_event(event_record, combined, status)
-    _finish_finalization(delegation_id, status)
+    try:
+        _push_batch_completion_event(event_record, combined, status)
+    finally:
+        _finish_finalization(delegation_id, status)
 
 
 def _push_batch_completion_event(
@@ -1372,7 +1441,7 @@ def list_async_delegations() -> List[Dict[str, Any]]:
             item = {
                 k: v
                 for k, v in r.items()
-                if k not in {"interrupt_fn", "progress_fn"}
+                if k not in {"interrupt_fn", "progress_fn", "done_event"}
                 and not k.startswith("_")
             }
             status = r.get("status")
