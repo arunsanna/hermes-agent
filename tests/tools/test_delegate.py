@@ -81,6 +81,19 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertNotIn("acp_args", props["tasks"]["items"]["properties"])
         self.assertNotIn("maxItems", props["tasks"])  # removed — limit is now runtime-configurable
 
+    def test_background_schema_explains_detach_and_acp_join_contract(self):
+        description = DELEGATE_TASK_SCHEMA["parameters"]["properties"][
+            "background"
+        ]["description"]
+
+        self.assertIn("detached", description.lower())
+        self.assertIn("later turn", description.lower())
+        self.assertIn("ACP", description)
+        self.assertIn("awaited and consolidated", description)
+        self.assertIn("synchronous", description.lower())
+        self.assertIn("this reply", description.lower())
+        self.assertNotIn("Do not wait or poll", description)
+
     def test_top_level_description_compact_and_complete(self):
         """The top-level description must stay compact while keeping every
         contract that exists nowhere else in the schema (keyword-level, not
