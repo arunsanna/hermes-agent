@@ -66,6 +66,23 @@ def _drop_verification_continuation_scaffolding(messages) -> None:
     ]
 
 
+def _hook_timeout_s() -> float:
+    """Per-callback timeout (seconds) for the response-gating finalize hooks.
+
+    These hooks (``transform_llm_output`` / ``post_llm_call`` / ``on_session_end``)
+    run on the synchronous ``finalize_turn`` tail, which gates the ACP
+    ``session/prompt`` response the gateway awaits. An unbounded blocking
+    callback there freezes the turn until the gateway's 300s stall watchdog
+    force-fails it. Bounding each callback well under that (default 30s) lets the
+    turn deliver its response and its ``stopReason`` normally. Tunable via
+    ``HERMES_HOOK_TIMEOUT_S``; ``<= 0`` restores the prior unbounded behavior.
+    """
+    try:
+        return float(os.environ.get("HERMES_HOOK_TIMEOUT_S", "30"))
+    except (TypeError, ValueError):
+        return 30.0
+
+
 def finalize_turn(
     agent,
     *,
@@ -461,6 +478,7 @@ def finalize_turn(
             from hermes_cli.plugins import invoke_hook as _invoke_hook
             _transform_results = _invoke_hook(
                 "transform_llm_output",
+                _timeout_s=_hook_timeout_s(),
                 response_text=final_response,
                 session_id=agent.session_id or "",
                 model=agent.model,
@@ -483,6 +501,7 @@ def finalize_turn(
             from hermes_cli.plugins import invoke_hook as _invoke_hook
             _invoke_hook(
                 "post_llm_call",
+                _timeout_s=_hook_timeout_s(),
                 session_id=agent.session_id,
                 task_id=effective_task_id,
                 turn_id=turn_id,
@@ -614,6 +633,7 @@ def finalize_turn(
         from hermes_cli.plugins import invoke_hook as _invoke_hook
         _invoke_hook(
             "on_session_end",
+            _timeout_s=_hook_timeout_s(),
             session_id=agent.session_id,
             task_id=effective_task_id,
             turn_id=turn_id,
