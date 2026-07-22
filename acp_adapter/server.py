@@ -75,7 +75,13 @@ from acp_adapter.events import (
 from acp_adapter.permissions import make_approval_callback
 from acp_adapter.provenance import session_provenance_meta
 from acp_adapter.session import SessionManager, SessionState, _expand_acp_enabled_toolsets
-from acp_adapter.tools import build_tool_complete, build_tool_start
+from acp_adapter.tools import (
+    _async_background_delegation_id,
+    build_async_background_completion,
+    build_tool_complete,
+    build_tool_start,
+    flush_async_background_dispatches,
+)
 from tools.approval import (
     reset_hermes_interactive_context,
     set_hermes_interactive_context,
@@ -1603,6 +1609,7 @@ class HermesACPAgent(acp.Agent):
 
         tool_call_ids: dict[str, Deque[str]] = defaultdict(deque)
         tool_call_meta: dict[str, dict[str, Any]] = {}
+        delegation_tool_calls: dict[str, str] = {}
         previous_approval_cb = None
         edit_approval_requester = None
 
@@ -1618,7 +1625,32 @@ class HermesACPAgent(acp.Agent):
                 edit_approval_policy_getter=lambda: self._edit_approval_policy_for_state(state),
             )
             reasoning_cb = make_thinking_cb(conn, session_id, loop)
-            step_cb = make_step_cb(conn, session_id, loop, tool_call_ids, tool_call_meta)
+            base_step_cb = make_step_cb(
+                conn, session_id, loop, tool_call_ids, tool_call_meta
+            )
+
+            def step_cb(api_call_count: int, prev_tools: Any = None) -> None:
+                for tool_info in prev_tools if isinstance(prev_tools, list) else []:
+                    if not isinstance(tool_info, dict):
+                        continue
+                    tool_name = tool_info.get("name") or tool_info.get(
+                        "function_name"
+                    )
+                    result_text = tool_info.get("result") or tool_info.get("output")
+                    delegation_id = _async_background_delegation_id(
+                        str(result_text) if result_text is not None else None,
+                        tool_name,
+                    )
+                    queue = tool_call_ids.get(tool_name or "")
+                    if delegation_id and queue:
+                        tool_call_id = (
+                            queue
+                            if isinstance(queue, str)
+                            else next(iter(queue), None)
+                        )
+                        if tool_call_id:
+                            delegation_tool_calls[delegation_id] = tool_call_id
+                base_step_cb(api_call_count, prev_tools)
             message_cb = make_message_cb(conn, session_id, loop)
 
             def stream_delta_cb(text: str) -> None:
@@ -1780,11 +1812,16 @@ class HermesACPAgent(acp.Agent):
                 state.current_prompt_text = ""
             if conn:
                 flush_open_tool_calls(conn, session_id, loop, tool_call_ids, tool_call_meta)
+                for update in flush_async_background_dispatches(
+                    delegation_tool_calls, set(delegation_tool_calls)
+                ):
+                    await conn.session_update(session_id, update)
             return PromptResponse(stop_reason="end_turn")
 
         if result.get("messages"):
             state.history = result["messages"]
 
+        joined_completed_ids: set[str] = set()
         try:
             from tools.async_delegation import join, running_for_session
             from tools.delegate_tool import _load_config
@@ -1833,6 +1870,31 @@ class HermesACPAgent(acp.Agent):
                 joined = await loop.run_in_executor(
                     _executor, join, delegation_ids, join_timeout
                 )
+                joined_completed_ids.update(
+                    str(delegation_id)
+                    for delegation_id in joined.get("completed") or []
+                )
+                completed_events = self._drain_session_delegation_completions(
+                    process_registry,
+                    format_process_notification,
+                    session_id,
+                    state,
+                )
+                for event in completed_events:
+                    delegation_id = str(event.get("delegation_id") or "")
+                    tool_call_id = delegation_tool_calls.pop(
+                        delegation_id, None
+                    )
+                    if conn and tool_call_id:
+                        formatted_result = format_process_notification(event) or str(
+                            event.get("summary") or event.get("error") or ""
+                        )
+                        await conn.session_update(
+                            session_id,
+                            build_async_background_completion(
+                                tool_call_id, event, formatted_result
+                            ),
+                        )
                 if joined.get("pending"):
                     state.history.append(
                         {
@@ -1845,13 +1907,6 @@ class HermesACPAgent(acp.Agent):
                     )
                     pending_note_added = True
                     break
-
-                completed_events = self._drain_session_delegation_completions(
-                    process_registry,
-                    format_process_notification,
-                    session_id,
-                    state,
-                )
                 if not completed_events:
                     break
 
@@ -1887,11 +1942,21 @@ class HermesACPAgent(acp.Agent):
                 "ACP same-turn delegation join failed for session %s", session_id
             )
 
+        missing_result_ids = {
+            delegation_id
+            for delegation_id in joined_completed_ids
+            if delegation_id in delegation_tool_calls
+        }
+
         # The turn is over: close any tool calls whose completion never made it
         # through the name-keyed FIFO pairing (long-turn steering/compression
         # drift), so clients never keep stuck in-progress items past end_turn.
         if conn:
             flush_open_tool_calls(conn, session_id, loop, tool_call_ids, tool_call_meta)
+            for update in flush_async_background_dispatches(
+                delegation_tool_calls, missing_result_ids
+            ):
+                await conn.session_update(session_id, update)
 
         if result.get("messages"):
             # Persist updated history so sessions survive process restarts.

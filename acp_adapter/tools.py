@@ -256,15 +256,63 @@ def _is_async_background_dispatch(result: Optional[str], tool_name: str | None =
     real aggregated results (not ``status="dispatched"``), so they stay
     ``completed`` — this predicate matches only the accepted-async case.
     """
+    return _async_background_delegation_id(result, tool_name) is not None
+
+
+def _async_background_delegation_id(
+    result: Optional[str], tool_name: str | None = None
+) -> Optional[str]:
+    """Return the delegation id from an accepted background dispatch ack."""
     if tool_name != "delegate_task":
-        return False
+        return None
     data = _json_loads_maybe(result)
     if not isinstance(data, dict):
-        return False
-    return (
+        return None
+    accepted = (
         str(data.get("status") or "").strip().lower() == "dispatched"
         and str(data.get("mode") or "").strip().lower() == "background"
     )
+    delegation_id = str(data.get("delegation_id") or "").strip()
+    return delegation_id if accepted and delegation_id else None
+
+
+def build_async_background_completion(
+    tool_call_id: str, event: Dict[str, Any], formatted_result: str
+) -> ToolCallProgress:
+    """Close the original dispatch card with its aggregated child result."""
+    status_raw = str(event.get("status") or "completed").strip().lower()
+    ok = status_raw in {"completed", "complete", "success", "done", ""}
+    return acp.update_tool_call(
+        tool_call_id,
+        kind="execute",
+        status="completed" if ok else "failed",
+        content=[_text(formatted_result)] if formatted_result else None,
+    )
+
+
+def flush_async_background_dispatches(
+    delegation_tool_calls: Dict[str, str],
+    missing_result_ids: set[str],
+) -> List[ToolCallProgress]:
+    """Terminalize every dispatch card that remains open at turn end."""
+    updates = []
+    for delegation_id, tool_call_id in list(delegation_tool_calls.items()):
+        missing = delegation_id in missing_result_ids
+        text = (
+            "subagent result not received"
+            if missing
+            else "Background delegation detached; result will arrive in a later turn."
+        )
+        updates.append(
+            acp.update_tool_call(
+                tool_call_id,
+                kind="execute",
+                status="failed" if missing else "completed",
+                content=[_text(text)],
+            )
+        )
+        delegation_tool_calls.pop(delegation_id, None)
+    return updates
 
 
 def _truncate_text(text: str, limit: int = 5000) -> str:
