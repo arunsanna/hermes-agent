@@ -9,6 +9,7 @@ import contextvars
 import json
 import logging
 import os
+import time
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -632,6 +633,34 @@ class HermesACPAgent(acp.Agent):
             await self._notify_background_completion(session_id, evt)
         for evt in requeue:
             pr.completion_queue.put(evt)
+
+    @staticmethod
+    def _drain_session_delegation_completions(pr, formatter, session_id, state):
+        """Take this session's delegation events and requeue everything else."""
+        drained = []
+        while not pr.completion_queue.empty():
+            try:
+                drained.append(pr.completion_queue.get_nowait())
+            except Exception:
+                break
+
+        matched = []
+        requeue = []
+        for evt in drained:
+            if (
+                evt.get("type") != "async_delegation"
+                or str(evt.get("session_key") or "") != session_id
+            ):
+                requeue.append(evt)
+                continue
+            matched.append(evt)
+            text = formatter(evt)
+            if text:
+                state.history.append({"role": "user", "content": text})
+
+        for evt in requeue:
+            pr.completion_queue.put(evt)
+        return matched
 
     async def _notify_background_completion(self, session_id: str, evt: dict) -> None:
         """Emit an out-of-turn tool frame pair for a finished background child."""
@@ -1645,7 +1674,10 @@ class HermesACPAgent(acp.Agent):
         edit_approval_token = None
         previous_session_id = None
 
-        def _run_agent() -> dict:
+        def _run_agent(
+            run_user_content=user_content,
+            persist_user_message=user_text or "[Image attachment]",
+        ) -> dict:
             nonlocal previous_approval_cb, interactive_token, edit_approval_token, previous_session_id
             # Bind HERMES_SESSION_KEY for this session so per-session caches
             # (e.g. the interactive sudo password cache in tools.terminal_tool)
@@ -1691,10 +1723,10 @@ class HermesACPAgent(acp.Agent):
             os.environ["HERMES_SESSION_ID"] = session_id
             try:
                 result = agent.run_conversation(
-                    user_message=user_content,
+                    user_message=run_user_content,
                     conversation_history=state.history,
                     task_id=session_id,
-                    persist_user_message=user_text or "[Image attachment]",
+                    persist_user_message=persist_user_message,
                 )
                 return result
             except Exception as e:
@@ -1739,6 +1771,7 @@ class HermesACPAgent(acp.Agent):
             # stomp on each other's ContextVar writes (HERMES_SESSION_KEY in
             # particular — used by the interactive sudo password cache scope).
             ctx = contextvars.copy_context()
+            turn_start_ts = time.time()
             result = await loop.run_in_executor(_executor, ctx.run, _run_agent)
         except Exception:
             logger.exception("Executor error for session %s", session_id)
@@ -1749,6 +1782,111 @@ class HermesACPAgent(acp.Agent):
                 flush_open_tool_calls(conn, session_id, loop, tool_call_ids, tool_call_meta)
             return PromptResponse(stop_reason="end_turn")
 
+        if result.get("messages"):
+            state.history = result["messages"]
+
+        try:
+            from tools.async_delegation import join, running_for_session
+            from tools.delegate_tool import _load_config
+            from tools.process_registry import (
+                format_process_notification,
+                process_registry,
+            )
+            from utils import is_truthy_value
+
+            delegation_config = _load_config()
+            join_enabled = is_truthy_value(
+                delegation_config.get("acp_join_same_turn"), default=True
+            )
+            try:
+                max_join_rounds = max(
+                    0, int(delegation_config.get("acp_join_max_rounds", 3))
+                )
+            except (TypeError, ValueError):
+                max_join_rounds = 3
+            try:
+                join_timeout = max(
+                    0.0,
+                    float(
+                        delegation_config.get(
+                            "acp_join_timeout_seconds", 180
+                        )
+                    ),
+                )
+            except (TypeError, ValueError):
+                join_timeout = 180.0
+
+            pending = (
+                running_for_session(session_id, turn_start_ts)
+                if join_enabled
+                else []
+            )
+            pending_note_added = False
+            for _round in range(max_join_rounds):
+                if not pending:
+                    break
+                delegation_ids = [
+                    str(record.get("delegation_id") or "")
+                    for record in pending
+                    if record.get("delegation_id")
+                ]
+                joined = await loop.run_in_executor(
+                    _executor, join, delegation_ids, join_timeout
+                )
+                if joined.get("pending"):
+                    state.history.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Background subagent(s) still running; results "
+                                "will arrive shortly."
+                            ),
+                        }
+                    )
+                    pending_note_added = True
+                    break
+
+                completed_events = self._drain_session_delegation_completions(
+                    process_registry,
+                    format_process_notification,
+                    session_id,
+                    state,
+                )
+                if not completed_events:
+                    break
+
+                continuation = (
+                    "Your background subagent(s) have completed; their results "
+                    "are above. Incorporate them and give your consolidated "
+                    "final answer."
+                )
+                continuation_ctx = contextvars.copy_context()
+                result = await loop.run_in_executor(
+                    _executor,
+                    continuation_ctx.run,
+                    _run_agent,
+                    continuation,
+                    continuation,
+                )
+                if result.get("messages"):
+                    state.history = result["messages"]
+                pending = running_for_session(session_id, turn_start_ts)
+
+            if pending and not pending_note_added:
+                state.history.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Background subagent(s) still running; results will "
+                            "arrive shortly."
+                        ),
+                    }
+                )
+        except Exception:
+            logger.exception(
+                "ACP same-turn delegation join failed for session %s", session_id
+            )
+
         # The turn is over: close any tool calls whose completion never made it
         # through the name-keyed FIFO pairing (long-turn steering/compression
         # drift), so clients never keep stuck in-progress items past end_turn.
@@ -1756,7 +1894,6 @@ class HermesACPAgent(acp.Agent):
             flush_open_tool_calls(conn, session_id, loop, tool_call_ids, tool_call_meta)
 
         if result.get("messages"):
-            state.history = result["messages"]
             # Persist updated history so sessions survive process restarts.
             self.session_manager.save_session(session_id)
 
