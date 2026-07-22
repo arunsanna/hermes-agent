@@ -2846,16 +2846,18 @@ def delegate_task(
         if dispatch.get("status") == "dispatched":
             n = len(_goals)
             note = (
-                "Subagent is running in the background. You and the user can "
-                "keep working; its full result re-enters the conversation as a "
-                "new message when it finishes. Do not wait or poll — just "
-                "continue."
+                "Background dispatch is detached: the subagent result normally "
+                "re-enters in a later turn. On the ACP surface, if you end your "
+                "turn, it will be awaited and consolidated before the reply "
+                "finalizes. For work you must consolidate into this reply, "
+                "prefer synchronous delegation (the default)."
                 if n == 1 else
-                f"{n} subagents are running in parallel in the background. You "
-                f"and the user can keep working; they wait on each other and "
-                f"their consolidated results re-enter the conversation as a "
-                f"single message once ALL of them finish. Do not wait or poll "
-                f"— just continue."
+                f"Background dispatch is detached: {n} subagents are running in "
+                f"parallel and their consolidated results normally re-enter in a "
+                f"later turn. On the ACP surface, if you end your turn, they will "
+                f"be awaited and consolidated before the reply finalizes. For "
+                f"work you must consolidate into this reply, prefer synchronous "
+                f"delegation (the default)."
             )
             payload = {
                 "status": "dispatched",
@@ -3417,13 +3419,13 @@ DELEGATE_TASK_SCHEMA = {
             "background": {
                 "type": "boolean",
                 "description": (
-                    "DEPRECATED / IGNORED. Single-task delegations always run "
-                    "in the background automatically — you do not need to (and "
-                    "cannot) opt in or out. The result re-enters the "
-                    "conversation as a new message when the subagent finishes; "
-                    "just continue working in the meantime. Setting this has no "
-                    "effect; the parameter remains only for backward "
-                    "compatibility."
+                    "Background means detached: results normally re-enter in a "
+                    "later turn. On the ACP surface, if you end your turn, "
+                    "background subagents will be awaited and consolidated before "
+                    "the reply finalizes. For work you must consolidate into this "
+                    "reply, prefer synchronous delegation (the default). This "
+                    "parameter may be ignored by model-facing top-level routing "
+                    "and remains for backward compatibility."
                 ),
             },
             "acp_command": {

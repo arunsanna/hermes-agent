@@ -380,6 +380,13 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     assert parsed["status"] == "dispatched"
     assert parsed["mode"] == "background"
     assert parsed["delegation_id"].startswith("deleg_")
+    assert "detached" in parsed["note"].lower()
+    assert "later turn" in parsed["note"].lower()
+    assert "ACP" in parsed["note"]
+    assert "awaited and consolidated" in parsed["note"]
+    assert "synchronous" in parsed["note"].lower()
+    assert "this reply" in parsed["note"].lower()
+    assert "Do not wait or poll" not in parsed["note"]
     # Non-blocking invariant: delegate_task returned while the child is STILL
     # blocked on the closed gate, so no completion event exists yet.
     assert process_registry.completion_queue.empty()
