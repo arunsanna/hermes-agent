@@ -183,3 +183,33 @@ async def test_cancelled_turn_skips_barrier_and_interrupts_subagents(monkeypatch
     assert len(interrupt_calls) == 1
     assert interrupt_calls[0].get("session_key") == state.session_id
     assert state.is_running is False
+
+
+# ---------------------------------------------------------------------------
+# P0.3 — a cancelled turn still drains prompts the user queued after STOP.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cancelled_turn_still_drains_queued_follow_ups(monkeypatch):
+    acp_agent, state, fake, _conn = _make_prompt_agent(
+        monkeypatch, cancel_mid_turn=True
+    )
+    monkeypatch.setattr(
+        "tools.async_delegation.interrupt_for_session",
+        lambda **_kwargs: 0,
+    )
+    # Two prompts the user typed after hitting STOP, queued while the
+    # cancelled turn was still (cooperatively) finishing on the executor.
+    state.queued_prompts.append("follow-up one")
+    state.queued_prompts.append("follow-up two")
+
+    response = await acp_agent.prompt(
+        session_id=state.session_id,
+        prompt=[TextContentBlock(type="text", text="do work")],
+    )
+
+    assert response.stop_reason == "cancelled"
+    assert state.queued_prompts == []
+    assert fake.runs == ["do work", "follow-up one", "follow-up two"]
+    assert state.is_running is False
