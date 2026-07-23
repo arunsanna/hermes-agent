@@ -1828,126 +1828,167 @@ class HermesACPAgent(acp.Agent):
         # (`is_running=False`) and drains anything queued while it ran — on
         # normal, cancelled, or errored exit. No path below may leave
         # `is_running` True (Phase 0 / stop-p0-brief.md P0.1).
+        # Computed before the barrier (Phase 0 / stop-p0-brief.md P0.2): a
+        # turn that was cancelled must skip the join barrier entirely rather
+        # than re-running the agent with a "consolidate results" prompt the
+        # user never asked for.
+        cancelled_before_barrier = bool(
+            state.cancel_event and state.cancel_event.is_set()
+        )
         try:
-            try:
-                from tools.async_delegation import join, running_for_session
-                from tools.delegate_tool import _load_config
-                from tools.process_registry import (
-                    format_process_notification,
-                    process_registry,
-                )
-                from utils import is_truthy_value
-
-                delegation_config = _load_config()
-                join_enabled = is_truthy_value(
-                    delegation_config.get("acp_join_same_turn"), default=True
-                )
+            if cancelled_before_barrier:
                 try:
-                    max_join_rounds = max(
-                        0, int(delegation_config.get("acp_join_max_rounds", 3))
-                    )
-                except (TypeError, ValueError):
-                    max_join_rounds = 3
-                try:
-                    join_timeout = max(
-                        0.0,
-                        float(
-                            delegation_config.get(
-                                "acp_join_timeout_seconds", 180
-                            )
-                        ),
-                    )
-                except (TypeError, ValueError):
-                    join_timeout = 180.0
+                    from tools.async_delegation import interrupt_for_session
 
-                pending = (
-                    running_for_session(session_id, turn_start_ts)
-                    if join_enabled
-                    else []
-                )
-                pending_note_added = False
-                for _round in range(max_join_rounds):
-                    if not pending:
-                        break
-                    delegation_ids = [
-                        str(record.get("delegation_id") or "")
-                        for record in pending
-                        if record.get("delegation_id")
-                    ]
-                    joined = await loop.run_in_executor(
-                        _executor, join, delegation_ids, join_timeout
+                    interrupt_for_session(
+                        session_key=session_id, reason="user cancelled"
                     )
-                    joined_completed_ids.update(
-                        str(delegation_id)
-                        for delegation_id in joined.get("completed") or []
-                    )
-                    completed_events = self._drain_session_delegation_completions(
-                        process_registry,
-                        format_process_notification,
+                except Exception:
+                    logger.exception(
+                        "Failed to interrupt async delegations for cancelled "
+                        "session %s",
                         session_id,
-                        state,
                     )
-                    for event in completed_events:
-                        delegation_id = str(event.get("delegation_id") or "")
-                        tool_call_id = delegation_tool_calls.pop(
-                            delegation_id, None
+            else:
+                try:
+                    from tools.async_delegation import join, running_for_session
+                    from tools.delegate_tool import _load_config
+                    from tools.process_registry import (
+                        format_process_notification,
+                        process_registry,
+                    )
+                    from utils import is_truthy_value
+
+                    delegation_config = _load_config()
+                    join_enabled = is_truthy_value(
+                        delegation_config.get("acp_join_same_turn"), default=True
+                    )
+                    try:
+                        max_join_rounds = max(
+                            0, int(delegation_config.get("acp_join_max_rounds", 3))
                         )
-                        if conn and tool_call_id:
-                            formatted_result = format_process_notification(event) or str(
-                                event.get("summary") or event.get("error") or ""
+                    except (TypeError, ValueError):
+                        max_join_rounds = 3
+                    try:
+                        join_timeout = max(
+                            0.0,
+                            float(
+                                delegation_config.get(
+                                    "acp_join_timeout_seconds", 180
+                                )
+                            ),
+                        )
+                    except (TypeError, ValueError):
+                        join_timeout = 180.0
+
+                    pending = (
+                        running_for_session(session_id, turn_start_ts)
+                        if join_enabled
+                        else []
+                    )
+                    pending_note_added = False
+                    for _round in range(max_join_rounds):
+                        if not pending:
+                            break
+                        # Re-check between join rounds: STOP can land while we're
+                        # waiting on join() below, or during the continuation
+                        # re-run's executor call. Abort the barrier loop rather
+                        # than keep consolidating a turn the user already cancelled.
+                        if state.cancel_event and state.cancel_event.is_set():
+                            try:
+                                from tools.async_delegation import (
+                                    interrupt_for_session,
+                                )
+
+                                interrupt_for_session(
+                                    session_key=session_id, reason="user cancelled"
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "Failed to interrupt async delegations for "
+                                    "session %s cancelled mid-join",
+                                    session_id,
+                                )
+                            break
+                        delegation_ids = [
+                            str(record.get("delegation_id") or "")
+                            for record in pending
+                            if record.get("delegation_id")
+                        ]
+                        joined = await loop.run_in_executor(
+                            _executor, join, delegation_ids, join_timeout
+                        )
+                        joined_completed_ids.update(
+                            str(delegation_id)
+                            for delegation_id in joined.get("completed") or []
+                        )
+                        completed_events = self._drain_session_delegation_completions(
+                            process_registry,
+                            format_process_notification,
+                            session_id,
+                            state,
+                        )
+                        for event in completed_events:
+                            delegation_id = str(event.get("delegation_id") or "")
+                            tool_call_id = delegation_tool_calls.pop(
+                                delegation_id, None
                             )
-                            await conn.session_update(
-                                session_id,
-                                build_async_background_completion(
-                                    tool_call_id, event, formatted_result
-                                ),
+                            if conn and tool_call_id:
+                                formatted_result = format_process_notification(event) or str(
+                                    event.get("summary") or event.get("error") or ""
+                                )
+                                await conn.session_update(
+                                    session_id,
+                                    build_async_background_completion(
+                                        tool_call_id, event, formatted_result
+                                    ),
+                                )
+                        if joined.get("pending"):
+                            state.history.append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "Background subagent(s) still running; results "
+                                        "will arrive shortly."
+                                    ),
+                                }
                             )
-                    if joined.get("pending"):
+                            pending_note_added = True
+                            break
+                        if not completed_events:
+                            break
+
+                        continuation = (
+                            "Your background subagent(s) have completed; their results "
+                            "are above. Incorporate them and give your consolidated "
+                            "final answer."
+                        )
+                        continuation_ctx = contextvars.copy_context()
+                        result = await loop.run_in_executor(
+                            _executor,
+                            continuation_ctx.run,
+                            _run_agent,
+                            continuation,
+                            continuation,
+                        )
+                        if result.get("messages"):
+                            state.history = result["messages"]
+                        pending = running_for_session(session_id, turn_start_ts)
+
+                    if pending and not pending_note_added:
                         state.history.append(
                             {
                                 "role": "user",
                                 "content": (
-                                    "Background subagent(s) still running; results "
-                                    "will arrive shortly."
+                                    "Background subagent(s) still running; results will "
+                                    "arrive shortly."
                                 ),
                             }
                         )
-                        pending_note_added = True
-                        break
-                    if not completed_events:
-                        break
-
-                    continuation = (
-                        "Your background subagent(s) have completed; their results "
-                        "are above. Incorporate them and give your consolidated "
-                        "final answer."
+                except Exception:
+                    logger.exception(
+                        "ACP same-turn delegation join failed for session %s", session_id
                     )
-                    continuation_ctx = contextvars.copy_context()
-                    result = await loop.run_in_executor(
-                        _executor,
-                        continuation_ctx.run,
-                        _run_agent,
-                        continuation,
-                        continuation,
-                    )
-                    if result.get("messages"):
-                        state.history = result["messages"]
-                    pending = running_for_session(session_id, turn_start_ts)
-
-                if pending and not pending_note_added:
-                    state.history.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                "Background subagent(s) still running; results will "
-                                "arrive shortly."
-                            ),
-                        }
-                    )
-            except Exception:
-                logger.exception(
-                    "ACP same-turn delegation join failed for session %s", session_id
-                )
 
             missing_result_ids = {
                 delegation_id
