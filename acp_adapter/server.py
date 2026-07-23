@@ -640,6 +640,29 @@ class HermesACPAgent(acp.Agent):
         for evt in requeue:
             pr.completion_queue.put(evt)
 
+    async def _drain_queued_prompts(self, state, session_id, conn):
+        """Run every prompt the caller queued while this turn was in flight,
+        as normal follow-up user turns (preserving role alternation and
+        history). Every `prompt()` return path — normal completion, a
+        cancelled turn, a post-barrier exception, or an exception from the
+        initial executor dispatch itself — must call this exactly once after
+        freeing `is_running`, so a queued follow-up never sits stuck (Phase 0
+        / stop-p0-brief.md P0.1, HOLE 2)."""
+        while True:
+            with state.runtime_lock:
+                if not state.queued_prompts:
+                    break
+                next_prompt = state.queued_prompts.pop(0)
+            if conn:
+                await conn.session_update(
+                    session_id,
+                    acp.update_user_message_text(next_prompt),
+                )
+            await self.prompt(
+                prompt=[TextContentBlock(type="text", text=next_prompt)],
+                session_id=session_id,
+            )
+
     @staticmethod
     def _drain_session_delegation_completions(pr, formatter, session_id, state):
         """Take this session's delegation events and requeue everything else."""
@@ -1816,6 +1839,11 @@ class HermesACPAgent(acp.Agent):
                     delegation_tool_calls, set(delegation_tool_calls)
                 ):
                     await conn.session_update(session_id, update)
+            # HOLE 2 (Phase 0 / stop-p0-brief.md): this path must drain
+            # queued_prompts exactly like every other return path below, so a
+            # prompt the user typed while the initial executor dispatch was
+            # crashing doesn't sit stuck forever.
+            await self._drain_queued_prompts(state, session_id, conn)
             return PromptResponse(stop_reason="end_turn")
 
         if result.get("messages"):
@@ -2105,20 +2133,7 @@ class HermesACPAgent(acp.Agent):
                 state.is_running = False
                 state.current_prompt_text = ""
 
-            while True:
-                with state.runtime_lock:
-                    if not state.queued_prompts:
-                        break
-                    next_prompt = state.queued_prompts.pop(0)
-                if conn:
-                    await conn.session_update(
-                        session_id,
-                        acp.update_user_message_text(next_prompt),
-                    )
-                await self.prompt(
-                    prompt=[TextContentBlock(type="text", text=next_prompt)],
-                    session_id=session_id,
-                )
+            await self._drain_queued_prompts(state, session_id, conn)
 
         usage = None
         if any(result.get(key) is not None for key in ("prompt_tokens", "completion_tokens", "total_tokens")):
