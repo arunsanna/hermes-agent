@@ -216,6 +216,103 @@ async def test_cancelled_turn_still_drains_queued_follow_ups(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# HOLE 1 — the join barrier only re-checked cancel_event at the TOP of each
+# round. STOP landing while blocked in join() (checkpoint a) or between the
+# drain and the continuation dispatch (checkpoint b) must still be caught:
+# no continuation _run_agent call, and subagents get interrupted.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_join_wait_skips_continuation_and_interrupts(
+    monkeypatch,
+):
+    """STOP lands while the barrier is blocked inside join() itself (not at
+    the top of the round). The re-check immediately after join() returns
+    must catch it and skip the continuation re-run entirely."""
+    acp_agent, state, fake, _conn = _make_prompt_agent(monkeypatch)
+    monkeypatch.setattr(
+        "tools.async_delegation.running_for_session",
+        lambda session_key, since_ts=None: [{"delegation_id": "deleg_a"}],
+    )
+
+    def _join(delegation_ids, timeout):
+        # Simulate STOP arriving while this turn was blocked waiting on
+        # join() — the cancel_event flips before join() returns.
+        state.cancel_event.set()
+        return {"completed": list(delegation_ids), "pending": []}
+
+    monkeypatch.setattr("tools.async_delegation.join", _join)
+
+    interrupt_calls = []
+    monkeypatch.setattr(
+        "tools.async_delegation.interrupt_for_session",
+        lambda **kwargs: interrupt_calls.append(kwargs) or 1,
+    )
+
+    response = await acp_agent.prompt(
+        session_id=state.session_id,
+        prompt=[TextContentBlock(type="text", text="do work")],
+    )
+
+    # Only the original turn ran; the join()-completed delegation must NOT
+    # trigger a "consolidate results" continuation re-run.
+    assert fake.runs == ["do work"]
+    assert len(interrupt_calls) == 1
+    assert interrupt_calls[0].get("session_key") == state.session_id
+    assert state.is_running is False
+    assert response.stop_reason == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_drain_before_continuation_skips_continuation(
+    monkeypatch,
+):
+    """STOP lands after join() returns completed delegations and the
+    completion drain runs, but before the continuation _run_agent call is
+    dispatched. The re-check immediately before that dispatch must catch it."""
+    acp_agent, state, fake, _conn = _make_prompt_agent(monkeypatch)
+    monkeypatch.setattr(
+        "tools.async_delegation.running_for_session",
+        lambda session_key, since_ts=None: [{"delegation_id": "deleg_b"}],
+    )
+    monkeypatch.setattr(
+        "tools.async_delegation.join",
+        lambda delegation_ids, timeout: {
+            "completed": list(delegation_ids),
+            "pending": [],
+        },
+    )
+
+    def _drain(pr, formatter, session_id, state_arg):
+        # Simulate STOP arriving during the (synchronous) completion drain,
+        # i.e. after join() returned but before the continuation dispatch.
+        state_arg.cancel_event.set()
+        return [{"delegation_id": "deleg_b", "summary": "done"}]
+
+    monkeypatch.setattr(acp_agent, "_drain_session_delegation_completions", _drain)
+
+    interrupt_calls = []
+    monkeypatch.setattr(
+        "tools.async_delegation.interrupt_for_session",
+        lambda **kwargs: interrupt_calls.append(kwargs) or 1,
+    )
+
+    response = await acp_agent.prompt(
+        session_id=state.session_id,
+        prompt=[TextContentBlock(type="text", text="do work")],
+    )
+
+    # The original turn ran, but the continuation ("Your background
+    # subagent(s) have completed...") must NOT run once cancelled.
+    assert fake.runs == ["do work"]
+    assert len(interrupt_calls) == 1
+    assert interrupt_calls[0].get("session_key") == state.session_id
+    assert state.is_running is False
+    assert response.stop_reason == "cancelled"
+
+
+# ---------------------------------------------------------------------------
 # HOLE 2 — the except block around the INITIAL executor call resets
 # is_running but must also drain state.queued_prompts, same as every other
 # return path in prompt().

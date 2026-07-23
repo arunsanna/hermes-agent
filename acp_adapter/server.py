@@ -1909,6 +1909,28 @@ class HermesACPAgent(acp.Agent):
                     except (TypeError, ValueError):
                         join_timeout = 180.0
 
+                    def _cancelled() -> bool:
+                        return bool(
+                            state.cancel_event and state.cancel_event.is_set()
+                        )
+
+                    def _interrupt_cancelled_subagents(where: str) -> None:
+                        try:
+                            from tools.async_delegation import (
+                                interrupt_for_session,
+                            )
+
+                            interrupt_for_session(
+                                session_key=session_id, reason="user cancelled"
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Failed to interrupt async delegations for "
+                                "session %s cancelled %s",
+                                session_id,
+                                where,
+                            )
+
                     pending = (
                         running_for_session(session_id, turn_start_ts)
                         if join_enabled
@@ -1917,26 +1939,21 @@ class HermesACPAgent(acp.Agent):
                     pending_note_added = False
                     for _round in range(max_join_rounds):
                         if not pending:
+                            # Nothing left to join. Still interrupt if STOP
+                            # landed exactly as the last round's pending list
+                            # emptied out, so a race here can't leave a
+                            # subagent running unattended past cancellation
+                            # (Phase 0 / stop-p0-brief.md HOLE 1).
+                            if _cancelled():
+                                _interrupt_cancelled_subagents("with nothing pending")
                             break
-                        # Re-check between join rounds: STOP can land while we're
-                        # waiting on join() below, or during the continuation
-                        # re-run's executor call. Abort the barrier loop rather
-                        # than keep consolidating a turn the user already cancelled.
-                        if state.cancel_event and state.cancel_event.is_set():
-                            try:
-                                from tools.async_delegation import (
-                                    interrupt_for_session,
-                                )
-
-                                interrupt_for_session(
-                                    session_key=session_id, reason="user cancelled"
-                                )
-                            except Exception:
-                                logger.exception(
-                                    "Failed to interrupt async delegations for "
-                                    "session %s cancelled mid-join",
-                                    session_id,
-                                )
+                        # Re-check at the TOP of each round: STOP can land while
+                        # we're waiting on join() below, or during the
+                        # continuation re-run's executor call. Abort the
+                        # barrier loop rather than keep consolidating a turn
+                        # the user already cancelled.
+                        if _cancelled():
+                            _interrupt_cancelled_subagents("mid-join")
                             break
                         delegation_ids = [
                             str(record.get("delegation_id") or "")
@@ -1946,6 +1963,14 @@ class HermesACPAgent(acp.Agent):
                         joined = await loop.run_in_executor(
                             _executor, join, delegation_ids, join_timeout
                         )
+                        # Re-check IMMEDIATELY after join() returns: STOP can
+                        # land while this coroutine was blocked waiting on the
+                        # executor, before any of the completed delegations'
+                        # results are consolidated into a continuation turn
+                        # (Phase 0 / stop-p0-brief.md HOLE 1, checkpoint a).
+                        if _cancelled():
+                            _interrupt_cancelled_subagents("right after join() returned")
+                            break
                         joined_completed_ids.update(
                             str(delegation_id)
                             for delegation_id in joined.get("completed") or []
@@ -1984,6 +2009,17 @@ class HermesACPAgent(acp.Agent):
                             pending_note_added = True
                             break
                         if not completed_events:
+                            break
+
+                        # Re-check IMMEDIATELY BEFORE dispatching the
+                        # continuation: STOP can land during the completion
+                        # drain/notification work above, between join()
+                        # returning and this dispatch (Phase 0 /
+                        # stop-p0-brief.md HOLE 1, checkpoint b).
+                        if _cancelled():
+                            _interrupt_cancelled_subagents(
+                                "right before the continuation dispatch"
+                            )
                             break
 
                         continuation = (
