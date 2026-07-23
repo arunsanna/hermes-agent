@@ -62,7 +62,6 @@ def _make_codex_agent(**overrides):
         quiet_mode=True,
         skip_context_files=True,
         skip_memory=True,
-        **kwargs,
     )
     kwargs.update(overrides)
     return run_agent.AIAgent(**kwargs)
