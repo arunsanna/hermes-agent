@@ -213,3 +213,40 @@ async def test_cancelled_turn_still_drains_queued_follow_ups(monkeypatch):
     assert state.queued_prompts == []
     assert fake.runs == ["do work", "follow-up one", "follow-up two"]
     assert state.is_running is False
+
+
+# ---------------------------------------------------------------------------
+# HOLE 2 — the except block around the INITIAL executor call resets
+# is_running but must also drain state.queued_prompts, same as every other
+# return path in prompt().
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_initial_executor_exception_drains_queued_prompts(monkeypatch):
+    """`_run_agent` catches every `run_conversation` exception internally and
+    turns it into a normal result, so the outer `except Exception` around the
+    INITIAL executor call (server.py ~L1808) only fires for failures in the
+    executor plumbing itself (context copy, executor scheduling, etc.), not
+    agent errors. Reproduce that by making `contextvars.copy_context()` blow
+    up before `run_in_executor` is even scheduled."""
+    acp_agent, state, fake, _conn = _make_prompt_agent(monkeypatch)
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("boom in initial executor scheduling")
+
+    monkeypatch.setattr("acp_adapter.server.contextvars.copy_context", _boom)
+    state.queued_prompts.append("queued during initial crash")
+
+    response = await acp_agent.prompt(
+        session_id=state.session_id,
+        prompt=[TextContentBlock(type="text", text="do work")],
+    )
+
+    assert response.stop_reason == "end_turn"
+    assert state.is_running is False
+    assert state.current_prompt_text == ""
+    assert state.queued_prompts == []
+    # The executor never ran the agent at all — the crash happened before
+    # the initial `_run_agent` dispatch.
+    assert fake.runs == []
