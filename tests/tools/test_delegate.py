@@ -97,8 +97,6 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("later turn", description.lower())
         self.assertIn("ACP", description)
         self.assertIn("awaited and consolidated", description)
-        self.assertIn("synchronous", description.lower())
-        self.assertIn("this reply", description.lower())
         self.assertNotIn("Do not wait or poll", description)
 
     def test_schema_description_advertises_runtime_limits(self):

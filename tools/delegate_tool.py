@@ -3024,15 +3024,13 @@ def delegate_task(
                 "Background dispatch is detached: the subagent result normally "
                 "re-enters in a later turn. On the ACP surface, if you end your "
                 "turn, it will be awaited and consolidated before the reply "
-                "finalizes. For work you must consolidate into this reply, "
-                "prefer synchronous delegation (the default)."
+                "finalizes. You can continue working while it runs."
                 if n == 1 else
                 f"Background dispatch is detached: {n} subagents are running in "
                 f"parallel and their consolidated results normally re-enter in a "
                 f"later turn. On the ACP surface, if you end your turn, they will "
-                f"be awaited and consolidated before the reply finalizes. For "
-                f"work you must consolidate into this reply, prefer synchronous "
-                f"delegation (the default)."
+                f"be awaited and consolidated before the reply finalizes. You "
+                f"can continue working while they run."
             )
             payload = {
                 "status": "dispatched",
@@ -3583,10 +3581,11 @@ DELEGATE_TASK_SCHEMA = {
                 "description": (
                     "DEPRECATED / IGNORED. Top-level single and batch "
                     "delegations run in the background automatically — you do "
-                    "not need to (and cannot) opt in or out. On ACP, work "
+                    "not need to (and cannot) opt in or out. Execution is "
+                    "detached. On ACP, work "
                     "started during the turn is awaited and consolidated before "
                     "the reply finalizes; on other surfaces, the result re-enters "
-                    "the conversation after completion. Setting this has no "
+                    "the conversation in a later turn. Setting this has no "
                     "effect; the parameter remains only for backward compatibility."
                 ),
             },
