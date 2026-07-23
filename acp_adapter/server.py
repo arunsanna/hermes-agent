@@ -1822,251 +1822,262 @@ class HermesACPAgent(acp.Agent):
             state.history = result["messages"]
 
         joined_completed_ids: set[str] = set()
+        # Everything from the same-turn delegation barrier through delivering
+        # the final response is wrapped in this try/finally so a turn that
+        # cooperatively returns from the executor ALWAYS frees the session
+        # (`is_running=False`) and drains anything queued while it ran — on
+        # normal, cancelled, or errored exit. No path below may leave
+        # `is_running` True (Phase 0 / stop-p0-brief.md P0.1).
         try:
-            from tools.async_delegation import join, running_for_session
-            from tools.delegate_tool import _load_config
-            from tools.process_registry import (
-                format_process_notification,
-                process_registry,
-            )
-            from utils import is_truthy_value
-
-            delegation_config = _load_config()
-            join_enabled = is_truthy_value(
-                delegation_config.get("acp_join_same_turn"), default=True
-            )
             try:
-                max_join_rounds = max(
-                    0, int(delegation_config.get("acp_join_max_rounds", 3))
-                )
-            except (TypeError, ValueError):
-                max_join_rounds = 3
-            try:
-                join_timeout = max(
-                    0.0,
-                    float(
-                        delegation_config.get(
-                            "acp_join_timeout_seconds", 180
-                        )
-                    ),
-                )
-            except (TypeError, ValueError):
-                join_timeout = 180.0
-
-            pending = (
-                running_for_session(session_id, turn_start_ts)
-                if join_enabled
-                else []
-            )
-            pending_note_added = False
-            for _round in range(max_join_rounds):
-                if not pending:
-                    break
-                delegation_ids = [
-                    str(record.get("delegation_id") or "")
-                    for record in pending
-                    if record.get("delegation_id")
-                ]
-                joined = await loop.run_in_executor(
-                    _executor, join, delegation_ids, join_timeout
-                )
-                joined_completed_ids.update(
-                    str(delegation_id)
-                    for delegation_id in joined.get("completed") or []
-                )
-                completed_events = self._drain_session_delegation_completions(
-                    process_registry,
+                from tools.async_delegation import join, running_for_session
+                from tools.delegate_tool import _load_config
+                from tools.process_registry import (
                     format_process_notification,
-                    session_id,
-                    state,
+                    process_registry,
                 )
-                for event in completed_events:
-                    delegation_id = str(event.get("delegation_id") or "")
-                    tool_call_id = delegation_tool_calls.pop(
-                        delegation_id, None
+                from utils import is_truthy_value
+
+                delegation_config = _load_config()
+                join_enabled = is_truthy_value(
+                    delegation_config.get("acp_join_same_turn"), default=True
+                )
+                try:
+                    max_join_rounds = max(
+                        0, int(delegation_config.get("acp_join_max_rounds", 3))
                     )
-                    if conn and tool_call_id:
-                        formatted_result = format_process_notification(event) or str(
-                            event.get("summary") or event.get("error") or ""
+                except (TypeError, ValueError):
+                    max_join_rounds = 3
+                try:
+                    join_timeout = max(
+                        0.0,
+                        float(
+                            delegation_config.get(
+                                "acp_join_timeout_seconds", 180
+                            )
+                        ),
+                    )
+                except (TypeError, ValueError):
+                    join_timeout = 180.0
+
+                pending = (
+                    running_for_session(session_id, turn_start_ts)
+                    if join_enabled
+                    else []
+                )
+                pending_note_added = False
+                for _round in range(max_join_rounds):
+                    if not pending:
+                        break
+                    delegation_ids = [
+                        str(record.get("delegation_id") or "")
+                        for record in pending
+                        if record.get("delegation_id")
+                    ]
+                    joined = await loop.run_in_executor(
+                        _executor, join, delegation_ids, join_timeout
+                    )
+                    joined_completed_ids.update(
+                        str(delegation_id)
+                        for delegation_id in joined.get("completed") or []
+                    )
+                    completed_events = self._drain_session_delegation_completions(
+                        process_registry,
+                        format_process_notification,
+                        session_id,
+                        state,
+                    )
+                    for event in completed_events:
+                        delegation_id = str(event.get("delegation_id") or "")
+                        tool_call_id = delegation_tool_calls.pop(
+                            delegation_id, None
                         )
-                        await conn.session_update(
-                            session_id,
-                            build_async_background_completion(
-                                tool_call_id, event, formatted_result
-                            ),
+                        if conn and tool_call_id:
+                            formatted_result = format_process_notification(event) or str(
+                                event.get("summary") or event.get("error") or ""
+                            )
+                            await conn.session_update(
+                                session_id,
+                                build_async_background_completion(
+                                    tool_call_id, event, formatted_result
+                                ),
+                            )
+                    if joined.get("pending"):
+                        state.history.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Background subagent(s) still running; results "
+                                    "will arrive shortly."
+                                ),
+                            }
                         )
-                if joined.get("pending"):
+                        pending_note_added = True
+                        break
+                    if not completed_events:
+                        break
+
+                    continuation = (
+                        "Your background subagent(s) have completed; their results "
+                        "are above. Incorporate them and give your consolidated "
+                        "final answer."
+                    )
+                    continuation_ctx = contextvars.copy_context()
+                    result = await loop.run_in_executor(
+                        _executor,
+                        continuation_ctx.run,
+                        _run_agent,
+                        continuation,
+                        continuation,
+                    )
+                    if result.get("messages"):
+                        state.history = result["messages"]
+                    pending = running_for_session(session_id, turn_start_ts)
+
+                if pending and not pending_note_added:
                     state.history.append(
                         {
                             "role": "user",
                             "content": (
-                                "Background subagent(s) still running; results "
-                                "will arrive shortly."
+                                "Background subagent(s) still running; results will "
+                                "arrive shortly."
                             ),
                         }
                     )
-                    pending_note_added = True
-                    break
-                if not completed_events:
-                    break
-
-                continuation = (
-                    "Your background subagent(s) have completed; their results "
-                    "are above. Incorporate them and give your consolidated "
-                    "final answer."
-                )
-                continuation_ctx = contextvars.copy_context()
-                result = await loop.run_in_executor(
-                    _executor,
-                    continuation_ctx.run,
-                    _run_agent,
-                    continuation,
-                    continuation,
-                )
-                if result.get("messages"):
-                    state.history = result["messages"]
-                pending = running_for_session(session_id, turn_start_ts)
-
-            if pending and not pending_note_added:
-                state.history.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "Background subagent(s) still running; results will "
-                            "arrive shortly."
-                        ),
-                    }
-                )
-        except Exception:
-            logger.exception(
-                "ACP same-turn delegation join failed for session %s", session_id
-            )
-
-        missing_result_ids = {
-            delegation_id
-            for delegation_id in joined_completed_ids
-            if delegation_id in delegation_tool_calls
-        }
-
-        # The turn is over: close any tool calls whose completion never made it
-        # through the name-keyed FIFO pairing (long-turn steering/compression
-        # drift), so clients never keep stuck in-progress items past end_turn.
-        if conn:
-            flush_open_tool_calls(conn, session_id, loop, tool_call_ids, tool_call_meta)
-            for update in flush_async_background_dispatches(
-                delegation_tool_calls, missing_result_ids
-            ):
-                await conn.session_update(session_id, update)
-
-        if result.get("messages"):
-            # Persist updated history so sessions survive process restarts.
-            self.session_manager.save_session(session_id)
-
-        # Detect a compression-driven internal session rotation. If the agent's
-        # DB head moved during the turn, emit a session_info_update carrying
-        # _meta.hermes.sessionProvenance so ACP clients can render the boundary
-        # and keep old/new ids in lineage. The ACP session_id is unchanged.
-        post_turn_hermes_id = getattr(state.agent, "session_id", None)
-        if (
-            conn
-            and post_turn_hermes_id
-            and pre_turn_hermes_id
-            and post_turn_hermes_id != pre_turn_hermes_id
-        ):
-            try:
-                await self._send_session_info_update(
-                    session_id,
-                    current_hermes_session_id=post_turn_hermes_id,
-                    previous_hermes_session_id=pre_turn_hermes_id,
-                )
             except Exception:
-                logger.debug(
-                    "Could not emit ACP provenance update after rotation for %s",
-                    session_id,
-                    exc_info=True,
+                logger.exception(
+                    "ACP same-turn delegation join failed for session %s", session_id
                 )
 
-        final_response = result.get("final_response", "")
-        cancelled = bool(state.cancel_event and state.cancel_event.is_set())
-        interrupted = bool(result.get("interrupted")) or cancelled
-        # Hermes' local "waiting for model response" interrupt status is metadata,
-        # not assistant prose — clients get cancellation from stop_reason instead.
-        from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
+            missing_result_ids = {
+                delegation_id
+                for delegation_id in joined_completed_ids
+                if delegation_id in delegation_tool_calls
+            }
 
-        suppress_interrupt_response = interrupted and final_response.startswith(
-            INTERRUPT_WAITING_FOR_MODEL_PREFIX
-        )
-        if final_response and not suppress_interrupt_response:
-            try:
-                from agent.title_generator import maybe_auto_title
-
-                def _notify_title_update(_title: str) -> None:
-                    if conn:
-                        loop.call_soon_threadsafe(
-                            asyncio.create_task,
-                            self._send_session_info_update(session_id),
-                        )
-
-                # Snapshot the runtime identity; the validator lets the
-                # background titler skip its LLM call if the session's model
-                # changed before it fires (#19027).
-                _title_model = getattr(state.agent, "model", None)
-                _title_provider = getattr(state.agent, "provider", None)
-                maybe_auto_title(
-                    self.session_manager._get_db(),
-                    session_id,
-                    user_text,
-                    final_response,
-                    state.history,
-                    main_runtime={
-                        "model": getattr(state.agent, "model", None),
-                        "provider": getattr(state.agent, "provider", None),
-                        "base_url": getattr(state.agent, "base_url", None),
-                        "api_key": getattr(state.agent, "api_key", None),
-                        "api_mode": getattr(state.agent, "api_mode", None),
-                    },
-                    runtime_validator=lambda: (
-                        getattr(state.agent, "model", None) == _title_model
-                        and getattr(state.agent, "provider", None) == _title_provider
-                    ),
-                    title_callback=_notify_title_update,
-                )
-            except Exception:
-                logger.debug("Failed to auto-title ACP session %s", session_id, exc_info=True)
-        if (
-            final_response
-            and conn
-            and not suppress_interrupt_response
-            and (not streamed_message or result.get("response_transformed"))
-        ):
-            # Deliver the final response when streaming did not already send it,
-            # or when a plugin hook transformed the response after streaming
-            # finished (e.g. transform_llm_output) — otherwise the appended /
-            # rewritten text never reaches the client.
-            update = acp.update_agent_message_text(final_response)
-            await conn.session_update(session_id, update)
-
-        # Mark this turn idle before draining queued work so recursive prompt()
-        # calls can acquire the session. Queued turns are intentionally run as
-        # normal follow-up user prompts, preserving role alternation and history.
-        with state.runtime_lock:
-            state.is_running = False
-            state.current_prompt_text = ""
-
-        while True:
-            with state.runtime_lock:
-                if not state.queued_prompts:
-                    break
-                next_prompt = state.queued_prompts.pop(0)
+            # The turn is over: close any tool calls whose completion never made it
+            # through the name-keyed FIFO pairing (long-turn steering/compression
+            # drift), so clients never keep stuck in-progress items past end_turn.
             if conn:
-                await conn.session_update(
-                    session_id,
-                    acp.update_user_message_text(next_prompt),
-                )
-            await self.prompt(
-                prompt=[TextContentBlock(type="text", text=next_prompt)],
-                session_id=session_id,
+                flush_open_tool_calls(conn, session_id, loop, tool_call_ids, tool_call_meta)
+                for update in flush_async_background_dispatches(
+                    delegation_tool_calls, missing_result_ids
+                ):
+                    await conn.session_update(session_id, update)
+
+            if result.get("messages"):
+                # Persist updated history so sessions survive process restarts.
+                self.session_manager.save_session(session_id)
+
+            # Detect a compression-driven internal session rotation. If the agent's
+            # DB head moved during the turn, emit a session_info_update carrying
+            # _meta.hermes.sessionProvenance so ACP clients can render the boundary
+            # and keep old/new ids in lineage. The ACP session_id is unchanged.
+            post_turn_hermes_id = getattr(state.agent, "session_id", None)
+            if (
+                conn
+                and post_turn_hermes_id
+                and pre_turn_hermes_id
+                and post_turn_hermes_id != pre_turn_hermes_id
+            ):
+                try:
+                    await self._send_session_info_update(
+                        session_id,
+                        current_hermes_session_id=post_turn_hermes_id,
+                        previous_hermes_session_id=pre_turn_hermes_id,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Could not emit ACP provenance update after rotation for %s",
+                        session_id,
+                        exc_info=True,
+                    )
+
+            final_response = result.get("final_response", "")
+            cancelled = bool(state.cancel_event and state.cancel_event.is_set())
+            interrupted = bool(result.get("interrupted")) or cancelled
+            # Hermes' local "waiting for model response" interrupt status is metadata,
+            # not assistant prose — clients get cancellation from stop_reason instead.
+            from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
+
+            suppress_interrupt_response = interrupted and final_response.startswith(
+                INTERRUPT_WAITING_FOR_MODEL_PREFIX
             )
+            if final_response and not suppress_interrupt_response:
+                try:
+                    from agent.title_generator import maybe_auto_title
+
+                    def _notify_title_update(_title: str) -> None:
+                        if conn:
+                            loop.call_soon_threadsafe(
+                                asyncio.create_task,
+                                self._send_session_info_update(session_id),
+                            )
+
+                    # Snapshot the runtime identity; the validator lets the
+                    # background titler skip its LLM call if the session's model
+                    # changed before it fires (#19027).
+                    _title_model = getattr(state.agent, "model", None)
+                    _title_provider = getattr(state.agent, "provider", None)
+                    maybe_auto_title(
+                        self.session_manager._get_db(),
+                        session_id,
+                        user_text,
+                        final_response,
+                        state.history,
+                        main_runtime={
+                            "model": getattr(state.agent, "model", None),
+                            "provider": getattr(state.agent, "provider", None),
+                            "base_url": getattr(state.agent, "base_url", None),
+                            "api_key": getattr(state.agent, "api_key", None),
+                            "api_mode": getattr(state.agent, "api_mode", None),
+                        },
+                        runtime_validator=lambda: (
+                            getattr(state.agent, "model", None) == _title_model
+                            and getattr(state.agent, "provider", None) == _title_provider
+                        ),
+                        title_callback=_notify_title_update,
+                    )
+                except Exception:
+                    logger.debug("Failed to auto-title ACP session %s", session_id, exc_info=True)
+            if (
+                final_response
+                and conn
+                and not suppress_interrupt_response
+                and (not streamed_message or result.get("response_transformed"))
+            ):
+                # Deliver the final response when streaming did not already send it,
+                # or when a plugin hook transformed the response after streaming
+                # finished (e.g. transform_llm_output) — otherwise the appended /
+                # rewritten text never reaches the client.
+                update = acp.update_agent_message_text(final_response)
+                await conn.session_update(session_id, update)
+        finally:
+            # Mark this turn idle before draining queued work so recursive prompt()
+            # calls can acquire the session. Queued turns are intentionally run as
+            # normal follow-up user prompts, preserving role alternation and history.
+            # This reset + the drain below MUST run no matter how the block above
+            # exits (success, caught error, or an uncaught exception) so a turn
+            # that cooperatively returned from the executor never leaves the
+            # session wedged with is_running=True and an undrained queue.
+            with state.runtime_lock:
+                state.is_running = False
+                state.current_prompt_text = ""
+
+            while True:
+                with state.runtime_lock:
+                    if not state.queued_prompts:
+                        break
+                    next_prompt = state.queued_prompts.pop(0)
+                if conn:
+                    await conn.session_update(
+                        session_id,
+                        acp.update_user_message_text(next_prompt),
+                    )
+                await self.prompt(
+                    prompt=[TextContentBlock(type="text", text=next_prompt)],
+                    session_id=session_id,
+                )
 
         usage = None
         if any(result.get(key) is not None for key in ("prompt_tokens", "completion_tokens", "total_tokens")):
