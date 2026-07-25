@@ -155,3 +155,109 @@ async def test_foreign_event_types_are_requeued():
     assert len(state.history) == 1
     assert pr.completion_queue.qsize() == 1
     assert pr.completion_queue.get_nowait()["type"] == "watch_match"
+
+
+# ---------------------------------------------------------------------------
+# Regression: cross-session delegation leak (#delegation-cross-session-leak,
+# 2026-07-25 Switchboard incident). A delegation dispatched under session A
+# must never be delivered into session B's context, even when both sessions'
+# processes share one SessionDB (e.g. a host that fails to isolate
+# HERMES_HOME per process) and B's process has never created or loaded A.
+# ---------------------------------------------------------------------------
+
+
+class ForeignSessionDb(NoopDb):
+    """Simulates a SessionDB shared with ANOTHER process: it knows about a
+    session (``other-session``) this process's SessionManager never created
+    or loaded — exactly what ``get_session``'s DB-restore fallback would
+    silently adopt."""
+
+    def get_session(self, session_id, *_args, **_kwargs):
+        if session_id == "other-session":
+            return {
+                "id": "other-session",
+                "source": "acp",
+                "model_config": "{}",
+                "model": "",
+                "billing_provider": None,
+                "billing_base_url": None,
+            }
+        return None
+
+    def get_messages_as_conversation(self, *_args, **_kwargs):
+        return []
+
+
+class ForeignRestoreSessionManager(NoSaveSessionManager):
+    """A SessionManager whose DB WOULD restore a foreign session on
+    ``get_session`` — proving ``peek_session`` (used by the watcher) refuses
+    to adopt it even though the legacy code path could."""
+
+    def __init__(self):
+        SessionManager.__init__(
+            self, agent_factory=lambda **_: SimpleNamespace(), db=ForeignSessionDb()
+        )
+        self.saved = []
+
+    def _get_db(self):
+        return self._db_instance
+
+
+@pytest.mark.asyncio
+async def test_cross_session_leak_is_blocked_even_when_db_would_restore_it():
+    """The exact production shape: a completion addressed to a session this
+    process never created/loaded must be dropped, not adopted via DB
+    restore — proving the watcher can never splice one session's delegation
+    result into an unrelated session's history/connection.
+    """
+    # Sanity check on a THROWAWAY instance: the legacy accessor WOULD have
+    # adopted (and cached) this foreign session — this is what makes the
+    # leak possible without the fix. Using a separate instance so this
+    # assertion doesn't contaminate the manager under test below (get_session
+    # caches whatever it restores into ``_sessions``, which would make a
+    # subsequent ``peek_session`` on the SAME instance pass for the wrong
+    # reason).
+    assert ForeignRestoreSessionManager().get_session("other-session") is not None
+
+    manager = ForeignRestoreSessionManager()
+    # The strict accessor the watcher now uses must refuse the same session.
+    assert manager.peek_session("other-session") is None
+
+    agent = HermesACPAgent(session_manager=manager)
+    agent._conn = CaptureConn()
+    pr = FakePR()
+    pr.completion_queue.put(completion_event(session_key="other-session"))
+
+    await agent._drain_completion_queue_once(pr, formatter)
+
+    assert pr.completion_queue.empty(), "unowned event must be dropped, not spun forever"
+    assert manager.saved == [], "no foreign session state may be persisted"
+    assert agent._conn.updates == [], "no notification may be sent for a session we don't own"
+
+
+@pytest.mark.asyncio
+async def test_durable_completion_is_not_redelivered_after_first_claim():
+    """A completion already claimed/delivered by one consumer (simulating a
+    second hermes-acp process racing on the same shared SessionDB) must not
+    be re-spliced into history a second time.
+    """
+    from tools.async_delegation import _persist_dispatch, claim_completion_delivery
+
+    agent, state, manager = make_agent_with_session(session_id="sess-1")
+    record = {
+        "delegation_id": "deleg_dup1",
+        "session_key": "sess-1",
+        "dispatched_at": 0.0,
+    }
+    _persist_dispatch(record)
+    # Simulate another consumer having already claimed this delivery (e.g.
+    # a different process's watcher tick that fired first).
+    assert claim_completion_delivery("deleg_dup1", "other-consumer-claim") is True
+
+    pr = FakePR()
+    pr.completion_queue.put(completion_event(session_key="sess-1", delegation_id="deleg_dup1"))
+
+    await agent._drain_completion_queue_once(pr, formatter)
+
+    assert state.history == [], "already-claimed completion must not be delivered again"
+    assert pr.completion_queue.empty(), "an already-claimed event should be dropped, not re-queued"

@@ -230,6 +230,26 @@ class SessionManager:
         # Attempt to restore from database.
         return self._restore(session_id)
 
+    def peek_session(self, session_id: str) -> Optional[SessionState]:
+        """Return *session_id* only if it is already resident in THIS process.
+
+        Unlike :meth:`get_session`, this never falls back to restoring from
+        the (potentially shared, multi-process) SessionDB. Deliberately
+        stricter for callers that must prove **live ownership** of a session
+        before acting on its behalf — e.g. routing a background-delegation
+        completion — where "exists in the database" only means some process,
+        possibly a different one working an unrelated conversation, created
+        that session at some point. It does NOT mean this process is that
+        session's current, legitimate owner. When multiple ACP processes
+        share one SessionDB (e.g. a host that doesn't isolate HERMES_HOME
+        per process), ``get_session`` would silently adopt and mutate a
+        session this process was never asked to load or resume, and any
+        outbound ACP notification would then be sent over the WRONG
+        connection under a foreign session_id (#delegation-cross-session-leak).
+        """
+        with self._lock:
+            return self._sessions.get(session_id)
+
     def remove_session(self, session_id: str) -> bool:
         """Remove a session from memory and database. Returns True if it existed."""
         with self._lock:
