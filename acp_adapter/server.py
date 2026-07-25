@@ -714,7 +714,37 @@ class HermesACPAgent(acp.Agent):
             await asyncio.sleep(interval)
 
     async def _drain_completion_queue_once(self, pr, formatter) -> None:
-        """One watcher tick: route completions, requeue what isn't ours yet."""
+        """One watcher tick: route completions, requeue what isn't ours yet.
+
+        Two ownership gates, both required — see #delegation-cross-session-leak
+        (2026-07-25 Switchboard incident: a delegation dispatched under one
+        session was re-delivered into four unrelated sessions):
+
+        1. ``peek_session`` (never ``get_session``) — this watcher may only
+           act on a session already resident IN THIS PROCESS. ``get_session``
+           transparently restores from the SessionDB on a miss, which is
+           correct for an explicit ``session/load`` from the editor but wrong
+           here: when multiple ACP processes share one SessionDB (a host that
+           doesn't isolate HERMES_HOME per process), it would silently adopt
+           a stranger's session, splice the completion into their history,
+           persist it back to the shared DB, and broadcast a ``session/update``
+           notification for their session_id over THIS process's connection.
+        2. ``claim_event_delivery`` — a completion may still be
+           ``delivery_state='pending'`` in a SessionDB shared across
+           processes/hosts (nothing here marks it delivered on its own), so
+           without this claim every process that boots and calls
+           ``restore_undelivered_completions`` would re-inject the same
+           durable event into its owning session forever. Matches the
+           claim/complete/release pattern every other completion_queue
+           consumer in the codebase already uses (``tui_gateway/server.py``,
+           ``cli.py``).
+        """
+        from tools.async_delegation import (
+            claim_event_delivery,
+            complete_event_delivery,
+            release_event_delivery,
+        )
+
         drained = []
         while not pr.completion_queue.empty():
             try:
@@ -730,27 +760,37 @@ class HermesACPAgent(acp.Agent):
                 requeue.append(evt)
                 continue
             session_id = str(evt.get("session_key") or "")
-            state = self.session_manager.get_session(session_id) if session_id else None
+            state = self.session_manager.peek_session(session_id) if session_id else None
             if state is None:
                 logger.warning(
-                    "Dropping async delegation %s: no ACP session for key %r",
+                    "Dropping async delegation %s: no live ACP session for "
+                    "key %r in this process",
                     evt.get("delegation_id"),
                     session_id,
                 )
                 continue
-            busy = False
             with state.runtime_lock:
-                if state.is_running:
-                    busy = True
-                else:
-                    text = formatter(evt)
-                    if text:
-                        state.history.append({"role": "user", "content": text})
+                busy = state.is_running
             if busy:
                 requeue.append(evt)
                 continue
-            self.session_manager.save_session(session_id)
-            await self._notify_background_completion(session_id, evt)
+            claim = claim_event_delivery(evt, "acp-watcher")
+            if claim is None:
+                # Another process/consumer already claimed (or delivered)
+                # this durable completion — do not duplicate it here.
+                continue
+            try:
+                with state.runtime_lock:
+                    text = formatter(evt)
+                    if text:
+                        state.history.append({"role": "user", "content": text})
+                self.session_manager.save_session(session_id)
+                await self._notify_background_completion(session_id, evt)
+            except Exception:
+                release_event_delivery(evt, claim)
+                raise
+            else:
+                complete_event_delivery(evt, claim)
         for evt in requeue:
             pr.completion_queue.put(evt)
 
@@ -779,7 +819,19 @@ class HermesACPAgent(acp.Agent):
 
     @staticmethod
     def _drain_session_delegation_completions(pr, formatter, session_id, state):
-        """Take this session's delegation events and requeue everything else."""
+        """Take this session's delegation events and requeue everything else.
+
+        The ``session_key`` match below is inherently self-scoped (``state``
+        is this call's own live session — there is no foreign-session
+        adoption risk here, unlike ``_drain_completion_queue_once``). Still
+        claim before delivering: without it, a completion whose
+        ``delivery_state`` is still ``pending`` in the SessionDB would be
+        re-spliced into this SAME session's history every time this process
+        (or a future one restoring the same durable row) re-drains the
+        queue, e.g. after a restart.
+        """
+        from tools.async_delegation import claim_event_delivery, complete_event_delivery
+
         drained = []
         while not pr.completion_queue.empty():
             try:
@@ -796,10 +848,16 @@ class HermesACPAgent(acp.Agent):
             ):
                 requeue.append(evt)
                 continue
+            claim = claim_event_delivery(evt, "acp-join")
+            if claim is None:
+                # Already delivered by another consumer (e.g. the background
+                # watcher won the race first) — do not duplicate it here.
+                continue
             matched.append(evt)
             text = formatter(evt)
             if text:
                 state.history.append({"role": "user", "content": text})
+            complete_event_delivery(evt, claim)
 
         for evt in requeue:
             pr.completion_queue.put(evt)
