@@ -28,6 +28,7 @@ import logging
 import os
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -243,6 +244,20 @@ class CodexAppServerSession:
         # to surface a real summary in the approval prompt (quirk #4).
         self._pending_file_changes: dict[str, str] = {}
         self._closed = False
+        # Turn ids of turns this session already finished (completed,
+        # interrupted, timed out, or abandoned via the deadline fallback).
+        # The subprocess shares ONE notification queue across all turns;
+        # codex can keep emitting item/turn notifications for a turn after
+        # run_turn() returned (watchdog interrupt, deadline fallback), and
+        # without an id check the NEXT run_turn() consumes those stragglers
+        # and instantly "completes" the new user prompt with the old turn's
+        # text (2026-07-26 Switchboard stale-echo incident: a fresh prompt
+        # "answered" in 173ms with zero inference). Frames whose turn id is
+        # in this set are discarded. Frames without a turn id, or with an
+        # unknown id, still flow — only provably-retired turns are dropped,
+        # so codex builds whose notification ids drift from the turn/start
+        # response id degrade to today's behavior instead of a dead session.
+        self._retired_turn_ids: deque[str] = deque(maxlen=32)
 
     # ---------- lifecycle ----------
 
@@ -509,6 +524,12 @@ class CodexAppServerSession:
                     pending = self._client.take_notification(timeout=0)
                     if pending is None:
                         break
+                    if self._is_stale_notification(pending):
+                        logger.debug(
+                            "discarding straggler notification in approval "
+                            "preamble: method=%s", pending.get("method", ""),
+                        )
+                        continue
                     # Mirror the main notification-handling block below so
                     # display events surface and stay in step with projector
                     # state. Without this, item/started / item/completed
@@ -550,6 +571,15 @@ class CodexAppServerSession:
             note = self._client.take_notification(
                 timeout=notification_poll_timeout
             )
+            if note is not None and self._is_stale_notification(note):
+                logger.info(
+                    "discarding straggler notification from retired turn: "
+                    "method=%s turnId=%s (current turn %s)",
+                    note.get("method", ""),
+                    self._notification_turn_id(note),
+                    result.turn_id,
+                )
+                continue
             if note is None:
                 # Only declare the turn quiet after checking both inbound
                 # queues. A notification or approval request may already be
@@ -659,6 +689,10 @@ class CodexAppServerSession:
                 "the assistant text as the terminal response"
             )
             turn_complete = True
+            # The server-side turn is still live but nobody will consume it
+            # anymore — stop it so it doesn't burn compute and spray
+            # straggler notifications into the shared queue.
+            self._issue_interrupt(result.turn_id)
 
         if not turn_complete and not result.interrupted:
             # Hit the deadline. Issue interrupt to stop wasted compute, and
@@ -673,6 +707,10 @@ class CodexAppServerSession:
                 )
             result.should_retire = True
 
+        # Whatever way the turn ended, it is finished from this session's
+        # perspective — any notification that still arrives for it is a
+        # straggler the next run_turn() must discard, never consume.
+        self._retire_turn_id(result.turn_id)
         return result
 
     def compact_thread(
@@ -761,6 +799,14 @@ class CodexAppServerSession:
             )
             if note is None:
                 continue
+            if self._is_stale_notification(note):
+                logger.info(
+                    "discarding straggler notification during compaction: "
+                    "method=%s turnId=%s",
+                    note.get("method", ""),
+                    self._notification_turn_id(note),
+                )
+                continue
 
             method = note.get("method", "")
             if self._on_event is not None:
@@ -821,9 +867,37 @@ class CodexAppServerSession:
                 )
             result.should_retire = True
 
+        self._retire_turn_id(result.turn_id)
         return result
 
     # ---------- internals ----------
+
+    @staticmethod
+    def _notification_turn_id(note: dict) -> Optional[str]:
+        """Extract the turn id a notification belongs to, if it carries one.
+
+        Item-level notifications carry a flat ``params.turnId``;
+        ``turn/started`` / ``turn/completed`` carry ``params.turn.id``.
+        """
+        params = note.get("params") or {}
+        turn_id = params.get("turnId")
+        if turn_id is None:
+            turn_obj = params.get("turn")
+            if isinstance(turn_obj, dict):
+                turn_id = turn_obj.get("id")
+        if isinstance(turn_id, str) and turn_id:
+            return turn_id
+        return None
+
+    def _is_stale_notification(self, note: dict) -> bool:
+        """True when the notification belongs to a turn this session already
+        finished — a straggler that must not leak into the current turn."""
+        turn_id = self._notification_turn_id(note)
+        return turn_id is not None and turn_id in self._retired_turn_ids
+
+    def _retire_turn_id(self, turn_id: Optional[str]) -> None:
+        if turn_id and turn_id not in self._retired_turn_ids:
+            self._retired_turn_ids.append(turn_id)
 
     def _issue_interrupt(self, turn_id: Optional[str]) -> None:
         if self._client is None or self._thread_id is None or turn_id is None:

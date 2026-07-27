@@ -962,7 +962,15 @@ class TestSessionRetirement:
             msg["role"] == "assistant" and msg.get("content") == "done"
             for msg in r.projected_messages
         )
-        assert not any(method == "turn/interrupt" for method, _ in client.requests)
+        # The recovery is graceful for the caller (not interrupted, no
+        # error), but the abandoned server-side turn IS interrupted so it
+        # stops emitting straggler notifications into the shared queue
+        # (2026-07-26 stale-echo incident).
+        assert any(
+            method == "turn/interrupt"
+            and params.get("turnId") == "turn-fake-001"
+            for method, params in client.requests
+        )
 
     def test_post_tool_quiet_watchdog_trips_and_retires(self):
         client = FakeClient()
@@ -1430,3 +1438,134 @@ class TestClassifyOAuthFailure:
             "[stderr] token has expired, run codex login",
         )
         assert hint is not None
+
+
+# ---- straggler-notification guard (2026-07-26 Switchboard stale-echo) ----
+
+class TestStragglerNotificationGuard:
+    """Codex keeps emitting notifications for a turn after run_turn()
+    returned (watchdog interrupt, deadline fallback, late flush). They land
+    in the ONE shared notification queue, and without a turn-id guard the
+    NEXT run_turn() consumes them and instantly "completes" the new user
+    prompt with the old turn's text — zero inference, stale answer.
+    """
+
+    @staticmethod
+    def _session_with_turn_ids(client, ids):
+        turn_ids = iter(ids)
+
+        def handler(method, params):
+            if method == "thread/start":
+                return {
+                    "thread": {"id": "thread-fake-001"},
+                    "activePermissionProfile": {"id": "workspace-write"},
+                }
+            if method == "turn/start":
+                return {"turn": {"id": next(turn_ids)}}
+            return {}
+
+        client._request_handler = handler
+        return make_session(client)
+
+    def test_next_turn_ignores_stragglers_from_previous_turn(self):
+        client = FakeClient()
+        s = self._session_with_turn_ids(client, ["turn-A", "turn-B"])
+
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m1", "text": "answer A"},
+            threadId="t", turnId="turn-A",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "turn-A", "status": "completed", "error": None},
+        )
+        r1 = s.run_turn("first", turn_timeout=2.0)
+        assert r1.final_text == "answer A"
+
+        # Stragglers for turn-A queued between turns (the incident shape:
+        # a full agentMessage AND a turn/completed), then the real turn-B
+        # frames behind them.
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m2", "text": "stale echo of A"},
+            threadId="t", turnId="turn-A",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "turn-A", "status": "completed", "error": None},
+        )
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m3", "text": "answer B"},
+            threadId="t", turnId="turn-B",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "turn-B", "status": "completed", "error": None},
+        )
+
+        r2 = s.run_turn("second", turn_timeout=2.0)
+        assert r2.final_text == "answer B"
+        assert not any(
+            "stale echo" in str(m.get("content") or "")
+            for m in r2.projected_messages
+        )
+
+    def test_stale_turn_completed_alone_does_not_end_new_turn(self):
+        """A lone straggler turn/completed must not terminate the new turn
+        before its own frames arrive."""
+        client = FakeClient()
+        s = self._session_with_turn_ids(client, ["turn-A", "turn-B"])
+
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "turn-A", "status": "completed", "error": None},
+        )
+        r1 = s.run_turn("first", turn_timeout=2.0)
+        assert r1.turn_id == "turn-A"
+
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "turn-A", "status": "completed", "error": None},
+        )
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m1", "text": "real B"},
+            threadId="t", turnId="turn-B",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "turn-B", "status": "completed", "error": None},
+        )
+        r2 = s.run_turn("second", turn_timeout=2.0)
+        assert r2.final_text == "real B"
+        assert r2.error is None
+
+    def test_turn_ids_are_retired_on_every_exit(self):
+        client = FakeClient()
+        s = self._session_with_turn_ids(client, ["turn-A"])
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "turn-A", "status": "completed", "error": None},
+        )
+        s.run_turn("first", turn_timeout=2.0)
+        assert "turn-A" in s._retired_turn_ids
+
+    def test_unknown_turn_id_frames_still_flow(self):
+        """Frames whose turn id never matches a retired turn (codex builds
+        where notification ids drift from the turn/start response) must be
+        processed exactly as before the guard existed."""
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m1", "text": "drifting ids"},
+            threadId="t", turnId="tu-drift",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu-drift", "status": "completed", "error": None},
+        )
+        r = make_session(client).run_turn("hi", turn_timeout=2.0)
+        assert r.final_text == "drifting ids"
+        assert r.error is None
