@@ -1653,7 +1653,29 @@ class AIAgent:
         returns the thread target.  ``threading.Thread`` is constructed
         here so existing tests that patch ``run_agent.threading.Thread``
         keep working.
+
+        Switchboard-hosted ACP sessions never run the post-turn review:
+        the fork replays the full conversation on the session's own
+        provider quota (context-overflow storms on long sessions), and
+        its between-turn activity races the product's turn lifecycle
+        (stale-echo incident 2026-07-26). The Switchboard gateway marks
+        its sessions via HERMES_SESSION_PLATFORM in the child process
+        env; ACP turns bind the session ContextVar to "" (see
+        acp_adapter/server.py set_session_vars), so the process env is
+        the authoritative fallback here.
         """
+        try:
+            from gateway.session_context import get_session_env
+            _bg_platform = get_session_env("HERMES_SESSION_PLATFORM", "") or ""
+        except Exception:
+            _bg_platform = ""
+        _bg_platform = _bg_platform or os.getenv("HERMES_SESSION_PLATFORM", "") or ""
+        if _bg_platform.strip().lower() == "switchboard":
+            logger.info(
+                "background review skipped: platform=switchboard (session=%s)",
+                getattr(self, "session_id", "") or "",
+            )
+            return
         from agent.background_review import spawn_background_review_thread
         from tools.thread_context import propagate_context_to_thread
         target, _prompt = spawn_background_review_thread(
