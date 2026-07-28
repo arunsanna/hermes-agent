@@ -4290,20 +4290,24 @@ from tools.registry import registry, tool_error
 
 
 def _model_background_value(args: dict, parent_agent=None) -> bool:
-    """Background flag for the MODEL-facing dispatch path (registry fallback).
+    """Return whether a model-facing delegation may detach from its turn.
 
-    Delegations from the top-level agent always run in the background — the
-    model does not choose. This applies to both a single task and a fan-out
-    batch (the whole batch is one async unit that joins on all children and
-    returns one consolidated result). The one
-    exception is a delegation from an orchestrator subagent (depth > 0), which
-    needs its workers' results within its own turn. The live path is
-    ``run_agent._dispatch_delegate_task``; this lambda mirrors it for the rare
-    case the intercept is bypassed. Direct Python callers of ``delegate_task``
-    keep the historical synchronous default.
+    Ordinary top-level surfaces preserve Hermes' detached-background behavior.
+    Two callers must wait synchronously:
+
+    - Orchestrator subagents need worker results to compose their own summary.
+    - ACP roots must not stream or finalize an answer before required child
+      results exist. Synchronous batches still fan their children out in
+      parallel; only the parent waits for the consolidated tool result.
+
+    The live path in ``run_agent._dispatch_delegate_task`` calls this helper too
+    so the fallback registry path cannot drift from the response-integrity
+    contract. Direct Python callers of ``delegate_task`` keep the historical
+    synchronous default.
     """
     is_subagent = getattr(parent_agent, "_delegate_depth", 0) > 0
-    return not is_subagent
+    platform = str(getattr(parent_agent, "platform", "") or "").strip().lower()
+    return not (is_subagent or platform == "acp")
 
 
 _MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args"}

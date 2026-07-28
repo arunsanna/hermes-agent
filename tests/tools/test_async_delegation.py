@@ -691,6 +691,235 @@ def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):
     assert evt["origin_ui_session_id"] == "origin-tab"
 
 
+def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch):
+    """A multi-item batch with background=True dispatches the WHOLE fan-out as
+    ONE background unit (one handle, one async slot). The children run in
+    parallel and join; the consolidated results come back as a single
+    completion event when ALL of them finish."""
+    import json
+    from unittest.mock import MagicMock, patch
+    import tools.delegate_tool as dt
+
+    parent = MagicMock()
+    parent._delegate_depth = 0
+    parent.session_id = "sess"
+    parent._interrupt_requested = False
+    parent._active_children = []
+    parent._active_children_lock = None
+
+    fake_child = MagicMock()
+    fake_child._delegate_role = "leaf"
+
+    gate = threading.Event()
+
+    def _blocking_child(task_index, goal, child=None, parent_agent=None, **kw):
+        gate.wait(timeout=60)
+        return {
+            "task_index": task_index, "status": "completed",
+            "summary": f"done: {goal}", "api_calls": 1,
+            "duration_seconds": 0.1, "model": "m", "exit_reason": "completed",
+        }
+
+    creds = {
+        "model": "m", "provider": None, "base_url": None, "api_key": None,
+        "api_mode": None, "command": None, "args": None,
+    }
+
+    # Use monkeypatch (not a `with` block) so the patches stay active while the
+    # background worker thread runs _execute_and_aggregate AFTER delegate_task
+    # has already returned.
+    monkeypatch.setattr(dt, "_build_child_agent", lambda **kw: fake_child)
+    monkeypatch.setattr(dt, "_run_single_child", _blocking_child)
+    monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
+    # Goals must clear upstream's batch quality gate (>=10 chars, added in
+    # 94bc3194b "validate batch task quality before spawning children"), so
+    # this test exercises dispatch rather than the rejection path.
+    goal_a = "audit the auth module"
+    goal_b = "benchmark the cache layer"
+    goal_c = "check the retry backoff"
+    out = dt.delegate_task(
+        tasks=[{"goal": goal_a}, {"goal": goal_b}, {"goal": goal_c}],
+        background=True,
+        parent_agent=parent,
+    )
+
+    parsed = json.loads(out)
+    assert parsed["status"] == "dispatched"
+    assert parsed["mode"] == "background"
+    assert parsed["count"] == 3
+    assert parsed["delegation_id"].startswith("deleg_")
+    assert parsed["goals"] == [goal_a, goal_b, goal_c]
+    # ONE background unit for the whole fan-out (not three), and the call
+    # returned while all children are still blocked → chat not blocked.
+    assert process_registry.completion_queue.empty()
+    assert ad.active_count() == 1
+
+    # Release the children; the whole batch joins and emits ONE event.
+    gate.set()
+    evt = _drain_one()
+    assert evt is not None
+    assert evt["type"] == "async_delegation"
+    assert evt.get("is_batch") is True
+    assert len(evt["results"]) == 3
+    summaries = sorted(r["summary"] for r in evt["results"])
+    assert summaries == sorted(f"done: {g}" for g in (goal_a, goal_b, goal_c))
+    # The consolidated notification names all three tasks in one block.
+    text = format_process_notification(evt)
+    assert text is not None
+    assert "TASK 1/3" in text and "TASK 2/3" in text and "TASK 3/3" in text
+    assert all(f"done: {g}" in text for g in (goal_a, goal_b, goal_c))
+    # No more events — it's a single combined completion, not N of them.
+    assert _drain_one() is None
+
+
+def test_model_dispatch_keeps_required_acp_delegations_synchronous():
+    """Top-level ACP delegations wait for their results before the model resumes.
+
+    Other top-level surfaces preserve upstream detached-background behavior,
+    while orchestrator children continue to wait synchronously for workers.
+    """
+    import tools.delegate_tool as dt
+    from unittest.mock import MagicMock
+
+    top = MagicMock()
+    top._delegate_depth = 0
+    top.platform = "cli"
+    sub = MagicMock()
+    sub._delegate_depth = 1
+    sub.platform = "cli"
+    acp = MagicMock()
+    acp._delegate_depth = 0
+    acp.platform = "acp"
+
+    # Registry-fallback helper: ordinary top-level runs remain background.
+    assert dt._model_background_value({"goal": "x"}, top) is True
+    assert dt._model_background_value(
+        {"tasks": [{"goal": "a"}, {"goal": "b"}]}, top
+    ) is True
+    assert dt._model_background_value({"tasks": [{"goal": "a"}]}, top) is True
+
+    # Workers and ACP roots must have their tool result before continuing.
+    assert dt._model_background_value({"goal": "x"}, sub) is False
+    assert dt._model_background_value(
+        {"tasks": [{"goal": "a"}, {"goal": "b"}]}, sub
+    ) is False
+    assert dt._model_background_value({"goal": "x"}, acp) is False
+    assert dt._model_background_value(
+        {"tasks": [{"goal": "a"}, {"goal": "b"}]}, acp
+    ) is False
+
+
+def test_run_agent_dispatch_keeps_required_acp_delegations_synchronous():
+    """The live dispatch path uses the same ACP finalization contract."""
+    from unittest.mock import patch
+    import run_agent
+
+    class _FakeAgent:
+        _delegate_depth = 0
+        platform = "cli"
+
+    captured = {}
+
+    def _fake_delegate(**kwargs):
+        captured.update(kwargs)
+        return "{}"
+
+    with patch("tools.delegate_tool.delegate_task", _fake_delegate):
+        agent = _FakeAgent()
+        run_agent.AIAgent._dispatch_delegate_task(agent, {"goal": "x"})
+        assert captured["background"] is True
+
+        run_agent.AIAgent._dispatch_delegate_task(
+            agent, {"tasks": [{"goal": "a"}, {"goal": "b"}]}
+        )
+        assert captured["background"] is True
+
+        sub = _FakeAgent()
+        sub._delegate_depth = 1
+        run_agent.AIAgent._dispatch_delegate_task(sub, {"goal": "x"})
+        assert captured["background"] is False
+
+        acp = _FakeAgent()
+        acp.platform = "acp"
+        run_agent.AIAgent._dispatch_delegate_task(acp, {"goal": "x"})
+        assert captured["background"] is False
+
+        run_agent.AIAgent._dispatch_delegate_task(
+            acp,
+            {"tasks": [{"goal": "a"}, {"goal": "b"}]},
+        )
+        assert captured["background"] is False
+
+
+def test_dispatch_never_forwards_model_toolsets():
+    """The model has no toolsets argument — subagents always inherit the
+    parent's toolsets. Even if a model smuggles a `toolsets` key into the
+    tool-call args, the live dispatch path must NOT forward it to
+    delegate_task (which no longer accepts it) and must not crash."""
+    from unittest.mock import patch
+    import run_agent
+
+    class _FakeAgent:
+        _delegate_depth = 0
+
+    captured = {}
+
+    def _fake_delegate(**kwargs):
+        captured.update(kwargs)
+        return "{}"
+
+    with patch("tools.delegate_tool.delegate_task", _fake_delegate):
+        run_agent.AIAgent._dispatch_delegate_task(
+            _FakeAgent(), {"goal": "x", "toolsets": ["web", "terminal"]}
+        )
+    assert "toolsets" not in captured
+
+
+def test_delegate_task_background_detaches_child_from_parent(monkeypatch):
+    """A background child must NOT remain in parent._active_children —
+    otherwise parent-turn interrupts / cache evicts / session close would
+    kill the detached subagent mid-run."""
+    from unittest.mock import MagicMock, patch
+    import tools.delegate_tool as dt
+
+    parent = MagicMock()
+    parent._delegate_depth = 0
+    parent.session_id = "sess"
+    parent._active_children = []
+    parent._active_children_lock = threading.Lock()
+    fake_child = MagicMock()
+    fake_child._delegate_role = "leaf"
+    fake_child._subagent_id = "s1"
+
+    gate = threading.Event()
+
+    def slow_child(task_index, goal, child=None, parent_agent=None, **kw):
+        gate.wait(timeout=60)
+        return {"task_index": 0, "status": "completed", "summary": "ok"}
+
+    def build_and_register(**kw):
+        # Mirror what the real _build_child_agent does: register the child
+        # for interrupt propagation.
+        parent._active_children.append(fake_child)
+        return fake_child
+
+    creds = {
+        "model": "m", "provider": None, "base_url": None, "api_key": None,
+        "api_mode": None, "command": None, "args": None,
+    }
+    with patch.object(dt, "_build_child_agent", side_effect=build_and_register), \
+         patch.object(dt, "_run_single_child", side_effect=slow_child), \
+         patch.object(dt, "_resolve_delegation_credentials", return_value=creds):
+        out = dt.delegate_task(goal="bg task", background=True, parent_agent=parent)
+
+    import json
+    assert json.loads(out)["status"] == "dispatched"
+    # Child detached immediately at dispatch, while it is still running.
+    assert fake_child not in parent._active_children
+    gate.set()
+    assert _drain_one() is not None
+
+
 def test_concurrent_dispatch_respects_capacity():
     """Two threads racing dispatch with cap=1 must yield exactly one accept
     (capacity check and record insert are atomic under the records lock)."""
