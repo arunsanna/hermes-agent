@@ -739,41 +739,51 @@ def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch):
     assert _drain_one() is None
 
 
-def test_model_dispatch_forces_background():
-    """The MODEL-facing dispatch path forces background=True for any top-level
-    delegation (single task OR batch), and keeps it off for an orchestrator
-    subagent (depth > 0). Direct delegate_task() callers are unaffected (they
-    keep the synchronous default)."""
+def test_model_dispatch_keeps_required_acp_delegations_synchronous():
+    """Top-level ACP delegations wait for their results before the model resumes.
+
+    Other top-level surfaces preserve upstream detached-background behavior,
+    while orchestrator children continue to wait synchronously for workers.
+    """
     import tools.delegate_tool as dt
     from unittest.mock import MagicMock
 
     top = MagicMock()
     top._delegate_depth = 0
+    top.platform = "cli"
     sub = MagicMock()
     sub._delegate_depth = 1
+    sub.platform = "cli"
+    acp = MagicMock()
+    acp._delegate_depth = 0
+    acp.platform = "acp"
 
-    # Registry-fallback helper: top-level always background, regardless of
-    # single vs batch; subagent never.
+    # Registry-fallback helper: ordinary top-level runs remain background.
     assert dt._model_background_value({"goal": "x"}, top) is True
     assert dt._model_background_value(
         {"tasks": [{"goal": "a"}, {"goal": "b"}]}, top
     ) is True
     assert dt._model_background_value({"tasks": [{"goal": "a"}]}, top) is True
+
+    # Workers and ACP roots must have their tool result before continuing.
     assert dt._model_background_value({"goal": "x"}, sub) is False
     assert dt._model_background_value(
         {"tasks": [{"goal": "a"}, {"goal": "b"}]}, sub
     ) is False
+    assert dt._model_background_value({"goal": "x"}, acp) is False
+    assert dt._model_background_value(
+        {"tasks": [{"goal": "a"}, {"goal": "b"}]}, acp
+    ) is False
 
 
-def test_run_agent_dispatch_forces_background():
-    """run_agent._dispatch_delegate_task — the live model path — forces
-    background on for any top-level delegation (single OR batch) and off for a
-    subagent."""
+def test_run_agent_dispatch_keeps_required_acp_delegations_synchronous():
+    """The live dispatch path uses the same ACP finalization contract."""
     from unittest.mock import patch
     import run_agent
 
     class _FakeAgent:
         _delegate_depth = 0
+        platform = "cli"
 
     captured = {}
 
@@ -794,6 +804,17 @@ def test_run_agent_dispatch_forces_background():
         sub = _FakeAgent()
         sub._delegate_depth = 1
         run_agent.AIAgent._dispatch_delegate_task(sub, {"goal": "x"})
+        assert captured["background"] is False
+
+        acp = _FakeAgent()
+        acp.platform = "acp"
+        run_agent.AIAgent._dispatch_delegate_task(acp, {"goal": "x"})
+        assert captured["background"] is False
+
+        run_agent.AIAgent._dispatch_delegate_task(
+            acp,
+            {"tasks": [{"goal": "a"}, {"goal": "b"}]},
+        )
         assert captured["background"] is False
 
 

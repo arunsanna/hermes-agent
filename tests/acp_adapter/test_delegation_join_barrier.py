@@ -1,6 +1,8 @@
-"""ACP prompt turns join same-turn background delegations before finalizing."""
+"""ACP required-delegation integrity and legacy join-barrier coverage."""
 
+import asyncio
 import json
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -8,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 from acp.schema import TextContentBlock
 
+import run_agent
 from acp_adapter.server import HermesACPAgent
 from acp_adapter.session import SessionManager
 from tools.process_registry import process_registry
@@ -53,6 +56,48 @@ class _FakeAgent:
         messages = list(conversation_history or [])
         messages.append({"role": "user", "content": user_message})
         final = f"consolidated: {user_message}"
+        messages.append({"role": "assistant", "content": final})
+        return {"final_response": final, "messages": messages}
+
+
+class _BlockingRequiredAgent(_FakeAgent):
+    """Exercise the real model dispatch policy from an ACP prompt."""
+
+    def __init__(self, child_release):
+        super().__init__()
+        self.platform = "acp"
+        self._delegate_depth = 0
+        self.child_release = child_release
+        self.interrupted = False
+        self.interrupt_calls = 0
+
+    def interrupt(self):
+        self.interrupt_calls += 1
+        self.interrupted = True
+        self.child_release.set()
+
+    def run_conversation(
+        self, *, user_message, conversation_history, task_id, **_kwargs
+    ):
+        self.runs.append(user_message)
+        tool_result = run_agent.AIAgent._dispatch_delegate_task(
+            self,
+            {"goal": "review the answer"},
+        )
+        messages = list(conversation_history or [])
+        messages.append({"role": "user", "content": user_message})
+        if self.interrupted:
+            return {
+                "final_response": "",
+                "messages": messages,
+                "interrupted": True,
+            }
+        final = (
+            "FINAL_WITH_OMEGA"
+            if "OMEGA" in tool_result
+            else "FINAL_MISSING_CHILD"
+        )
+        self.stream_delta_callback(final)
         messages.append({"role": "assistant", "content": final})
         return {"final_response": final, "messages": messages}
 
@@ -111,6 +156,37 @@ def _make_prompt_agent(monkeypatch, *, emit_dispatch=False, connect=False):
     return acp_agent, state, fake, conn
 
 
+def _make_blocking_required_prompt_agent(monkeypatch, child_release):
+    fake = _BlockingRequiredAgent(child_release)
+    manager = SessionManager(agent_factory=lambda **_kwargs: fake, db=_NoopDb())
+    acp_agent = HermesACPAgent(session_manager=manager)
+    state = manager.create_session(cwd=".")
+    conn = _CaptureConn()
+    acp_agent.on_connect(conn)
+    monkeypatch.setattr(acp_agent, "_ensure_delegation_watcher", lambda _loop: None)
+    monkeypatch.setattr(
+        "tools.delegate_tool._load_config",
+        lambda: {
+            "acp_join_same_turn": True,
+            "acp_join_max_rounds": 3,
+            "acp_join_timeout_seconds": 0.05,
+        },
+    )
+    monkeypatch.setattr(
+        "tools.async_delegation.running_for_session",
+        lambda session_key, since_ts=None: [],
+    )
+    return acp_agent, state, fake, conn
+
+
+def _agent_message_texts(conn):
+    return [
+        update.content.text
+        for _session_id, update in conn.updates
+        if getattr(update, "session_update", None) == "agent_message_chunk"
+    ]
+
+
 def _completion_event(session_id):
     return {
         "type": "async_delegation",
@@ -123,6 +199,101 @@ def _completion_event(session_id):
         "api_calls": 2,
         "duration_seconds": 0.1,
     }
+
+
+@pytest.mark.asyncio
+async def test_required_acp_delegation_blocks_final_until_child_returns(
+    monkeypatch,
+):
+    child_entered = threading.Event()
+    child_release = threading.Event()
+    background_values = []
+
+    def _delegate(**kwargs):
+        background_values.append(kwargs["background"])
+        child_entered.set()
+        if kwargs["background"]:
+            return json.dumps(
+                {
+                    "status": "dispatched",
+                    "mode": "background",
+                    "delegation_id": "deleg_premature",
+                }
+            )
+        if not child_release.wait(timeout=5):
+            return json.dumps({"results": [{"status": "failed"}]})
+        return json.dumps(
+            {"results": [{"status": "completed", "summary": "OMEGA"}]}
+        )
+
+    monkeypatch.setattr("tools.delegate_tool.delegate_task", _delegate)
+    acp_agent, state, _fake, conn = _make_blocking_required_prompt_agent(
+        monkeypatch,
+        child_release,
+    )
+    prompt_task = asyncio.create_task(
+        acp_agent.prompt(
+            session_id=state.session_id,
+            prompt=[TextContentBlock(type="text", text="give the verified answer")],
+        )
+    )
+    try:
+        assert await asyncio.to_thread(child_entered.wait, 2)
+        assert background_values == [False]
+        assert prompt_task.done() is False
+        assert _agent_message_texts(conn) == []
+    finally:
+        child_release.set()
+
+    response = await asyncio.wait_for(prompt_task, timeout=2)
+    await asyncio.sleep(0)
+
+    assert response.stop_reason == "end_turn"
+    assert _agent_message_texts(conn) == ["FINAL_WITH_OMEGA"]
+    assert state.history[-1]["content"] == "FINAL_WITH_OMEGA"
+    assert state.is_running is False
+
+
+@pytest.mark.asyncio
+async def test_cancel_interrupts_required_acp_delegation_without_false_final(
+    monkeypatch,
+):
+    child_entered = threading.Event()
+    child_release = threading.Event()
+    background_values = []
+
+    def _delegate(**kwargs):
+        background_values.append(kwargs["background"])
+        child_entered.set()
+        child_release.wait(timeout=5)
+        return json.dumps(
+            {"results": [{"status": "completed", "summary": "OMEGA"}]}
+        )
+
+    monkeypatch.setattr("tools.delegate_tool.delegate_task", _delegate)
+    acp_agent, state, fake, conn = _make_blocking_required_prompt_agent(
+        monkeypatch,
+        child_release,
+    )
+    prompt_task = asyncio.create_task(
+        acp_agent.prompt(
+            session_id=state.session_id,
+            prompt=[TextContentBlock(type="text", text="cancel this work")],
+        )
+    )
+    try:
+        assert await asyncio.to_thread(child_entered.wait, 2)
+        assert background_values == [False]
+        await acp_agent.cancel(state.session_id)
+        response = await asyncio.wait_for(prompt_task, timeout=2)
+    finally:
+        child_release.set()
+
+    await asyncio.sleep(0)
+    assert response.stop_reason == "cancelled"
+    assert fake.interrupt_calls == 1
+    assert _agent_message_texts(conn) == []
+    assert state.is_running is False
 
 
 @pytest.mark.asyncio
