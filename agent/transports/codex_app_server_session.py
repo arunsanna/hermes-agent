@@ -93,6 +93,55 @@ class TurnResult:
 _TURN_ABORTED_MARKERS = ("<turn_aborted>", "<turn_aborted/>")
 
 
+def _notification_scope_ids(
+    note: dict,
+) -> tuple[Optional[str], Optional[str]]:
+    """Extract the thread and turn ids from a Codex notification envelope.
+
+    Codex app-server multiplexes the root thread and hosted subagent threads
+    over one JSON-RPC connection. Item notifications carry flat scope ids,
+    while turn notifications nest the turn id under ``params.turn.id``.
+    Older builds and fixtures may use snake_case or nested item scope fields.
+    """
+    if not isinstance(note, dict):
+        return None, None
+    params = note.get("params") or {}
+    if not isinstance(params, dict):
+        return None, None
+
+    nested_turn = params.get("turn") or {}
+    nested_item = params.get("item") or {}
+
+    thread_id = params.get("threadId") or params.get("thread_id")
+    if thread_id is None and isinstance(nested_turn, dict):
+        thread_id = (
+            nested_turn.get("threadId")
+            or nested_turn.get("thread_id")
+        )
+    if thread_id is None and isinstance(nested_item, dict):
+        thread_id = (
+            nested_item.get("threadId")
+            or nested_item.get("thread_id")
+        )
+
+    turn_id = params.get("turnId") or params.get("turn_id")
+    if turn_id is None and isinstance(nested_turn, dict):
+        turn_id = nested_turn.get("id") or nested_turn.get("turnId")
+    if turn_id is None and isinstance(nested_item, dict):
+        turn_id = (
+            nested_item.get("turnId")
+            or nested_item.get("turn_id")
+        )
+
+    normalized_thread_id = (
+        str(thread_id) if thread_id is not None and str(thread_id) else None
+    )
+    normalized_turn_id = (
+        str(turn_id) if turn_id is not None and str(turn_id) else None
+    )
+    return normalized_thread_id, normalized_turn_id
+
+
 def _coerce_turn_input_text(user_input: Any) -> str:
     """Collapse Hermes/OpenAI rich content into app-server text input.
 
@@ -524,11 +573,11 @@ class CodexAppServerSession:
                     pending = self._client.take_notification(timeout=0)
                     if pending is None:
                         break
-                    if self._is_stale_notification(pending):
-                        logger.debug(
-                            "discarding straggler notification in approval "
-                            "preamble: method=%s", pending.get("method", ""),
-                        )
+                    if self._discard_scoped_notification(
+                        pending,
+                        context="approval-preamble",
+                        current_turn_id=result.turn_id,
+                    ):
                         continue
                     # Mirror the main notification-handling block below so
                     # display events surface and stay in step with projector
@@ -571,15 +620,6 @@ class CodexAppServerSession:
             note = self._client.take_notification(
                 timeout=notification_poll_timeout
             )
-            if note is not None and self._is_stale_notification(note):
-                logger.info(
-                    "discarding straggler notification from retired turn: "
-                    "method=%s turnId=%s (current turn %s)",
-                    note.get("method", ""),
-                    self._notification_turn_id(note),
-                    result.turn_id,
-                )
-                continue
             if note is None:
                 # Only declare the turn quiet after checking both inbound
                 # queues. A notification or approval request may already be
@@ -599,6 +639,12 @@ class CodexAppServerSession:
                     )
                     result.should_retire = True
                     break
+                continue
+            if self._discard_scoped_notification(
+                note,
+                context="run-turn",
+                current_turn_id=result.turn_id,
+            ):
                 continue
 
             method = note.get("method", "")
@@ -799,13 +845,11 @@ class CodexAppServerSession:
             )
             if note is None:
                 continue
-            if self._is_stale_notification(note):
-                logger.info(
-                    "discarding straggler notification during compaction: "
-                    "method=%s turnId=%s",
-                    note.get("method", ""),
-                    self._notification_turn_id(note),
-                )
+            if self._discard_scoped_notification(
+                note,
+                context="compaction",
+                current_turn_id=result.turn_id,
+            ):
                 continue
 
             method = note.get("method", "")
@@ -873,27 +917,75 @@ class CodexAppServerSession:
     # ---------- internals ----------
 
     @staticmethod
+    def _notification_thread_id(note: dict) -> Optional[str]:
+        """Extract the thread id a notification belongs to, if present."""
+        return _notification_scope_ids(note)[0]
+
+    @staticmethod
     def _notification_turn_id(note: dict) -> Optional[str]:
         """Extract the turn id a notification belongs to, if it carries one.
 
         Item-level notifications carry a flat ``params.turnId``;
         ``turn/started`` / ``turn/completed`` carry ``params.turn.id``.
         """
-        params = note.get("params") or {}
-        turn_id = params.get("turnId")
-        if turn_id is None:
-            turn_obj = params.get("turn")
-            if isinstance(turn_obj, dict):
-                turn_id = turn_obj.get("id")
-        if isinstance(turn_id, str) and turn_id:
-            return turn_id
-        return None
+        return _notification_scope_ids(note)[1]
+
+    def _is_foreign_thread_notification(self, note: dict) -> bool:
+        """True when an explicitly scoped notification belongs to a hosted
+        child or another thread multiplexed on this app-server connection."""
+        thread_id = self._notification_thread_id(note)
+        return (
+            self._thread_id is not None
+            and thread_id is not None
+            and thread_id != self._thread_id
+        )
 
     def _is_stale_notification(self, note: dict) -> bool:
         """True when the notification belongs to a turn this session already
         finished — a straggler that must not leak into the current turn."""
         turn_id = self._notification_turn_id(note)
         return turn_id is not None and turn_id in self._retired_turn_ids
+
+    def _discard_scoped_notification(
+        self,
+        note: dict,
+        *,
+        context: str,
+        current_turn_id: Optional[str],
+    ) -> bool:
+        """Reject foreign-thread and retired-turn notifications before they
+        reach callbacks, state trackers, projection, or terminal handling.
+
+        Missing scope ids and non-retired unknown turn ids remain accepted for
+        compatibility with older Codex builds whose notification ids drift.
+        """
+        thread_id, turn_id = _notification_scope_ids(note)
+        if self._is_foreign_thread_notification(note):
+            reason = "foreign-thread"
+        elif self._is_stale_notification(note):
+            reason = "retired-turn"
+        else:
+            return False
+
+        method = note.get("method", "")
+        log = (
+            logger.info
+            if reason == "retired-turn" or method == "turn/completed"
+            else logger.debug
+        )
+        log(
+            "discarding scoped codex notification: reason=%s context=%s "
+            "method=%s threadId=%s activeThreadId=%s turnId=%s "
+            "currentTurnId=%s",
+            reason,
+            context,
+            method,
+            thread_id,
+            self._thread_id,
+            turn_id,
+            current_turn_id,
+        )
+        return True
 
     def _retire_turn_id(self, turn_id: Optional[str]) -> None:
         if turn_id and turn_id not in self._retired_turn_ids:
