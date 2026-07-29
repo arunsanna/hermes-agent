@@ -49,6 +49,9 @@ from utils import base_url_hostname, is_truthy_value
 DELEGATE_BLOCKED_TOOLS = frozenset(
     [
         "delegate_task",  # no recursive delegation
+        "delegation_status",  # ACP root controller only
+        "delegation_wait",  # ACP root controller only
+        "delegation_cancel",  # ACP root controller only
         "clarify",  # no user interaction
         "memory",  # no writes to shared MEMORY.md
         "send_message",  # no cross-platform side effects
@@ -697,6 +700,96 @@ def _get_child_timeout() -> Optional[float]:
     return DEFAULT_CHILD_TIMEOUT
 
 
+_DEFAULT_REQUIRED_NO_PROGRESS_TIMEOUT_SECONDS = 300.0
+_DEFAULT_REQUIRED_START_TIMEOUT_SECONDS = 300.0
+_DEFAULT_REQUIRED_IN_FLIGHT_TIMEOUT_SECONDS = 1500.0
+
+
+def _get_required_no_progress_timeout_seconds() -> float:
+    """Read delegation.required_no_progress_timeout_seconds from config.
+
+    Deadline (seconds) an idle required-delegation child (no tool call, no
+    provider API call in flight) is allowed to go without meaningful
+    progress before the supervisor terminalizes it. See
+    ``tools.async_delegation._required_child_effective_timeout_locked``.
+    """
+    cfg = _load_config()
+    val = cfg.get("required_no_progress_timeout_seconds")
+    if val is not None:
+        try:
+            return max(0.001, float(val))
+        except (TypeError, ValueError):
+            logger.warning(
+                "delegation.required_no_progress_timeout_seconds=%r is not a "
+                "valid number; using default %g",
+                val, _DEFAULT_REQUIRED_NO_PROGRESS_TIMEOUT_SECONDS,
+            )
+    env_val = os.getenv("DELEGATION_REQUIRED_NO_PROGRESS_TIMEOUT_SECONDS")
+    if env_val:
+        try:
+            return max(0.001, float(env_val))
+        except (TypeError, ValueError):
+            pass
+    return _DEFAULT_REQUIRED_NO_PROGRESS_TIMEOUT_SECONDS
+
+
+def _get_required_start_timeout_seconds() -> float:
+    """Read delegation.required_start_timeout_seconds from config.
+
+    Deadline (seconds) a required-delegation child is allowed to sit queued
+    before it starts running before the supervisor terminalizes it.
+    """
+    cfg = _load_config()
+    val = cfg.get("required_start_timeout_seconds")
+    if val is not None:
+        try:
+            return max(0.001, float(val))
+        except (TypeError, ValueError):
+            logger.warning(
+                "delegation.required_start_timeout_seconds=%r is not a valid "
+                "number; using default %g",
+                val, _DEFAULT_REQUIRED_START_TIMEOUT_SECONDS,
+            )
+    env_val = os.getenv("DELEGATION_REQUIRED_START_TIMEOUT_SECONDS")
+    if env_val:
+        try:
+            return max(0.001, float(env_val))
+        except (TypeError, ValueError):
+            pass
+    return _DEFAULT_REQUIRED_START_TIMEOUT_SECONDS
+
+
+def _get_required_in_flight_timeout_seconds() -> float:
+    """Read delegation.required_in_flight_timeout_seconds from config.
+
+    Wider deadline (seconds) applied instead of
+    ``required_no_progress_timeout_seconds`` while a required-delegation
+    child is silently inside a tool call or has a provider API call in
+    flight — both produce zero liveness touches by design, so judging them
+    against the tight idle ceiling would kill legitimate slow work. Default
+    matches the model-call watchdog scale already used elsewhere (see
+    ``HERMES_CODEX_HARD_TIMEOUT_SECONDS`` in chat_completion_helpers.py).
+    """
+    cfg = _load_config()
+    val = cfg.get("required_in_flight_timeout_seconds")
+    if val is not None:
+        try:
+            return max(0.001, float(val))
+        except (TypeError, ValueError):
+            logger.warning(
+                "delegation.required_in_flight_timeout_seconds=%r is not a "
+                "valid number; using default %g",
+                val, _DEFAULT_REQUIRED_IN_FLIGHT_TIMEOUT_SECONDS,
+            )
+    env_val = os.getenv("DELEGATION_REQUIRED_IN_FLIGHT_TIMEOUT_SECONDS")
+    if env_val:
+        try:
+            return max(0.001, float(env_val))
+        except (TypeError, ValueError):
+            pass
+    return _DEFAULT_REQUIRED_IN_FLIGHT_TIMEOUT_SECONDS
+
+
 def _get_max_spawn_depth() -> int:
     """Read delegation.max_spawn_depth from config, floored at 1 (no ceiling).
 
@@ -1020,7 +1113,14 @@ def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
         or all(t in DELEGATE_BLOCKED_TOOLS for t in defn.get("tools", []))
     }
     blocked_toolset_names.add("kanban")
-    return [t for t in toolsets if t not in blocked_toolset_names]
+    child_safe = [
+        "hermes-acp-child" if name == "hermes-acp" else name
+        for name in toolsets
+    ]
+    return [
+        name for name in child_safe
+        if name not in blocked_toolset_names
+    ]
 
 
 def _blocked_toolsets_for_role(role: str) -> List[str]:
@@ -1093,7 +1193,11 @@ def _build_child_progress_callback(
     spinner = getattr(parent_agent, "_delegate_spinner", None)
     parent_cb = getattr(parent_agent, "tool_progress_callback", None)
 
-    if not spinner and not parent_cb:
+    _required_tracking = (
+        str(getattr(parent_agent, "platform", "") or "").lower() == "acp"
+        and getattr(parent_agent, "_delegate_depth", 0) == 0
+    )
+    if not spinner and not parent_cb and not _required_tracking:
         return None  # No display → no callback → zero behavior change
 
     # Show 1-indexed prefix only in batch mode (multiple tasks)
@@ -1144,6 +1248,126 @@ def _build_child_progress_callback(
     def _callback(
         event_type, tool_name: str = None, preview: str = None, args=None, **kwargs
     ):
+        relayed_subagent_id = str(
+            kwargs.get("subagent_id") or ""
+        )
+        direct_child_event = (
+            not relayed_subagent_id
+            or relayed_subagent_id == str(subagent_id or "")
+        )
+        # Nested orchestrator events arrive through this callback with the
+        # grandchild's identity in kwargs. They are useful progress for the
+        # required child that owns the nested work, but must never be mistaken
+        # for that owner's terminal event/result.
+        descendant_event = (
+            bool(relayed_subagent_id)
+            and relayed_subagent_id != str(subagent_id or "")
+        )
+        if (
+            subagent_id is not None
+            and event_type == "subagent.complete"
+            and direct_child_event
+        ):
+            terminal_snapshot = None
+            try:
+                from tools.async_delegation import note_required_child_terminal
+
+                terminal_snapshot = note_required_child_terminal(
+                    subagent_id,
+                    status=str(kwargs.get("status") or "completed"),
+                    activity=str(
+                        preview or kwargs.get("summary") or "child completed"
+                    ),
+                    result={
+                        "task_index": task_index,
+                        "child_id": subagent_id,
+                        "status": str(
+                            kwargs.get("status") or "completed"
+                        ),
+                        "summary": kwargs.get("summary") or preview or None,
+                        "api_calls": kwargs.get("api_calls", 0),
+                        "duration_seconds": kwargs.get(
+                            "duration_seconds", 0
+                        ),
+                        "tokens": {
+                            "input": kwargs.get("input_tokens", 0),
+                            "output": kwargs.get("output_tokens", 0),
+                            "reasoning": kwargs.get(
+                                "reasoning_tokens", 0
+                            ),
+                        },
+                    },
+                )
+            except Exception:
+                logger.debug(
+                    "Required child terminal update failed",
+                    exc_info=True,
+                )
+            if (
+                isinstance(terminal_snapshot, dict)
+                and terminal_snapshot.get("terminal")
+            ):
+                winning_status = str(
+                    terminal_snapshot.get("status") or "failed"
+                )
+                requested_status = str(
+                    kwargs.get("status") or "completed"
+                ).strip().lower()
+                if requested_status in {"complete", "success", "done", ""}:
+                    requested_status = "completed"
+                if winning_status != requested_status:
+                    # Controller timeout/cancel won before this normal child
+                    # completion reached ACP. Relay only the immutable winner.
+                    kwargs = dict(kwargs)
+                    kwargs["status"] = winning_status
+                    kwargs["supervision_status"] = winning_status
+                    kwargs["supervision_terminal"] = True
+                    preview = str(
+                        terminal_snapshot.get("last_activity")
+                        or preview
+                        or winning_status
+                    )
+        if subagent_id is not None and (
+            event_type != "subagent.heartbeat" or descendant_event
+        ):
+            meaningful_event = (
+                (
+                    event_type in {
+                        "subagent.text", "subagent_progress",
+                        "tool.started", "tool.completed",
+                        DelegateEvent.TASK_PROGRESS,
+                        DelegateEvent.TASK_TOOL_STARTED,
+                        DelegateEvent.TASK_TOOL_COMPLETED,
+                    }
+                    and bool(preview or tool_name or args)
+                )
+                or (
+                    descendant_event
+                    and event_type == "subagent.heartbeat"
+                    and bool(kwargs.get("meaningful"))
+                )
+                or (
+                    descendant_event
+                    and event_type == "subagent.complete"
+                )
+            )
+            try:
+                from tools.async_delegation import note_required_child_activity
+                note_required_child_activity(
+                    subagent_id,
+                    current_tool=(
+                        tool_name or kwargs.get("current_tool")
+                    ),
+                    activity=str(preview or tool_name or event_type),
+                    meaningful=meaningful_event,
+                    state=(
+                        "running"
+                        if event_type == "subagent.start"
+                        else None
+                    ),
+                )
+            except Exception:
+                logger.debug("Required child activity update failed", exc_info=True)
         # Lifecycle events emitted by the orchestrator itself — handled
         # before enum normalisation since they are not part of DelegateEvent.
         if event_type == "subagent.start":
@@ -1160,6 +1384,10 @@ def _build_child_progress_callback(
 
         if event_type == "subagent.complete":
             _relay("subagent.complete", preview=preview, **kwargs)
+            return
+
+        if event_type == "subagent.heartbeat":
+            _relay("subagent.heartbeat", preview=preview, **kwargs)
             return
 
         if event_type == "subagent.text":
@@ -1670,6 +1898,21 @@ def _build_child_agent(
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
+    # Nested descendants remain part of the direct required child's semantic
+    # work. Copy the immutable ancestor binding rather than the direct-only
+    # `_required_delegation_id`, so descendant terminal events cannot
+    # accidentally finalize the root controller's child slot.
+    parent_required_binding = getattr(
+        parent_agent, "_required_delegation_ancestor_binding", None
+    )
+    if (
+        isinstance(parent_required_binding, tuple)
+        and len(parent_required_binding) == 2
+    ):
+        child._required_delegation_ancestor_binding = (
+            str(parent_required_binding[0] or ""),
+            str(parent_required_binding[1] or ""),
+        )
     # Stable sidebar marker: delegate subagent sessions must stay out of
     # session pickers even when a parent delete orphans them (parent_session_id
     # → NULL). Mirrors /branch's ``_branched_from`` pattern — see
@@ -2073,6 +2316,29 @@ def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
         )
 
 
+def _close_delegation_child_once(child) -> bool:
+    """Close a prebuilt delegation child at most once across worker races."""
+    cleanup_lock = getattr(child, "_delegation_cleanup_lock", None)
+    if not isinstance(cleanup_lock, type(threading.Lock())):
+        cleanup_lock = threading.Lock()
+        child._delegation_cleanup_lock = cleanup_lock
+
+    with cleanup_lock:
+        if getattr(child, "_delegation_resources_closed", False) is True:
+            return False
+        child._delegation_resources_closed = True
+
+    try:
+        if hasattr(child, "close"):
+            child.close()
+    except Exception:
+        logger.debug(
+            "Failed to close child agent after delegation",
+            exc_info=True,
+        )
+    return True
+
+
 def _run_single_child(
     task_index: int,
     goal: str,
@@ -2089,6 +2355,11 @@ def _run_single_child(
     Returns a structured result dict.
     """
     child_start = time.monotonic()
+    worker_started_event = getattr(
+        child, "_delegation_worker_started_event", None
+    )
+    if isinstance(worker_started_event, threading.Event):
+        worker_started_event.set()
 
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, "tool_progress_callback", None)
@@ -2100,6 +2371,64 @@ def _run_single_child(
     _saved_tool_names = getattr(
         child, "_delegate_saved_tool_names", list(model_tools._last_resolved_tool_names)
     )
+
+    required_id_at_start = getattr(child, "_required_delegation_id", None)
+    if required_id_at_start:
+        try:
+            from tools.async_delegation import refresh_required_supervision
+
+            supervision = (
+                refresh_required_supervision(required_id_at_start) or {}
+            )
+            child_id = str(getattr(child, "_subagent_id", "") or "")
+            child_snapshot = next(
+                (
+                    item
+                    for item in (supervision.get("children") or [])
+                    if str(item.get("child_id") or "") == child_id
+                ),
+                {},
+            )
+            if (
+                supervision.get("terminal")
+                or child_snapshot.get("terminal")
+            ):
+                terminal_status = str(
+                    child_snapshot.get("status")
+                    or supervision.get("status")
+                    or "interrupted"
+                )
+                if hasattr(parent_agent, "_active_children"):
+                    try:
+                        lock = getattr(
+                            parent_agent, "_active_children_lock", None
+                        )
+                        if lock:
+                            with lock:
+                                parent_agent._active_children.remove(child)
+                        else:
+                            parent_agent._active_children.remove(child)
+                    except (ValueError, TypeError):
+                        pass
+                _close_delegation_child_once(child)
+                return {
+                    "task_index": task_index,
+                    "child_id": child_id,
+                    "status": terminal_status,
+                    "summary": None,
+                    "error": (
+                        "Required delegation supervisor terminalized the "
+                        "child before provider execution"
+                    ),
+                    "api_calls": 0,
+                    "duration_seconds": 0,
+                    "_child_role": getattr(child, "_delegate_role", None),
+                }
+        except Exception:
+            logger.debug(
+                "Required child pre-start supervision check failed",
+                exc_info=True,
+            )
 
     child_pool = getattr(child, "_credential_pool", None)
     leased_cred_id = None
@@ -2120,12 +2449,21 @@ def _run_single_child(
     _heartbeat_stop = threading.Event()
     # Stale detection: track the child's (tool, iteration, activity_ts) across
     # heartbeat cycles. If none advances, count the cycle as stale.
+    try:
+        child._delegation_heartbeat_stop = _heartbeat_stop
+    except Exception:
+        pass
+    # Stale detection: track the child's semantic progress generation plus
+    # (tool, iteration) across heartbeat cycles. Generic liveness timestamps
+    # are intentionally excluded: terminal/provider wait loops refresh them
+    # periodically even when no output or work advances.
     # Different thresholds for idle vs in-tool (see _HEARTBEAT_STALE_CYCLES_*).
     # last_activity_ts is the same liveness signal the async stall monitor
     # already uses (streamed chunks + direct_api_call mid-wait heartbeats).
     _last_seen_iter = [0]
     _last_seen_tool = [None]  # type: list
     _last_seen_activity_ts = [None]  # type: list
+    _last_seen_meaningful_generation = [0]
     _stale_count = [0]
 
     def _heartbeat_loop():
@@ -2143,6 +2481,9 @@ def _run_single_child(
                 child_iter = child_summary.get("api_call_count", 0)
                 child_max = child_summary.get("max_iterations", 0)
                 child_activity_ts = child_summary.get("last_activity_ts")
+                child_meaningful_generation = int(
+                    child_summary.get("meaningful_progress_generation") or 0
+                )
 
                 # Stale detection: count cycles where iteration, current_tool,
                 # AND last_activity_ts are all frozen. A child running a
@@ -2159,11 +2500,28 @@ def _run_single_child(
                         or child_activity_ts > _last_seen_activity_ts[0]
                     )
                 )
-                if iter_advanced or tool_changed or activity_advanced:
+                semantic_progress = (
+                    child_meaningful_generation
+                    > _last_seen_meaningful_generation[0]
+                )
+                # `meaningful` stays STRICTLY semantic — it is propagated to
+                # note_required_progress and the heartbeat event, where liveness
+                # must never extend a required child's no-progress deadline.
+                meaningful = bool(
+                    iter_advanced or tool_changed or semantic_progress
+                )
+                # The stale COUNTER additionally forgives liveness: this
+                # heartbeat has no in-flight ceiling to fall back on, so
+                # judging a child merely waiting on a slow model as stale is
+                # the exact false positive upstream's activity_advanced fixed.
+                if meaningful or activity_advanced:
                     _last_seen_iter[0] = child_iter
                     _last_seen_tool[0] = child_tool
                     if child_activity_ts is not None:
                         _last_seen_activity_ts[0] = child_activity_ts
+                    _last_seen_meaningful_generation[0] = (
+                        child_meaningful_generation
+                    )
                     _stale_count[0] = 0
                 else:
                     _stale_count[0] += 1
@@ -2200,10 +2558,62 @@ def _run_single_child(
                             f"delegate_task: subagent {child_desc} "
                             f"(iteration {child_iter}/{child_max})"
                         )
+                required_id = getattr(child, "_required_delegation_id", None)
+                progress_generation = 0
+                if required_id:
+                    try:
+                        from tools.async_delegation import note_required_progress
+                        progress = note_required_progress(
+                            required_id,
+                            child_id=str(getattr(child, "_subagent_id", "") or ""),
+                            current_tool=child_tool,
+                            activity=desc,
+                            meaningful=meaningful,
+                            state="running",
+                        ) or {}
+                        if progress.get("terminal"):
+                            _heartbeat_stop.set()
+                        progress_generation = int(
+                            progress.get("progress_generation") or 0
+                        )
+                        supervision_status = str(
+                            progress.get("status") or "running"
+                        )
+                    except Exception:
+                        logger.debug("Required heartbeat update failed", exc_info=True)
+                        supervision_status = "running"
+                else:
+                    supervision_status = "detached"
+                # A supervision update can win the timeout/cancel terminal
+                # transition and synchronously set this stop event through
+                # the controller's child-terminal callback. Do not leak one
+                # final heartbeat or parent activity touch after that lock
+                # winner.
+                if _heartbeat_stop.is_set():
+                    break
+                if child_progress_cb:
+                    try:
+                        child_progress_cb(
+                            "subagent.heartbeat",
+                            preview=desc,
+                            elapsed_seconds=round(time.monotonic() - child_start, 2),
+                            current_tool=child_tool,
+                            last_activity=desc,
+                            progress_generation=progress_generation,
+                            meaningful=meaningful,
+                            status="running",
+                            supervision_status=supervision_status,
+                        )
+                    except Exception:
+                        logger.debug("Heartbeat relay failed", exc_info=True)
             except Exception:
                 pass
             try:
-                touch(desc)
+                try:
+                    touch(desc, meaningful=False)
+                except TypeError:
+                    # Backward compatibility for test doubles/older adapters.
+                    touch(desc)
             except Exception:
                 pass
 
@@ -2865,11 +3275,7 @@ def _run_single_child(
         # Close tool resources (terminal sandboxes, browser daemons,
         # background processes, httpx clients) so subagent subprocesses
         # don't outlive the delegation.
-        try:
-            if hasattr(child, "close"):
-                child.close()
-        except Exception:
-            logger.debug("Failed to close child agent after delegation")
+        _close_delegation_child_once(child)
 
         # The AIAgent turn boundary normally closes the child scope itself. This
         # fallback covers failures before that boundary starts, but must not pop
@@ -3128,6 +3534,7 @@ def delegate_task(
     role: Optional[str] = None,
     background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None,
+    required: bool = False,
     parent_agent=None,
 ) -> str:
     """
@@ -3146,6 +3553,13 @@ def delegate_task(
     """
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
+    required = bool(
+        required
+        and str(getattr(parent_agent, "platform", "") or "").lower() == "acp"
+        and getattr(parent_agent, "_delegate_depth", 0) == 0
+    )
+    if required and getattr(parent_agent, "_interrupt_requested", False):
+        return tool_error("Required delegation cancelled before dispatch: parent turn stopped.")
 
     # Operator-controlled kill switch — lets the TUI freeze new fan-out
     # when a runaway tree is detected, without interrupting already-running
@@ -3274,6 +3688,11 @@ def delegate_task(
 
     overall_start = time.monotonic()
     results = []
+    # Required supervision can stop a batch independently of the parent turn
+    # (for example, the 300-second no-progress watchdog). Keep that signal
+    # separate from ``parent_agent._interrupt_requested`` so a timed-out child
+    # can release the physical async worker without cancelling the parent.
+    _batch_stop = threading.Event()
 
     n_tasks = len(task_list)
     # Track goal labels for progress display (truncated for readability)
@@ -3293,6 +3712,14 @@ def delegate_task(
     live_deleg_id, live_writers, live_paths = create_live_transcripts(
         task_list, context
     )
+    # Required supervision identity cannot depend on the best-effort live-log
+    # side channel. Allocate it before children start so every heartbeat and
+    # controller lookup uses one stable id even when log creation fails.
+    controller_deleg_id = live_deleg_id
+    if required and not controller_deleg_id:
+        from tools.async_delegation import new_delegation_id
+
+        controller_deleg_id = new_delegation_id()
 
     # Capture the ORIGINATING session's wake target BEFORE any child agent is
     # constructed: _build_child_agent() -> AIAgent() -> agent_init calls
@@ -3384,7 +3811,38 @@ def delegate_task(
         results block. That is the contract: fan-out runs in the background,
         waits on each other, and returns together.
         """
-        if n_tasks == 1:
+        supervision_before_start = {}
+        if required:
+            try:
+                from tools.async_delegation import (
+                    refresh_required_supervision,
+                )
+
+                supervision_before_start = (
+                    refresh_required_supervision(controller_deleg_id) or {}
+                )
+            except Exception:
+                logger.debug(
+                    "Required batch pre-start supervision check failed",
+                    exc_info=True,
+                )
+        _stopped_before_start = required and (
+            getattr(parent_agent, "_interrupt_requested", False) is True
+            or _batch_stop.is_set()
+            or bool(supervision_before_start.get("terminal"))
+        )
+        if _stopped_before_start:
+            for _i, _t, _child in children:
+                results.append({
+                    "task_index": _i,
+                    "status": "interrupted",
+                    "summary": None,
+                    "error": "Parent agent stopped before required child execution",
+                    "api_calls": 0,
+                    "duration_seconds": 0,
+                    "_child_role": getattr(_child, "_delegate_role", None),
+                })
+        elif n_tasks == 1 and not required:
             # Single task -- run directly (no thread pool overhead)
             _i, _t, child = children[0]
             result = _run_single_child(
@@ -3398,15 +3856,21 @@ def delegate_task(
             )
             results.append(result)
         else:
-            # Batch -- run in parallel with per-task progress lines
+            # Batch -- run in parallel with per-task progress lines. Required
+            # single-child work also uses this path: the supervisor must be
+            # able to abandon an uninterruptible child and release the outer
+            # async-capacity slot after timeout/STOP.
             completed_count = 0
             spinner_ref = getattr(parent_agent, "_delegate_spinner", None)
 
-            # Daemon workers (tools.daemon_pool): the `with` block still joins
-            # normally, but if the parent is interrupted while a child is
-            # wedged, the abandoned worker must not block interpreter exit.
+            # Daemon workers (tools.daemon_pool) keep abandoned child threads
+            # from blocking interpreter exit. Do not use a context manager:
+            # ThreadPoolExecutor.__exit__ calls shutdown(wait=True), which
+            # would strand this batch worker forever when a child ignores
+            # cancellation.
             from tools.daemon_pool import DaemonThreadPoolExecutor
-            with DaemonThreadPoolExecutor(max_workers=max_children) as executor:
+            executor = DaemonThreadPoolExecutor(max_workers=max_children)
+            try:
                 futures = {}
                 for i, t, child in children:
                     child_context = contextvars.copy_context()
@@ -3434,13 +3898,80 @@ def delegate_task(
 
                 pending = set(futures.keys())
                 while pending:
-                    if (
+                    # A targeted cancellation is terminal for that child even
+                    # if its Python thread ignores interrupt. Drop only the
+                    # cancelled future from this join, then keep collecting
+                    # unaffected siblings.
+                    if required and not _batch_stop.is_set():
+                        try:
+                            from tools.async_delegation import (
+                                refresh_required_supervision,
+                            )
+
+                            supervision = (
+                                refresh_required_supervision(
+                                    controller_deleg_id
+                                )
+                                or {}
+                            )
+                            cancelled_ids = {
+                                str(item.get("child_id") or "")
+                                for item in (
+                                    supervision.get("children") or []
+                                )
+                                if str(item.get("status") or "").lower()
+                                == "cancelled"
+                            }
+                        except Exception:
+                            logger.debug(
+                                "Required targeted-cancel poll failed",
+                                exc_info=True,
+                            )
+                            cancelled_ids = set()
+                        for future in list(pending):
+                            idx = futures[future]
+                            candidate = _child_by_index.get(idx)
+                            candidate_id = str(
+                                getattr(candidate, "_subagent_id", "") or ""
+                            )
+                            if candidate_id not in cancelled_ids:
+                                continue
+                            pending.remove(future)
+                            future.cancel()
+                            results.append(
+                                {
+                                    "task_index": idx,
+                                    "child_id": candidate_id,
+                                    "status": "cancelled",
+                                    "summary": None,
+                                    "error": (
+                                        "Required delegation child was "
+                                        "cancelled by the parent"
+                                    ),
+                                    "api_calls": 0,
+                                    "duration_seconds": round(
+                                        time.monotonic() - overall_start, 2
+                                    ),
+                                    "_child_role": getattr(
+                                        candidate, "_delegate_role", None
+                                    ),
+                                }
+                            )
+                            completed_count += 1
+                        if not pending:
+                            break
+
+                    parent_stopped = (
                         honor_parent_interrupt
-                        and getattr(parent_agent, "_interrupt_requested", False) is True
-                    ):
-                        # Parent interrupted — collect whatever finished and
-                        # abandon the rest.  Children already received the
-                        # interrupt signal; we just can't wait forever.
+                        and getattr(parent_agent, "_interrupt_requested", False)
+                        is True
+                    )
+                    supervisor_stopped = required and _batch_stop.is_set()
+                    if parent_stopped or supervisor_stopped:
+                        # Parent/supervisor stopped — preserve every completed
+                        # sibling and fabricate bounded interrupted entries for
+                        # the rest. Children already received the interrupt
+                        # signal; we cannot wait for one that ignores it.
                         for f in pending:
                             idx = futures[f]
                             if f.done():
@@ -3463,7 +3994,15 @@ def delegate_task(
                                     "task_index": idx,
                                     "status": "interrupted",
                                     "summary": None,
-                                    "error": "Parent agent interrupted — child did not finish in time",
+                                    "error": (
+                                        "Required delegation supervisor stopped "
+                                        "the child before it finished"
+                                        if supervisor_stopped
+                                        else (
+                                            "Parent agent interrupted — child "
+                                            "did not finish in time"
+                                        )
+                                    ),
                                     "api_calls": 0,
                                     "duration_seconds": 0,
                                     "_child_role": getattr(
@@ -3524,6 +4063,15 @@ def delegate_task(
                                 )
                             except Exception as e:
                                 logger.debug("Spinner update_text failed: %s", e)
+            finally:
+                # cancel_futures prevents queued children from starting after a
+                # supervised timeout. ``wait=False`` is the integrity-critical
+                # part: running Python threads cannot be killed, so waiting
+                # here would retain the async pool slot indefinitely.
+                try:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                except TypeError:  # Python < 3.9 compatibility
+                    executor.shutdown(wait=False)
 
             # Sort by task_index so results match input order
             results.sort(key=lambda r: r["task_index"])
@@ -3610,7 +4158,11 @@ def delegate_task(
                 )
                 _async_ok = True
 
-        if not _async_ok:
+        # Required delegations are process-local and same-turn: they are
+        # supervised and joined before the reply finalizes, so they never need
+        # the forced-synchronous fallback even when detached delivery is
+        # unsupported on this session runtime.
+        if not _async_ok and not required:
             logger.info(
                 "delegate_task: async delivery unsupported on this session "
                 "runtime; running the batch synchronously instead."
@@ -3664,34 +4216,93 @@ def delegate_task(
             if _agent_session_id:
                 _session_key = _agent_session_id
         _parent_session_id = getattr(parent_agent, "session_id", None)
-        _child_agents = [c for (_, _, c) in children]
+        _parent_owner_token = str(
+            getattr(parent_agent, "_required_delegation_owner_token", "")
+            or ""
+        )
+        if required and not _parent_owner_token:
+            # Direct tests/embedders may dispatch without entering the full
+            # conversation prologue. Create the same stable capability here.
+            import uuid as _owner_uuid
 
-        # Detach every child from the parent's interrupt-propagation list — the
-        # batch's lifecycle is owned by the async registry now, not the parent
-        # turn. _build_child_agent attached them (correct for sync runs).
-        if hasattr(parent_agent, "_active_children"):
-            _ac_lock = getattr(parent_agent, "_active_children_lock", None)
+            _parent_owner_token = _owner_uuid.uuid4().hex
+            parent_agent._required_delegation_owner_token = (
+                _parent_owner_token
+            )
+        _child_agents = [c for (_, _, c) in children]
+        if required:
             for _c in _child_agents:
-                try:
-                    if _ac_lock:
-                        with _ac_lock:
-                            parent_agent._active_children.remove(_c)
-                    else:
-                        parent_agent._active_children.remove(_c)
-                except ValueError:
-                    pass
+                _c._required_delegation_id = controller_deleg_id
+                _c._required_delegation_ancestor_binding = (
+                    str(controller_deleg_id),
+                    str(getattr(_c, "_subagent_id", "") or ""),
+                )
+                _c._delegation_worker_started_event = threading.Event()
+                _c._delegation_cleanup_lock = threading.Lock()
+                _c._delegation_resources_closed = False
 
         def _batch_runner():
             # This batch is detached from the foreground turn. Its lifecycle is
             # owned by the async registry and cancelled only via _batch_interrupt.
             return _execute_and_aggregate(honor_parent_interrupt=False)
 
+        def _remove_from_parent_tracking(_c) -> None:
+            if not hasattr(parent_agent, "_active_children"):
+                return
+            try:
+                _ac_lock = getattr(
+                    parent_agent, "_active_children_lock", None
+                )
+                if _ac_lock:
+                    with _ac_lock:
+                        parent_agent._active_children.remove(_c)
+                else:
+                    parent_agent._active_children.remove(_c)
+            except (ValueError, TypeError):
+                pass
+
+        def _dispose_if_unstarted(_c) -> bool:
+            started = getattr(
+                _c, "_delegation_worker_started_event", None
+            )
+            if (
+                isinstance(started, threading.Event)
+                and started.is_set()
+            ):
+                return False
+            if (
+                getattr(_c, "_delegation_prestart_disposed", False)
+                is True
+            ):
+                return True
+            _c._delegation_prestart_disposed = True
+            _remove_from_parent_tracking(_c)
+            _close_delegation_child_once(_c)
+            return True
+
         def _batch_interrupt():
+            _batch_stop.set()
             for _c in _child_agents:
+                # A prebuilt child whose worker never began owns clients and
+                # tool resources but has no _run_single_child finally block.
+                # Dispose it here. A started worker is only interrupted; its
+                # own finally remains the single close owner.
+                if _dispose_if_unstarted(_c):
+                    continue
                 try:
+                    # Stop the heartbeat thread first so it cannot keep
+                    # reporting progress for a child we are cancelling.
+                    heartbeat_stop = getattr(
+                        _c, "_delegation_heartbeat_stop", None
+                    )
+                    if isinstance(heartbeat_stop, threading.Event):
+                        heartbeat_stop.set()
                     interrupted = request_hard_interrupt(_c, "Async delegation cancelled")
-                    if not interrupted and hasattr(_c, "_interrupt_requested"):
-                        _c._interrupt_requested = True
+                    if not interrupted:
+                        if hasattr(_c, "interrupt"):
+                            _c.interrupt("Async delegation cancelled")
+                        elif hasattr(_c, "_interrupt_requested"):
+                            _c._interrupt_requested = True
                 except Exception:
                     pass
 
@@ -3726,8 +4337,61 @@ def delegate_task(
                 except Exception:
                     parts.append(None)
             return tuple(parts), in_tool
+        def _child_interrupt(child_id: str):
+            for _c in _child_agents:
+                if getattr(_c, "_subagent_id", None) != child_id:
+                    continue
+                if _dispose_if_unstarted(_c):
+                    return
+                try:
+                    heartbeat_stop = getattr(
+                        _c, "_delegation_heartbeat_stop", None
+                    )
+                    if isinstance(heartbeat_stop, threading.Event):
+                        heartbeat_stop.set()
+                    _c.interrupt("Required delegation child cancelled")
+                except Exception:
+                    pass
+                return
+
+        def _dispose_unstarted_children(reason: str) -> None:
+            """Close children when required dispatch never gained ownership."""
+            _batch_interrupt()
+            for _c in _child_agents:
+                # `_run_single_child` never emitted `subagent.start`. A
+                # terminal relay here would create an ACP early-terminal
+                # tombstone that can never be paired with a later start.
+                _dispose_if_unstarted(_c)
+
+        def _child_terminal(child_id: str, status: str, reason: str):
+            """Force-close one visible child frame on controller timeout/STOP."""
+            for _c in _child_agents:
+                if getattr(_c, "_subagent_id", None) != child_id:
+                    continue
+                heartbeat_stop = getattr(
+                    _c, "_delegation_heartbeat_stop", None
+                )
+                if isinstance(heartbeat_stop, threading.Event):
+                    heartbeat_stop.set()
+                progress_cb = getattr(_c, "tool_progress_callback", None)
+                if callable(progress_cb):
+                    progress_cb(
+                        "subagent.complete",
+                        preview=reason,
+                        status=status,
+                        summary=reason,
+                        supervision_status=status,
+                        supervision_terminal=True,
+                    )
+                return
 
         _goals = [t["goal"] for t in task_list]
+        # Close the STOP-before-registration gap. Children are still attached
+        # to the parent here, so an interrupt arriving before or during the
+        # registry call always reaches a concrete child or a concrete record.
+        if required and getattr(parent_agent, "_interrupt_requested", False):
+            _batch_interrupt()
+            return json.dumps(_execute_and_aggregate(), ensure_ascii=False)
         dispatch = dispatch_async_delegation_batch(
             goals=_goals,
             context=context,
@@ -3740,16 +4404,45 @@ def delegate_task(
             origin_ui_session_id=_origin_ui_session_id,
             origin_session_id=_wake_sid,
             parent_session_id=_parent_session_id,
+            parent_owner_token=_parent_owner_token,
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,
             max_async_children=_get_max_async_children(),
             # Reuse the live-transcript directory's id (when created) so the
             # returned delegation_id matches cache/delegation/live/<id>/.
-            delegation_id=live_deleg_id,
+            # controller_deleg_id IS live_deleg_id whenever the live-transcript
+            # dir was created, so the returned id still matches
+            # cache/delegation/live/<id>/; it only diverges as a fallback when
+            # that best-effort side channel failed.
+            delegation_id=controller_deleg_id,
             progress_fn=_batch_progress,
+            required=required,
+            parent_turn_id=getattr(parent_agent, "_current_turn_id", "") or "",
+            child_ids=[
+                str(getattr(_c, "_subagent_id", "") or "")
+                for _c in _child_agents
+            ],
+            child_interrupt_fn=_child_interrupt,
+            child_terminal_fn=_child_terminal if required else None,
+            no_progress_timeout_seconds=_get_required_no_progress_timeout_seconds(),
+            start_timeout_seconds=_get_required_start_timeout_seconds(),
+            in_flight_no_progress_timeout_seconds=_get_required_in_flight_timeout_seconds(),
         )
 
         if dispatch.get("status") == "dispatched":
+            # Registration succeeded; lifecycle ownership now moves from the
+            # parent's attached-child list to the required/background record.
+            if hasattr(parent_agent, "_active_children"):
+                _ac_lock = getattr(parent_agent, "_active_children_lock", None)
+                for _c in _child_agents:
+                    try:
+                        if _ac_lock:
+                            with _ac_lock:
+                                parent_agent._active_children.remove(_c)
+                        else:
+                            parent_agent._active_children.remove(_c)
+                    except ValueError:
+                        pass
             n = len(_goals)
             note = (
                 "Background dispatch is detached: the subagent result normally "
@@ -3765,7 +4458,7 @@ def delegate_task(
             )
             payload = {
                 "status": "dispatched",
-                "mode": "background",
+                "mode": "required" if required else "background",
                 "count": n,
                 "delegation_id": dispatch["delegation_id"],
                 "goals": _goals,
@@ -3781,9 +4474,23 @@ def delegate_task(
                 )
             return json.dumps(payload, ensure_ascii=False)
 
-        # Pool at capacity / schedule failure — children are still attached
-        # (we detach above only on the parent list, but the async unit was
-        # never accepted, so re-attaching isn't needed: we just run inline).
+        # Pool at capacity / schedule failure: required ACP work must never
+        # fall back to an unbounded synchronous run. That would bypass its
+        # controller, status/cancel tools, and no-progress watchdog. Dispose
+        # the not-yet-started children and return a bounded tool error.
+        if required:
+            rejection = str(dispatch.get("error", "dispatch rejected"))
+            _dispose_unstarted_children(rejection)
+            logger.warning(
+                "delegate_task: required async dispatch rejected: %s",
+                rejection,
+            )
+            return tool_error(
+                "Required delegation could not be started under supervision: "
+                f"{rejection}"
+            )
+
+        # Ordinary background work retains the legacy synchronous fallback.
         logger.info(
             "delegate_task: async pool at capacity (%s); running the whole "
             "batch synchronously instead.",
@@ -4306,8 +5013,14 @@ def _model_background_value(args: dict, parent_agent=None) -> bool:
     synchronous default.
     """
     is_subagent = getattr(parent_agent, "_delegate_depth", 0) > 0
-    platform = str(getattr(parent_agent, "platform", "") or "").strip().lower()
-    return not (is_subagent or platform == "acp")
+    return not is_subagent
+
+
+def _model_required_value(parent_agent=None) -> bool:
+    return (
+        str(getattr(parent_agent, "platform", "") or "").strip().lower() == "acp"
+        and getattr(parent_agent, "_delegate_depth", 0) == 0
+    )
 
 
 _MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args"}
@@ -4344,9 +5057,105 @@ registry.register(
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),
         output_schema=args.get("output_schema"),
+        required=_model_required_value(kw.get("parent_agent")),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,
     emoji="🔀",
     dynamic_schema_overrides=_build_dynamic_schema_overrides,
 )
+
+
+def _required_control(handler_name: str, args: dict, parent_agent=None) -> str:
+    from tools import async_delegation as _required
+
+    if (
+        parent_agent is None
+        or str(getattr(parent_agent, "platform", "") or "").lower() != "acp"
+        or getattr(parent_agent, "_delegate_depth", 0) != 0
+    ):
+        return json.dumps({
+            "status": "unavailable",
+            "error": (
+                "Required delegation controls are available only to the "
+                "top-level ACP parent turn."
+            ),
+        })
+    delegation_id = str(args.get("delegation_id") or "")
+    if handler_name == "status":
+        payload = _required.required_status(parent_agent, delegation_id)
+    elif handler_name == "wait":
+        payload = _required.wait_required(
+            parent_agent,
+            delegation_id,
+            timeout_seconds=args.get("timeout_seconds", 0),
+        )
+    else:
+        payload = _required.cancel_required(
+            parent_agent, delegation_id, child_id=args.get("child_id")
+        )
+    if payload.get("terminal"):
+        # Model-called controls are liveness/status surfaces, never the
+        # durable child-result observation. This applies equally to wait,
+        # status-after-terminal, whole cancel, and last-child cancel.
+        # The barrier injects the one canonical result atomically.
+        payload = dict(payload)
+        payload.pop("result", None)
+        payload["observation_pending"] = not bool(
+            payload.get("consumed")
+        )
+    return json.dumps(payload, ensure_ascii=False)
+
+
+_REQUIRED_ID_PROPERTY = {
+    "type": "string",
+    "description": "Required delegation id returned by delegate_task.",
+}
+
+for _name, _description, _properties in (
+    (
+        "delegation_status",
+        "Inspect same-turn ACP required delegation progress without consuming it.",
+        {"delegation_id": _REQUIRED_ID_PROPERTY},
+    ),
+    (
+        "delegation_wait",
+        (
+            "Wait up to 30 seconds for same-turn ACP delegation progress. "
+            "A terminal result is inserted automatically through the durable "
+            "required-delegation barrier."
+        ),
+        {
+            "delegation_id": _REQUIRED_ID_PROPERTY,
+            "timeout_seconds": {"type": "number", "minimum": 0, "maximum": 30},
+        },
+    ),
+    (
+        "delegation_cancel",
+        "Cancel a same-turn ACP required delegation or one owned child.",
+        {
+            "delegation_id": _REQUIRED_ID_PROPERTY,
+            "child_id": {"type": "string"},
+        },
+    ),
+):
+    registry.register(
+        name=_name,
+        # These controls are an ACP root protocol surface, not a generally
+        # selectable delegation toolset. Register directly into the static
+        # ACP composite so CLI/TUI/API profiles cannot opt into them by name.
+        toolset="hermes-acp",
+        schema={
+            "name": _name,
+            "description": _description,
+            "parameters": {
+                "type": "object",
+                "properties": _properties,
+                "required": ["delegation_id"],
+            },
+        },
+        handler=lambda args, _n=_name, **kw: _required_control(
+            _n.removeprefix("delegation_"), args, kw.get("parent_agent")
+        ),
+        emoji="🔀",
+    )

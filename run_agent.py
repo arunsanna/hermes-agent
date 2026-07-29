@@ -33,6 +33,7 @@ except ModuleNotFoundError:
 
 import asyncio
 import base64
+import contextlib
 import copy
 import hashlib
 import json
@@ -1082,7 +1083,7 @@ class AIAgent:
 
         Never raises — a wait notice must not break the API-call wait loop.
         """
-        self._touch_activity(text)
+        self._touch_activity(text, meaningful=False)
         _thinking_cb = getattr(self, "thinking_callback", None)
         if _thinking_cb:
             try:
@@ -2027,6 +2028,63 @@ class AIAgent:
             return self._flush_messages_to_session_db_unlocked(messages, conversation_history)
         with persist_lock:
             return self._flush_messages_to_session_db_unlocked(messages, conversation_history)
+
+    def _persist_required_observation_pair(
+        self,
+        messages: List[Dict],
+        observation_start: int,
+        conversation_history: Optional[List[Dict]] = None,
+    ) -> None:
+        """Persist one required delegation call/result pair atomically.
+
+        The ordinary incremental flush deliberately writes one row at a time.
+        Required completion evidence has a stronger contract: neither row may
+        become durable without the other, and the controller gate opens only
+        after both commit.
+        """
+        persist_lock = getattr(self, "_session_persist_lock", None)
+        lock_context = (
+            persist_lock
+            if persist_lock is not None
+            else contextlib.nullcontext()
+        )
+        with lock_context:
+            if getattr(self, "_persist_disabled", False):
+                raise RuntimeError(
+                    "required delegation observation persistence is disabled"
+                )
+            if self._session_db is None:
+                raise RuntimeError(
+                    "required delegation observation has no session database"
+                )
+            if not self._session_db_created:
+                self._ensure_db_session()
+
+            # Flush everything before the observation through the ordinary
+            # path. The pair itself is excluded and committed below in one
+            # transaction.
+            self._flush_messages_to_session_db_unlocked(
+                messages[:observation_start],
+                conversation_history,
+            )
+            pair = messages[observation_start:]
+            if len(pair) != 2:
+                raise RuntimeError(
+                    "required delegation observation must contain exactly "
+                    "one assistant call and one tool result"
+                )
+            inserted = self._session_db.append_messages_atomic(
+                self.session_id, pair
+            )
+            if inserted != 2:
+                raise RuntimeError(
+                    "required delegation observation atomic append was incomplete"
+                )
+            for message in pair:
+                message[_DB_PERSISTED_MARKER] = True
+            self._flushed_db_message_ids = set()
+            self._flushed_db_message_session_id = self.session_id
+            self._last_flushed_db_idx = len(messages)
 
     def _flush_messages_to_session_db_unlocked(
         self,
@@ -3183,6 +3241,16 @@ class AIAgent:
                         exc_info=True,
                     )
 
+        # Required ACP children are detached from ``_active_children`` so the
+        # parent model can inspect/cancel them while they run. Cancel them at
+        # the controller boundary before propagating to attached sync children.
+        try:
+            from tools.async_delegation import interrupt_required_for_agent
+
+            interrupt_required_for_agent(self, reason="parent interrupted")
+        except Exception:
+            logger.debug("Failed to interrupt required delegations", exc_info=True)
+
         # A cron turn performs its API request on the conversation thread to
         # avoid the nested interrupt-worker deadlock.  Unlike the normal worker
         # path, its client is registered here so this cross-thread interrupt can
@@ -3774,8 +3842,25 @@ class AIAgent:
         *,
         provenance: Optional[ActivityProvenance] = None,
         force_persist: bool = False,
+        meaningful: bool = False,
+        in_flight: Optional[bool] = None,
     ) -> None:
-        """Update the last-activity timestamp and description (thread-safe).
+        """Update liveness and, when warranted, semantic progress.
+
+        Liveness is the safe default: keepalives, retry notices, and polling
+        loops must not extend a required delegation's no-progress deadline.
+        Callers may opt into ``meaningful=True`` only for concrete model/tool
+        progress such as response text, tool arguments, or tool completion.
+
+        ``in_flight`` is a separate, explicit state marker for "this agent
+        has a provider API call outstanding right now" — pass ``True`` when
+        dispatching a request and ``False`` once it returns. It must never be
+        inferred from ``meaningful``: a silent wait for a non-streaming
+        response is legitimate work with zero meaningful touches, and the
+        required-delegation controller uses this marker (alongside
+        ``_current_tool``) to pick a wider no-progress ceiling for it instead
+        of treating the wait as stuck. Omit (``None``) on touches that don't
+        cross that boundary so the previously recorded state is preserved.
 
         Also bridges to the kanban board's heartbeat fields when this
         process is a dispatcher-spawned worker (HERMES_KANBAN_TASK set),
@@ -3800,9 +3885,69 @@ class AIAgent:
             reset_session_activity_persist_window,
         )
 
-        self._last_activity_ts = time.time()
-        self._last_activity_desc = bound_activity_description(desc)
+        now = time.time()
+        _bounded_desc = bound_activity_description(desc)
+        self._last_activity_ts = now
+        self._last_activity_desc = _bounded_desc
         self._last_activity_provenance = normalize_activity_provenance(provenance)
+        if meaningful:
+            self._last_meaningful_activity_ts = now
+            self._last_meaningful_activity_desc = _bounded_desc
+            self._meaningful_progress_generation = (
+                int(getattr(self, "_meaningful_progress_generation", 0)) + 1
+            )
+        # Required-delegation semantic clocks must move synchronously with the
+        # child signal. Waiting for the 30-second UI heartbeat creates a race
+        # where real output at t=299 can still lose to the t=300 watchdog.
+        # Liveness-only touches propagate too, but never move the semantic
+        # deadline because ``meaningful`` stays false.
+        # A direct required child owns the controller id itself. Nested
+        # descendants inherit a frozen (controller id, direct child id)
+        # binding so their semantic progress advances the direct child's
+        # watchdog synchronously without stealing its terminal identity.
+        required_binding = getattr(
+            self, "_required_delegation_ancestor_binding", None
+        )
+        if (
+            isinstance(required_binding, tuple)
+            and len(required_binding) == 2
+        ):
+            required_id = str(required_binding[0] or "")
+            required_child_id = str(required_binding[1] or "")
+        else:
+            required_id = str(
+                getattr(self, "_required_delegation_id", "") or ""
+            )
+            required_child_id = str(
+                getattr(self, "_subagent_id", "") or ""
+            )
+        if required_id and required_child_id:
+            try:
+                from tools.async_delegation import note_required_progress
+
+                # This agent's OWN identity — distinct from required_child_id
+                # once nested delegation is active, where several concurrent
+                # grandchildren share the same frozen ancestor binding (and
+                # therefore the same required_child_id/child slot). Passing
+                # it lets the controller track in-flight state per source
+                # instead of one shared bool, so a finishing sibling can't
+                # clobber a still-in-flight sibling's marker.
+                own_source_id = str(getattr(self, "_subagent_id", "") or "")
+                note_required_progress(
+                    required_id,
+                    child_id=required_child_id,
+                    current_tool=getattr(self, "_current_tool", None),
+                    activity=desc,
+                    meaningful=meaningful,
+                    state="running",
+                    in_flight=in_flight,
+                    in_flight_source=own_source_id,
+                )
+            except Exception:
+                logger.debug(
+                    "Required delegation activity propagation failed",
+                    exc_info=True,
+                )
         if os.environ.get("HERMES_KANBAN_TASK"):
             try:
                 from tools.kanban_tools import (
@@ -4125,11 +4270,22 @@ class AIAgent:
             last_activity_description=getattr(self, "_last_activity_desc", None) or "",
             last_activity_provenance=provenance,
             extra={
-            "current_tool": self._current_tool,
-            "api_call_count": self._api_call_count,
-            "max_iterations": self.max_iterations,
-            "budget_used": self.iteration_budget.used,
-            "budget_max": self.iteration_budget.max_total,
+                # Semantic-progress clocks for required-delegation supervision:
+                # liveness alone must not extend a child's no-progress ceiling.
+                "last_meaningful_activity_ts": getattr(
+                    self, "_last_meaningful_activity_ts", self._last_activity_ts
+                ),
+                "last_meaningful_activity_desc": getattr(
+                    self, "_last_meaningful_activity_desc", self._last_activity_desc
+                ),
+                "meaningful_progress_generation": int(
+                    getattr(self, "_meaningful_progress_generation", 0)
+                ),
+                "current_tool": self._current_tool,
+                "api_call_count": self._api_call_count,
+                "max_iterations": self.max_iterations,
+                "budget_used": self.iteration_budget.used,
+                "budget_max": self.iteration_budget.max_total,
             },
         )
 
@@ -6170,7 +6326,9 @@ class AIAgent:
 
     # ── Unified streaming API call ─────────────────────────────────────────
 
-    def _reset_stream_delivery_tracking(self) -> None:
+    def _reset_stream_delivery_tracking(
+        self, *, discard_provisional_attempt: bool = False
+    ) -> None:
         """Reset tracking for text delivered during the current model response."""
         # Flush any benign partial-tag tail held by the think scrubber
         # first (#17924): an innocent '<' at the end of the stream that
@@ -6187,28 +6345,21 @@ class AIAgent:
                 ctx_scrubber = getattr(self, "_stream_context_scrubber", None)
                 if ctx_scrubber is not None:
                     think_tail = ctx_scrubber.feed(think_tail)
-                if think_tail:
-                    callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
-                    for cb in callbacks:
-                        try:
-                            cb(think_tail)
-                        except Exception:
-                            pass
-                    self._record_streamed_assistant_text(think_tail)
+                self._deliver_scrubbed_stream_delta(think_tail)
         # Flush any benign partial-tag tail held by the context scrubber so it
         # reaches the UI before we clear state for the next model call.  If
         # the scrubber is mid-span, flush() drops the orphaned content.
         scrubber = getattr(self, "_stream_context_scrubber", None)
         if scrubber is not None:
             tail = scrubber.flush()
-            if tail:
-                callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
-                for cb in callbacks:
-                    try:
-                        cb(tail)
-                    except Exception:
-                        pass
-                self._record_streamed_assistant_text(tail)
+            self._deliver_scrubbed_stream_delta(tail)
+        if (
+            discard_provisional_attempt
+            and getattr(self, "_acp_provisional_stream_active", False)
+        ):
+            # Retry/supersession boundary: no text from the failed provider
+            # attempt may be replayed if a later attempt classifies ordinary.
+            self._acp_provisional_stream_buffer = []
         self._current_streamed_assistant_text = ""
 
     def _record_streamed_assistant_text(self, text: str) -> None:
@@ -6217,7 +6368,10 @@ class AIAgent:
         # turn's accumulated text (which also feeds the interim-visible-text
         # de-dup comparison), even when a caller reaches this directly (the
         # tool-suppressed content path) rather than through _fire_stream_delta.
-        if self._stream_writer_superseded():
+        if (
+            self._stream_writer_superseded()
+            or self._has_unconsumed_required_delegations()
+        ):
             return
         if isinstance(text, str) and text:
             self._current_streamed_assistant_text = (
@@ -6339,8 +6493,22 @@ class AIAgent:
 
     def _fire_streamed_codex_commentary(self, text: str) -> None:
         """Deliver a completed live Codex commentary message immediately."""
+        if self._has_unconsumed_required_delegations():
+            return
         cb = getattr(self, "interim_assistant_callback", None)
         if cb is None or not isinstance(text, str):
+            return
+        # ACP roots cannot know whether this provider response launches a
+        # required delegation until the completed tool calls have been
+        # repaired and classified. Hold commentary on the same provisional
+        # rail as response text so a delegate candidate is never visible.
+        if getattr(self, "_acp_provisional_stream_active", False):
+            self._acp_provisional_stream_buffer = list(
+                getattr(self, "_acp_provisional_stream_buffer", [])
+            )
+            self._acp_provisional_stream_buffer.append(
+                ("codex_commentary", text)
+            )
             return
         visible = self._strip_think_blocks(text).strip()
         if visible:
@@ -6366,8 +6534,22 @@ class AIAgent:
         when the only streamed text was unrelated mid-turn commentary. (#65919
         review: response-loss blocker)
         """
+        if self._has_unconsumed_required_delegations():
+            return
         cb = getattr(self, "interim_assistant_callback", None)
         if cb is None or not isinstance(assistant_msg, dict):
+            return
+        # Non-streaming Codex/incomplete-response paths can reach this helper
+        # before tool-call classification too. Preserve ordinary ACP
+        # commentary by buffering and replaying after a non-delegation
+        # classification; required candidates are discarded.
+        if getattr(self, "_acp_provisional_stream_active", False):
+            self._acp_provisional_stream_buffer = list(
+                getattr(self, "_acp_provisional_stream_buffer", [])
+            )
+            self._acp_provisional_stream_buffer.append(
+                ("interim_assistant", dict(assistant_msg))
+            )
             return
         commentary_parts = self._extract_codex_interim_visible_parts(assistant_msg)
         undelivered_parts: List[str] = []
@@ -6481,6 +6663,17 @@ class AIAgent:
 
     def _fire_stream_delta(self, text: str) -> None:
         """Fire all registered stream delta callbacks (display + TTS)."""
+        if isinstance(text, str) and text:
+            self._touch_activity(
+                "receiving assistant response text",
+                meaningful=True,
+            )
+        # ACP required-delegation integrity gate. A terminal child result is
+        # still pending until ``delegation_wait`` has placed it in model
+        # context, so both running and terminal-unconsumed records suppress
+        # every visible delta sink.
+        if self._has_unconsumed_required_delegations():
+            return
         # Single-writer guard (#65991): a superseded stream must not interleave
         # its tokens into the turn alongside the retry that replaced it.
         if self._stream_writer_superseded():
@@ -6526,6 +6719,32 @@ class AIAgent:
                 text = text.lstrip("\n")
         if not text:
             return
+        self._deliver_scrubbed_stream_delta(text)
+
+    def _deliver_scrubbed_stream_delta(self, text: str) -> None:
+        """Deliver already-scrubbed text through the one integrity gate.
+
+        Scrubber ``flush()`` tails and ordinary streamed deltas must share this
+        sink. Calling callbacks directly from a reset/retry path would bypass
+        ACP's provisional buffer before the completed response is classified.
+        """
+        if not text or self._has_unconsumed_required_delegations():
+            return
+        if self._stream_writer_superseded():
+            self._note_dropped_stream_writer(
+                "_deliver_scrubbed_stream_delta"
+            )
+            return
+        # ACP roots provisionally buffer visible text until the completed
+        # provider response is classified. If it contains delegate_task, that
+        # prose is an incomplete candidate and is discarded; otherwise it is
+        # flushed in order as the ordinary response stream.
+        if getattr(self, "_acp_provisional_stream_active", False):
+            self._acp_provisional_stream_buffer = list(
+                getattr(self, "_acp_provisional_stream_buffer", [])
+            )
+            self._acp_provisional_stream_buffer.append(("stream_delta", text))
+            return
         callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
         delivered = False
         for cb in callbacks:
@@ -6537,8 +6756,51 @@ class AIAgent:
         if delivered:
             self._record_streamed_assistant_text(text)
 
+    def _finish_acp_provisional_stream(self, *, discard: bool) -> None:
+        if not getattr(self, "_acp_provisional_stream_active", False):
+            return
+        buffered = list(getattr(self, "_acp_provisional_stream_buffer", []))
+        self._acp_provisional_stream_active = False
+        self._acp_provisional_stream_buffer = []
+        if discard:
+            return
+        for entry in buffered:
+            # Accept legacy plain-text entries defensively for callers that
+            # seeded this private buffer before typed delivery events existed.
+            if isinstance(entry, tuple) and len(entry) == 2:
+                kind, payload = entry
+            else:
+                kind, payload = "stream_delta", entry
+            if kind == "stream_delta":
+                self._deliver_scrubbed_stream_delta(payload)
+            elif kind == "codex_commentary":
+                self._fire_streamed_codex_commentary(payload)
+            elif kind == "interim_assistant":
+                self._emit_interim_assistant_message(payload)
+
+    def _has_unconsumed_required_delegations(self) -> bool:
+        """Whether the current ACP turn is forbidden from emitting an answer."""
+        if str(getattr(self, "platform", "") or "").strip().lower() != "acp":
+            return False
+        if getattr(self, "_required_delegation_launching", False):
+            return True
+        try:
+            from tools.async_delegation import has_unconsumed_required
+
+            return has_unconsumed_required(self)
+        except Exception:
+            logger.debug("Required-delegation gate check failed", exc_info=True)
+            # Fail closed on ACP: a controller failure must not leak a
+            # potentially incomplete final answer.
+            return True
+
     def _fire_reasoning_delta(self, text: str) -> None:
         """Fire reasoning callback if registered."""
+        if isinstance(text, str) and text:
+            self._touch_activity(
+                "receiving assistant reasoning",
+                meaningful=True,
+            )
         # Single-writer guard (#65991): fence out a superseded stream's
         # reasoning deltas the same way as content deltas.
         if self._stream_writer_superseded():
@@ -6559,6 +6821,11 @@ class AIAgent:
         or status line so the user isn't staring at a frozen screen while a
         large tool payload (e.g. a 45 KB write_file) is being generated.
         """
+        if tool_name:
+            self._touch_activity(
+                f"receiving tool call: {tool_name}",
+                meaningful=True,
+            )
         cb = self.tool_gen_callback
         if cb is not None:
             try:
@@ -7789,6 +8056,7 @@ class AIAgent:
         """
         from tools.delegate_tool import (
             _model_background_value,
+            _model_required_value,
             _strip_model_hidden_task_fields,
             delegate_task as _delegate_task,
         )
@@ -7803,6 +8071,7 @@ class AIAgent:
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
             background=_model_background_value(function_args, self),
+            required=_model_required_value(self),
             parent_agent=self,
         )
 

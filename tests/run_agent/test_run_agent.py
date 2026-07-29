@@ -1944,6 +1944,7 @@ class TestConcurrentToolExecution:
                 enabled_toolsets=agent.enabled_toolsets,
                 disabled_toolsets=agent.disabled_toolsets,
                 tool_request_middleware_trace=[],
+                parent_agent=agent,
             )
             assert result == "result"
 
@@ -2709,6 +2710,115 @@ class TestHandleMaxIterations:
         # and both tool results survive — this is what prevents the 400.
         tool_ids = [m.get("tool_call_id") for m in sanitized if m.get("role") == "tool"]
         assert tool_ids == ["call_good", "call_bad"]
+
+
+class TestHandleMaxIterationsRequiredDelegationInFlight:
+    """Fix 1 follow-up (adversarial review, HIGH): handle_max_iterations makes
+    its summary call directly against the provider SDK — bypassing
+    interruptible_api_call/interruptible_streaming_api_call entirely — so it
+    needs its own in_flight=True/False touches around the call, or a required
+    child hitting max_iterations gets judged against the tight idle ceiling
+    for a legitimately slow summary call and killed mid-work."""
+
+    def test_survives_past_idle_ceiling_during_summary_call(self, agent):
+        import threading
+
+        from tools import async_delegation as ad
+
+        owner_token = "owner-max-iter"
+        agent._required_delegation_owner_token = owner_token
+        agent.session_id = "parent-max-iter"
+        agent._current_turn_id = "turn-max-iter"
+        agent._cached_system_prompt = "You are helpful."
+
+        call_started = threading.Event()
+        release = threading.Event()
+
+        def _slow_create(**kwargs):
+            call_started.set()
+            assert release.wait(timeout=2)
+            return _mock_response(content="Summary of work done.")
+
+        agent.client.chat.completions.create.side_effect = _slow_create
+
+        # The batch's own runner simulates "this child's conversation loop is
+        # still running" — it must stay blocked for the whole test, otherwise
+        # _finalize_batch terminalizes the record the instant it returns,
+        # before agent._handle_max_iterations (exercised separately below)
+        # ever gets a chance to propagate its own in_flight touches onto the
+        # same child slot.
+        runner_release = threading.Event()
+
+        def _runner():
+            runner_release.wait(timeout=10)
+            return {"results": [{"task_index": 0, "status": "completed"}]}
+
+        dispatch = ad.dispatch_async_delegation_batch(
+            goals=["summary work"],
+            context=None,
+            toolsets=None,
+            role="leaf",
+            model=None,
+            session_key=agent.session_id,
+            parent_session_id=agent.session_id,
+            parent_owner_token=owner_token,
+            parent_turn_id=agent._current_turn_id,
+            runner=_runner,
+            child_ids=["child-max-iter"],
+            required=True,
+            max_async_children=3,
+            no_progress_timeout_seconds=0.02,
+            in_flight_no_progress_timeout_seconds=5.0,
+        )
+        delegation_id = dispatch["delegation_id"]
+        try:
+            agent._required_delegation_id = delegation_id
+            agent._subagent_id = "child-max-iter"
+            ad.note_required_progress(
+                delegation_id,
+                child_id="child-max-iter",
+                current_tool=None,
+                activity="started",
+                meaningful=False,
+                state="running",
+            )
+
+            messages = [{"role": "user", "content": "do stuff"}]
+            result_holder = {}
+
+            def _run():
+                result_holder["result"] = agent._handle_max_iterations(messages, 60)
+
+            t = threading.Thread(target=_run)
+            t.start()
+            assert call_started.wait(timeout=2)
+
+            # Mid-call: the summary dispatch must have marked this child
+            # in_flight. Push last_meaningful_at well past the idle ceiling
+            # but still under the wider in-flight ceiling — the child must
+            # NOT be terminalized (this is exactly the false-positive kill
+            # the review flagged: pre-fix, this call was uninstrumented and
+            # in_flight would still be False, so this same push would have
+            # timed the child out mid-legitimate-work).
+            with ad._records_lock:
+                record = ad._records[delegation_id]
+                child = record["child_supervision"]["child-max-iter"]
+                assert child.get("in_flight_sources")
+                child["last_meaningful_at"] -= 1.0
+            status = ad.required_status(agent, delegation_id)
+            assert status["terminal"] is False
+
+            release.set()
+            t.join(timeout=2)
+
+            assert result_holder["result"] == "Summary of work done."
+            with ad._records_lock:
+                child = ad._records[delegation_id]["child_supervision"]["child-max-iter"]
+                assert not child.get("in_flight_sources")
+        finally:
+            release.set()
+            runner_release.set()
+            ad._reset_for_tests()
 
 
 class TestRunConversation:

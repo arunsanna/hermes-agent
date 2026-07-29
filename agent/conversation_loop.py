@@ -22,6 +22,7 @@ import os
 import random
 import re
 import ssl
+import uuid
 import time
 from typing import Any, Dict, List, Optional
 
@@ -42,6 +43,7 @@ from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
     build_turn_context,
     compose_user_api_content,
+    drop_stale_api_content,
     reanchor_current_turn_user_idx,
 )
 from agent.turn_retry_state import TurnRetryState
@@ -1096,6 +1098,319 @@ def _rewrite_system_content_blocks(system_message: dict, effective: str) -> bool
                 content[1]["text"] = tail
                 return True
     return False
+def _observe_required_delegations(
+    agent,
+    messages: List[Dict[str, Any]],
+    conversation_history: Optional[List[Dict[str, Any]]] = None,
+    *,
+    wait_for_pending: bool = True,
+) -> bool:
+    """Canonically observe required results, optionally waiting for pending.
+
+    Each terminal result is appended as its own synthetic assistant tool call
+    plus exactly one paired tool result. The controller opens the output gate
+    only after that pair exists in the same append-only message list. Tool
+    supervision iterations use ``wait_for_pending=False`` so status/cancel
+    remain model-reachable; a no-tool final candidate uses the hard barrier.
+    """
+    if str(getattr(agent, "platform", "") or "").lower() != "acp":
+        return True
+    from tools import async_delegation as required
+
+    last_visible_wait_heartbeat = 0.0
+    while True:
+        pending = required.list_unconsumed_required(agent)
+        if not pending:
+            agent._required_delegation_launching = False
+            return True
+        if getattr(agent, "_interrupt_requested", False):
+            required.stop_required_for_agent(agent, reason="parent turn stopped")
+            agent._required_delegation_launching = False
+            agent._finish_acp_provisional_stream(discard=True)
+            return False
+        snapshot = (
+            required.wait_required(
+                agent, pending[0]["delegation_id"], timeout_seconds=0.25
+            )
+            if wait_for_pending
+            else required.required_status(
+                agent, pending[0]["delegation_id"]
+            )
+        )
+        if not snapshot.get("terminal"):
+            if not wait_for_pending:
+                return True
+            wait_text = (
+                "waiting for required delegation "
+                f"{snapshot.get('delegation_id')} "
+                f"({snapshot.get('status') or 'running'})"
+            )
+            now = time.monotonic()
+            if now - last_visible_wait_heartbeat >= 15.0:
+                # ACP-visible thinking/status activity keeps the outer Gateway
+                # silence watchdog informed even when a child never starts or
+                # all child cards are terminal while aggregation is wedged.
+                # The internal supervisor still owns the semantic deadline.
+                emit_wait = getattr(agent, "_emit_wait_notice", None)
+                if callable(emit_wait):
+                    emit_wait(wait_text)
+                else:
+                    agent._touch_activity(
+                        wait_text, meaningful=False
+                    )
+                last_visible_wait_heartbeat = now
+            else:
+                agent._touch_activity(
+                    wait_text, meaningful=False
+                )
+            continue
+
+        delegation_id = str(snapshot["delegation_id"])
+        call_id = f"required_wait_{delegation_id}"
+
+        def _append(payload):
+            from agent.tool_dispatch_helpers import make_tool_result_message
+
+            observation_start = len(messages)
+            messages.append({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "delegation_wait",
+                        "arguments": json.dumps({
+                            "delegation_id": delegation_id,
+                            "timeout_seconds": 0,
+                        }),
+                    },
+                }],
+                "_required_delegation_observation": True,
+            })
+            tool_result = make_tool_result_message(
+                "delegation_wait",
+                json.dumps(payload, ensure_ascii=False),
+                call_id,
+            )
+            tool_result["_required_delegation_observation"] = True
+            messages.append(tool_result)
+            try:
+                # ``observe_required`` runs this callback UNLOCKED (a slow
+                # durable write must never stall every other session's
+                # heartbeats/watchdogs/status/cancel calls on the shared
+                # controller lock). Exactly-once consumption instead comes
+                # from the exclusive "consuming" claim ``observe_required``
+                # wins under lock before calling us: on our success it stamps
+                # ``consumed_at`` under lock; on our exception it clears the
+                # claim (leaving ``consumed_at`` unset) so a retry can still
+                # consume the record. Persist the protocol pair in one SQLite
+                # transaction here regardless: the output gate must never
+                # read as open before durable, non-orphaned evidence exists.
+                agent._session_messages = messages
+                agent._persist_required_observation_pair(
+                    messages,
+                    observation_start,
+                    (
+                        conversation_history
+                        if conversation_history is not None
+                        else []
+                    ),
+                )
+            except Exception:
+                # A failed flush must leave both sides retryable. Roll back the
+                # in-memory pair; the controller keeps the terminal record
+                # unconsumed because this callback did not complete.
+                del messages[observation_start:]
+                agent._session_messages = messages
+                raise
+
+        required.observe_required(agent, delegation_id, _append)
+
+
+def _sanitize_required_assistant_candidate(
+    assistant_msg: Dict[str, Any],
+) -> None:
+    """Remove every replayable visible answer while preserving tool protocol."""
+    assistant_msg["content"] = ""
+    # Codex Responses replays these structured message/output_text items
+    # verbatim on the next request. Reasoning continuity is carried separately
+    # in codex_reasoning_items and remains untouched.
+    assistant_msg.pop("codex_message_items", None)
+
+    # api_content is a byte-fidelity sidecar carrying the exact text
+    # previously sent to the API for this row (see turn_context.py). It is
+    # replayed verbatim wherever present — both by the live api_messages
+    # build (conversation_loop's substitution loop) and by a durable reload
+    # via get_messages_as_conversation, which returns the column unchanged.
+    # Clearing `content` above does nothing to stop either path from
+    # resurrecting the rejected candidate if the sidecar survives, so it
+    # must be dropped in the same step.
+    drop_stale_api_content(assistant_msg)
+
+    # Native Anthropic ordered blocks interleave signed thinking with tool_use
+    # and text. Preserve signed reasoning/tool blocks exactly, but strip text
+    # candidates so neither state.db replay nor the next request can resurrect
+    # preliminary prose.
+    ordered_blocks = assistant_msg.get("anthropic_content_blocks")
+    if isinstance(ordered_blocks, list):
+        preserved = []
+        for block in ordered_blocks:
+            block_type = (
+                block.get("type")
+                if isinstance(block, dict)
+                else getattr(block, "type", None)
+            )
+            if block_type == "text":
+                continue
+            preserved.append(block)
+        if preserved:
+            assistant_msg["anthropic_content_blocks"] = preserved
+        else:
+            assistant_msg.pop("anthropic_content_blocks", None)
+
+
+def _clear_orphaned_required_launch(agent) -> None:
+    """Clear a response-local latch only when no controller record owns it."""
+    if not getattr(agent, "_required_delegation_launching", False):
+        return
+    try:
+        from tools.async_delegation import list_unconsumed_required
+
+        if list_unconsumed_required(agent):
+            return
+    except Exception:
+        # Fail closed for this response. The next turn reinitializes the latch.
+        return
+    agent._required_delegation_launching = False
+    agent._finish_acp_provisional_stream(discard=True)
+
+
+def _join_required_before_context_compression(
+    agent,
+    messages: List[Dict[str, Any]],
+    conversation_history: Optional[List[Dict[str, Any]]],
+) -> None:
+    """Make required child evidence durable before any context rewrite.
+
+    Reactive provider errors can demand compression while a required child is
+    still running. Compression may rotate the Hermes session id, invalidating
+    the controller's exact owner key. Join and atomically observe first; the
+    central compression guard remains the fail-closed backstop for every other
+    caller, including manual/forced and in-place compression.
+    """
+    _clear_orphaned_required_launch(agent)
+    if not agent._has_unconsumed_required_delegations():
+        return
+    agent._finish_acp_provisional_stream(discard=True)
+    if not _observe_required_delegations(
+        agent,
+        messages,
+        conversation_history,
+        wait_for_pending=True,
+    ):
+        raise RuntimeError(
+            "Required delegation was interrupted before context compression"
+        )
+
+
+def _required_safe_terminal_result(
+    agent,
+    result: Dict[str, Any],
+    messages: List[Dict[str, Any]],
+    conversation_history: Optional[List[Dict[str, Any]]],
+    *,
+    interrupt: bool = False,
+) -> Dict[str, Any]:
+    """Close every direct turn exit behind the required-observation gate.
+
+    Provider/output/validation failures remain the terminal decision; this
+    helper does not make another model call. It only waits for owned child
+    work, appends and durably persists its canonical synthetic observation,
+    and makes sure rollback/error result shapes return that live message list.
+    User interrupts cancel immediately instead of waiting on a stuck child.
+    """
+    if str(getattr(agent, "platform", "") or "").lower() != "acp":
+        return result
+
+    _clear_orphaned_required_launch(agent)
+    try:
+        required_pending = bool(
+            getattr(agent, "_required_delegation_launching", False)
+            or agent._has_unconsumed_required_delegations()
+        )
+    except Exception:
+        required_pending = True
+    if not required_pending:
+        return result
+
+    try:
+        agent._finish_acp_provisional_stream(discard=True)
+    except Exception:
+        logger.debug(
+            "Required terminal provisional cleanup failed", exc_info=True
+        )
+
+    try:
+        if interrupt:
+            from tools.async_delegation import stop_required_for_agent
+
+            stop_required_for_agent(agent, reason="parent turn stopped")
+            agent._required_delegation_launching = False
+        else:
+            observed = _observe_required_delegations(
+                agent,
+                messages,
+                conversation_history,
+                wait_for_pending=True,
+            )
+            if not observed:
+                # The observer already cancelled on an interrupt. Preserve
+                # the caller's explicit interrupted result, but never wait.
+                if getattr(agent, "_interrupt_requested", False):
+                    result = dict(result)
+                    result["messages"] = messages
+                    result["interrupted"] = True
+                    result["completed"] = False
+                    return result
+                raise RuntimeError(
+                    "Required delegation observation did not complete"
+                )
+            _clear_orphaned_required_launch(agent)
+            if (
+                getattr(agent, "_required_delegation_launching", False)
+                or agent._has_unconsumed_required_delegations()
+            ):
+                raise RuntimeError(
+                    "Required delegation remained pending after hard join"
+                )
+    except Exception:
+        logger.exception(
+            "Required delegation terminal observation failed"
+        )
+        agent._required_observation_failed = True
+        try:
+            agent._finish_acp_provisional_stream(discard=True)
+        except Exception:
+            pass
+        return {
+            "final_response": None,
+            "messages": messages,
+            "api_calls": result.get("api_calls", 0),
+            "completed": False,
+            "failed": True,
+            "partial": False,
+            "interrupted": False,
+            "error": "required_delegation_observation_failed",
+            "turn_exit_reason": (
+                "required_delegation_observation_failed"
+            ),
+        }
+
+    result = dict(result)
+    # A rollback branch may have captured a stale pre-observation list.
+    result["messages"] = messages
+    return result
 
 
 def _sync_failover_system_message(agent, api_messages, active_system_prompt):
@@ -1438,6 +1753,66 @@ def run_conversation(
         logger.debug("per-turn env credential refresh failed", exc_info=True)
 
     # ── Per-turn setup (the prologue) ──
+    # A prior abnormal turn may have escaped before its required observation
+    # became durable. Clean that exact old owner while its turn id is still on
+    # the agent; build_turn_context assigns the new turn id below. Without this
+    # handoff, the old record can never match a future owner and is retained
+    # forever.
+    if str(getattr(agent, "platform", "") or "").lower() == "acp":
+        try:
+            from tools.async_delegation import stop_required_for_agent
+
+            abandoned = stop_required_for_agent(
+                agent,
+                reason=(
+                    "previous ACP parent turn ended before required "
+                    "observation completed"
+                ),
+            )
+            if abandoned:
+                logger.warning(
+                    "Abandoned %d required delegation record(s) from the "
+                    "previous ACP turn before starting a new turn",
+                    abandoned,
+                )
+        except Exception:
+            logger.exception("Previous required-delegation cleanup failed")
+            try:
+                agent._finish_acp_provisional_stream(discard=True)
+            except Exception:
+                logger.debug(
+                    "Previous provisional stream cleanup also failed",
+                    exc_info=True,
+                )
+            return {
+                # Actionable text, not None: ACP delivery routes this error
+                # to refusal handling, but non-ACP callers surface
+                # final_response directly.
+                "final_response": (
+                    "Required delegation cleanup from the previous turn "
+                    "failed, so this turn was closed before running. "
+                    "Send the message again to retry."
+                ),
+                "messages": (
+                    conversation_history
+                    if isinstance(conversation_history, list)
+                    else []
+                ),
+                "completed": False,
+                "failed": True,
+                "partial": False,
+                "interrupted": False,
+                "api_calls": 0,
+                "error": "required_delegation_observation_failed",
+                "turn_exit_reason": (
+                    "required_delegation_observation_failed"
+                ),
+            }
+        try:
+            agent._finish_acp_provisional_stream(discard=True)
+        except Exception:
+            logger.debug("Previous provisional stream cleanup failed", exc_info=True)
+
     # All once-per-turn setup — stdio guarding, retry-counter resets, user
     # message sanitization, todo/nudge hydration, system-prompt restore-or-
     # build, preflight compression, the ``pre_llm_call`` plugin hook,
@@ -1474,10 +1849,21 @@ def run_conversation(
     active_system_prompt = _ctx.active_system_prompt
     effective_task_id = _ctx.effective_task_id
     turn_id = _ctx.turn_id
+    # Required child ownership must survive context compression, which may
+    # rotate ``agent.session_id`` inside the same ACP turn. Bind controls to an
+    # immutable per-turn capability instead of that mutable DB session id.
+    agent._required_delegation_owner_token = uuid.uuid4().hex
     current_turn_user_idx = _ctx.current_turn_user_idx
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
+    # Response-local required/provisional guards must never leak across user
+    # turns. Any live required record belongs to the previous turn id and
+    # cannot be legally consumed here.
+    agent._required_delegation_launching = False
+    agent._required_observation_failed = False
+    agent._acp_provisional_stream_active = False
+    agent._acp_provisional_stream_buffer = []
 
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
@@ -1566,11 +1952,31 @@ def run_conversation(
                 )
             agent._persist_session(messages, conversation_history)
 
+        _clear_orphaned_required_launch(agent)
+        # Consume only already-terminal required results before each provider
+        # continuation. Pending children keep the answer gate closed but do
+        # not prevent the model from using status/wait/cancel supervision.
+        if not _observe_required_delegations(
+            agent,
+            messages,
+            conversation_history,
+            wait_for_pending=False,
+        ):
+            interrupted = True
+            _turn_exit_reason = "required_delegation_interrupted"
+            break
         # Reset per-turn checkpoint dedup so each iteration can take one snapshot
         agent._checkpoint_mgr.new_turn()
 
         # Check for interrupt request (e.g., user sent new message)
         if agent._interrupt_requested:
+            try:
+                from tools.async_delegation import stop_required_for_agent
+                stop_required_for_agent(agent, reason="parent turn stopped")
+            except Exception:
+                logger.debug("Required STOP cleanup failed", exc_info=True)
+            agent._required_delegation_launching = False
+            agent._finish_acp_provisional_stream(discard=True)
             interrupted = True
             _turn_exit_reason = "interrupted_by_user"
             if not agent.quiet_mode:
@@ -1579,7 +1985,17 @@ def run_conversation(
         
         api_call_count += 1
         agent._api_call_count = api_call_count
-        agent._touch_activity(f"starting API call #{api_call_count}")
+        agent._touch_activity(
+            f"starting API call #{api_call_count}",
+            meaningful=False,
+        )
+        if (
+            str(getattr(agent, "platform", "") or "").lower() == "acp"
+            and getattr(agent, "_delegate_depth", 0) == 0
+            and "delegate_task" in getattr(agent, "valid_tool_names", set())
+        ):
+            agent._acp_provisional_stream_active = True
+            agent._acp_provisional_stream_buffer = []
 
         # Grace call: the budget is exhausted but we gave the model one
         # more chance.  Consume the grace flag so the loop exits after
@@ -2141,6 +2557,7 @@ def run_conversation(
         )()
         if (
             agent.compression_enabled
+            and not agent._has_unconsumed_required_delegations()
             and len(messages) > 1
             and compression_attempts < max_compression_attempts
             and not _preflight_compression_blocked
@@ -2356,7 +2773,7 @@ def run_conversation(
                         # so user sees the rate-limit message that led here.
                         agent._flush_status_buffer()
                         agent._persist_session(messages, conversation_history)
-                        return {
+                        return _required_safe_terminal_result(agent, {
                             "final_response": (
                                 f"⏳ {_nous_msg}\n\n"
                                 "No fallback provider available. "
@@ -2368,14 +2785,16 @@ def run_conversation(
                             "completed": False,
                             "failed": True,
                             "error": _nous_msg,
-                        }
+                        }, messages, conversation_history)
                 except ImportError:
                     pass
                 except Exception:
                     pass  # Never let rate guard break the agent loop
 
             try:
-                agent._reset_stream_delivery_tracking()
+                agent._reset_stream_delivery_tracking(
+                    discard_provisional_attempt=True
+                )
                 # api_messages is built once, before this retry loop, while the
                 # primary provider is active.  A mid-conversation fallback can
                 # switch to a require-side provider (DeepSeek / Kimi / MiMo) that
@@ -2883,14 +3302,14 @@ def run_conversation(
                         logger.error("%sInvalid API response after %d retries.", agent.log_prefix, max_retries)
                         agent._persist_session(messages, conversation_history)
                         _final_response = f"Invalid API response after {max_retries} retries: {_failure_hint}"
-                        return {
+                        return _required_safe_terminal_result(agent, {
                             "final_response": _final_response,
                             "messages": messages,
                             "completed": False,
                             "api_calls": api_call_count,
                             "error": _final_response,
                             "failed": True  # Mark as failure for filtering
-                        }
+                        }, messages, conversation_history)
                     
                     # Backoff before retry — jittered exponential: 5s base, 120s cap
                     wait_time = jittered_backoff(retry_count, base_delay=5.0, max_delay=120.0)
@@ -2917,14 +3336,21 @@ def run_conversation(
                             _interrupt_text = f"Operation interrupted during retry ({_failure_hint}, attempt {retry_count}/{max_retries})."
                             close_interrupted_tool_sequence(messages, _interrupt_text)
                             agent._persist_session(messages, conversation_history)
-                            agent.clear_interrupt()
-                            return {
+                            terminal_result = _required_safe_terminal_result(
+                                agent,
+                                {
                                 "final_response": _interrupt_text,
                                 "messages": messages,
                                 "api_calls": api_call_count,
                                 "completed": False,
                                 "interrupted": True,
-                            }
+                                },
+                                messages,
+                                conversation_history,
+                                interrupt=True,
+                            )
+                            agent.clear_interrupt()
+                            return terminal_result
                         time.sleep(0.2)
                         # Touch activity every ~30s so the gateway's inactivity
                         # monitor knows we're alive during backoff waits.
@@ -2932,7 +3358,8 @@ def run_conversation(
                         if _backoff_touch_counter % 150 == 0:  # 150 × 0.2s = 30s
                             agent._touch_activity(
                                 f"retry backoff ({retry_count}/{max_retries}), "
-                                f"{int(sleep_end - time.time())}s remaining"
+                                f"{int(sleep_end - time.time())}s remaining",
+                                meaningful=False,
                             )
                     if _retry.restart_with_redirected_messages:
                         break  # rebuild this iteration from the correction
@@ -3085,11 +3512,19 @@ def run_conversation(
 
                     agent._cleanup_task_resources(effective_task_id)
                     agent._persist_session(messages, conversation_history)
-                    return _content_policy_blocked_result(
+                    return _required_safe_terminal_result(
+                        agent,
+                        _content_policy_blocked_result(
+                            messages,
+                            api_call_count,
+                            final_response=_refusal_response,
+                            error_detail=(
+                                _refusal_text
+                                or "model declined (content_filter)"
+                            ),
+                        ),
                         messages,
-                        api_call_count,
-                        final_response=_refusal_response,
-                        error_detail=_refusal_text or "model declined (content_filter)",
+                        conversation_history,
                     )
 
                 if finish_reason == "length":
@@ -3178,14 +3613,14 @@ def run_conversation(
                         )
                         agent._cleanup_task_resources(effective_task_id)
                         agent._persist_session(messages, conversation_history)
-                        return {
+                        return _required_safe_terminal_result(agent, {
                             "final_response": _exhaust_response,
                             "messages": messages,
                             "api_calls": api_call_count,
                             "completed": False,
                             "partial": True,
                             "error": _exhaust_error,
-                        }
+                        }, messages, conversation_history)
 
                     if agent.api_mode in {"chat_completions", "bedrock_converse", "anthropic_messages"}:
                         assistant_message = _trunc_msg
@@ -3345,14 +3780,14 @@ def run_conversation(
                             agent._session_messages = messages
                             agent._cleanup_task_resources(effective_task_id)
                             agent._persist_session(messages, conversation_history)
-                            return {
+                            return _required_safe_terminal_result(agent, {
                                 "final_response": partial_response or None,
                                 "messages": messages,
                                 "api_calls": api_call_count,
                                 "completed": False,
                                 "partial": True,
                                 "error": "Response remained truncated after 4 continuation attempts",
-                            }
+                            }, messages, conversation_history)
 
                     if agent.api_mode in {"chat_completions", "bedrock_converse", "anthropic_messages"}:
                         assistant_message = _trunc_msg
@@ -3415,14 +3850,14 @@ def run_conversation(
                             # never reaches finalize_turn (#48879 class).
                             close_interrupted_tool_sequence(messages, _final_response)
                             agent._persist_session(messages, conversation_history)
-                            return {
+                            return _required_safe_terminal_result(agent, {
                                 "final_response": _final_response,
                                 "messages": messages,
                                 "api_calls": api_call_count,
                                 "completed": False,
                                 "partial": True,
                                 "error": _final_response,
-                            }
+                            }, messages, conversation_history)
 
                     # If we have prior messages, roll back to last complete state
                     if len(messages) > 1:
@@ -3432,27 +3867,27 @@ def run_conversation(
                         agent._cleanup_task_resources(effective_task_id)
                         agent._persist_session(messages, conversation_history)
 
-                        return {
+                        return _required_safe_terminal_result(agent, {
                             "final_response": "Response truncated due to output length limit",
                             "messages": rolled_back_messages,
                             "api_calls": api_call_count,
                             "completed": False,
                             "partial": True,
                             "error": "Response truncated due to output length limit"
-                        }
+                        }, messages, conversation_history)
                     else:
                         # First message was truncated - mark as failed
                         agent._flush_status_buffer()
                         agent._vprint(f"{agent.log_prefix}❌ First response truncated - cannot recover", force=True)
                         agent._persist_session(messages, conversation_history)
-                        return {
+                        return _required_safe_terminal_result(agent, {
                             "final_response": "First response truncated due to output length limit",
                             "messages": messages,
                             "api_calls": api_call_count,
                             "completed": False,
                             "failed": True,
                             "error": "First response truncated due to output length limit"
-                        }
+                        }, messages, conversation_history)
                 
                 # Track actual token usage from response for context management
                 if hasattr(response, 'usage') and response.usage:
@@ -3712,6 +4147,10 @@ def run_conversation(
                     outcome="success",
                 )
                 agent._touch_activity(f"API call #{api_call_count} completed")
+                agent._touch_activity(
+                    f"API call #{api_call_count} completed",
+                    meaningful=True,
+                )
                 break  # Success, exit retry loop
 
             except InterruptedError:
@@ -4455,7 +4894,8 @@ def run_conversation(
                 retry_count += 1
                 elapsed_time = time.time() - api_start_time
                 agent._touch_activity(
-                    f"API error recovery (attempt {retry_count}/{max_retries})"
+                    f"API error recovery (attempt {retry_count}/{max_retries})",
+                    meaningful=False,
                 )
                 
                 error_type = type(api_error).__name__
@@ -4541,14 +4981,21 @@ def run_conversation(
                     _interrupt_text = f"Operation interrupted: handling API error ({error_type}: {agent._clean_error_message(str(api_error))})."
                     close_interrupted_tool_sequence(messages, _interrupt_text)
                     agent._persist_session(messages, conversation_history)
-                    agent.clear_interrupt()
-                    return {
+                    terminal_result = _required_safe_terminal_result(
+                        agent,
+                        {
                         "final_response": _interrupt_text,
                         "messages": messages,
                         "api_calls": api_call_count,
                         "completed": False,
                         "interrupted": True,
-                    }
+                        },
+                        messages,
+                        conversation_history,
+                        interrupt=True,
+                    )
+                    agent.clear_interrupt()
+                    return terminal_result
                 
                 # Check for 413 payload-too-large BEFORE generic 4xx handler.
                 # A 413 is a payload-size error — the correct response is to
@@ -4611,7 +5058,7 @@ def run_conversation(
                         "(compression.enabled: false). Run /compress to compact manually, "
                         "/new to start fresh, or switch to a larger-context model."
                     )
-                    return {
+                    return _required_safe_terminal_result(agent, {
                         "final_response": _final_response,
                         "messages": messages,
                         "completed": False,
@@ -4620,7 +5067,7 @@ def run_conversation(
                         "partial": True,
                         "failed": True,
                         "compaction_disabled": True,
-                    }
+                    }, messages, conversation_history)
 
                 # ── Anthropic Sonnet long-context tier gate ───────────
                 # Anthropic returns HTTP 429 "Extra usage is required for
@@ -4630,6 +5077,9 @@ def run_conversation(
                 # credentials won't help.  Reduce context to 200k (the
                 # standard tier) and compress.
                 if classified.reason == FailoverReason.long_context_tier:
+                    _join_required_before_context_compression(
+                        agent, messages, conversation_history
+                    )
                     _reduced_ctx = 200000
                     compressor = agent.context_compressor
                     old_ctx = compressor.context_length
@@ -4895,6 +5345,9 @@ def run_conversation(
                     )
 
                 if is_payload_too_large:
+                    _join_required_before_context_compression(
+                        agent, messages, conversation_history
+                    )
                     compression_attempts += 1
                     if compression_attempts > max_compression_attempts:
                         # Terminal — surface the buffered retry trace.
@@ -4904,7 +5357,7 @@ def run_conversation(
                         logger.error("%s413 compression failed after %d attempts.", agent.log_prefix, max_compression_attempts)
                         agent._persist_session(messages, conversation_history)
                         _final_response = f"Request payload too large: max compression attempts ({max_compression_attempts}) reached."
-                        return {
+                        return _required_safe_terminal_result(agent, {
                             "final_response": _final_response,
                             "messages": messages,
                             "completed": False,
@@ -4913,7 +5366,7 @@ def run_conversation(
                             "partial": True,
                             "failed": True,
                             "compression_exhausted": True,
-                        }
+                        }, messages, conversation_history)
                     agent._buffer_status(f"⚠️  Request payload too large (413) — compression attempt {compression_attempts}/{max_compression_attempts}...")
 
                     original_len = len(messages)
@@ -4976,7 +5429,7 @@ def run_conversation(
                         logger.error("%s413 payload too large. Cannot compress further.", agent.log_prefix)
                         agent._persist_session(messages, conversation_history)
                         _final_response = "Request payload too large (413). Cannot compress further."
-                        return {
+                        return _required_safe_terminal_result(agent, {
                             "final_response": _final_response,
                             "messages": messages,
                             "completed": False,
@@ -4985,7 +5438,7 @@ def run_conversation(
                             "partial": True,
                             "failed": True,
                             "compression_exhausted": True,
-                        }
+                        }, messages, conversation_history)
 
                 # Check for context-length errors BEFORE generic 4xx handler.
                 # The classifier detects context overflow from: explicit error
@@ -5049,7 +5502,7 @@ def run_conversation(
                             logger.error("%sContext compression failed after %d attempts.", agent.log_prefix, max_compression_attempts)
                             agent._persist_session(messages, conversation_history)
                             _final_response = f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached."
-                            return {
+                            return _required_safe_terminal_result(agent, {
                                 "final_response": _final_response,
                                 "messages": messages,
                                 "completed": False,
@@ -5058,7 +5511,7 @@ def run_conversation(
                                 "partial": True,
                                 "failed": True,
                                 "compression_exhausted": True,
-                            }
+                            }, messages, conversation_history)
                         # Also compress the message history so the output-cap
                         # retry does not just spin on max_tokens alone.  The
                         # compressor drops the middle window, freeing enough
@@ -5128,7 +5581,7 @@ def run_conversation(
                             "max_tokens exceeds the provider's output cap for this model. "
                             "Lower model.max_tokens in config.yaml."
                         )
-                        return {
+                        return _required_safe_terminal_result(agent, {
                             "final_response": _final_response,
                             "messages": messages,
                             "completed": False,
@@ -5136,7 +5589,11 @@ def run_conversation(
                             "error": _final_response,
                             "partial": True,
                             "failed": True,
-                        }
+                        }, messages, conversation_history)
+
+                    _join_required_before_context_compression(
+                        agent, messages, conversation_history
+                    )
 
                     # Error is about the INPUT being too large.  Only reduce
                     # context_length when the provider explicitly reports the
@@ -5203,7 +5660,7 @@ def run_conversation(
                         logger.error("%sContext compression failed after %d attempts.", agent.log_prefix, max_compression_attempts)
                         agent._persist_session(messages, conversation_history)
                         _final_response = f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached."
-                        return {
+                        return _required_safe_terminal_result(agent, {
                             "final_response": _final_response,
                             "messages": messages,
                             "completed": False,
@@ -5212,7 +5669,7 @@ def run_conversation(
                             "partial": True,
                             "failed": True,
                             "compression_exhausted": True,
-                        }
+                        }, messages, conversation_history)
                     agent._buffer_status(COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE.format(tokens=approx_tokens, attempt=compression_attempts, cap=max_compression_attempts))
 
                     original_len = len(messages)
@@ -5266,7 +5723,7 @@ def run_conversation(
                         logger.error("%sContext length exceeded: %s tokens. Cannot compress further.", agent.log_prefix, f"{new_tokens:,}")
                         agent._persist_session(messages, conversation_history)
                         _final_response = f"Context length exceeded ({new_tokens:,} tokens). Cannot compress further."
-                        return {
+                        return _required_safe_terminal_result(agent, {
                             "final_response": _final_response,
                             "messages": messages,
                             "completed": False,
@@ -5275,7 +5732,7 @@ def run_conversation(
                             "partial": True,
                             "failed": True,
                             "compression_exhausted": True,
-                        }
+                        }, messages, conversation_history)
 
                 # Check for non-retryable client errors.  The classifier
                 # already accounts for 413, 429, 529 (transient), context
@@ -5550,11 +6007,16 @@ def run_conversation(
                             f"Provider message: {_nonretryable_summary}\n\n"
                             f"{_CONTENT_POLICY_RECOVERY_HINT}"
                         )
-                        return _content_policy_blocked_result(
+                        return _required_safe_terminal_result(
+                            agent,
+                            _content_policy_blocked_result(
+                                messages,
+                                api_call_count,
+                                final_response=_policy_response,
+                                error_detail=_nonretryable_summary,
+                            ),
                             messages,
-                            api_call_count,
-                            final_response=_policy_response,
-                            error_detail=_nonretryable_summary,
+                            conversation_history,
                         )
                     # Billing walls are the common non-retryable abort: enrich
                     # the result with the same structured recovery descriptor as
@@ -5571,7 +6033,10 @@ def run_conversation(
                         if _ce_guidance:
                             _ce_final += f"\n\n{_ce_guidance}"
                         _ce_block = _billing_block_dict(_provider, _base, _model, _ce_guidance)
-                        return {
+                        # Routed through the required-safe wrapper like every
+                        # other terminal return, so a billing wall cannot skip
+                        # required-delegation cleanup.
+                        return _required_safe_terminal_result(agent, {
                             "final_response": _ce_final,
                             "messages": messages,
                             "api_calls": api_call_count,
@@ -5580,15 +6045,15 @@ def run_conversation(
                             "error": _nonretryable_summary,
                             "failure_reason": classified.reason.value,
                             "billing_block": _ce_block,
-                        }
-                    return {
+                        }, messages, conversation_history)
+                    return _required_safe_terminal_result(agent, {
                         "final_response": _nonretryable_summary,
                         "messages": messages,
                         "api_calls": api_call_count,
                         "completed": False,
                         "failed": True,
                         "error": _nonretryable_summary,
-                    }
+                    }, messages, conversation_history)
 
                 if retry_count >= max_retries:
                     # Before falling back, try rebuilding the primary
@@ -5775,7 +6240,7 @@ def run_conversation(
                             "execute_code with Python's open() for large "
                             "files, or to write in smaller sections."
                         )
-                    return {
+                    return _required_safe_terminal_result(agent, {
                         "final_response": _final_response,
                         "messages": messages,
                         "api_calls": api_call_count,
@@ -5791,7 +6256,7 @@ def run_conversation(
                         # Present only for billing walls: structured recovery
                         # descriptor (provider, billing_url, is_nous, message).
                         "billing_block": _billing_block,
-                    }
+                    }, messages, conversation_history)
 
                 # For rate limits, respect the Retry-After header if present
                 _retry_after = None
@@ -5861,14 +6326,21 @@ def run_conversation(
                         _interrupt_text = f"Operation interrupted: retrying API call after error (retry {retry_count}/{max_retries})."
                         close_interrupted_tool_sequence(messages, _interrupt_text)
                         agent._persist_session(messages, conversation_history)
-                        agent.clear_interrupt()
-                        return {
+                        terminal_result = _required_safe_terminal_result(
+                            agent,
+                            {
                             "final_response": _interrupt_text,
                             "messages": messages,
                             "api_calls": api_call_count,
                             "completed": False,
                             "interrupted": True,
-                        }
+                            },
+                            messages,
+                            conversation_history,
+                            interrupt=True,
+                        )
+                        agent.clear_interrupt()
+                        return terminal_result
                     time.sleep(0.2)  # Check interrupt every 200ms
                     # Touch activity every ~30s so the gateway's inactivity
                     # monitor knows we're alive during backoff waits.
@@ -5876,7 +6348,8 @@ def run_conversation(
                     if _backoff_touch_counter % 150 == 0:  # 150 × 0.2s = 30s
                         agent._touch_activity(
                             f"error retry backoff ({retry_count}/{max_retries}), "
-                            f"{int(sleep_end - time.time())}s remaining"
+                            f"{int(sleep_end - time.time())}s remaining",
+                            meaningful=False,
                         )
                 if _retry.restart_with_redirected_messages:
                     # Leave the retry loop — the check right below rebuilds this
@@ -6091,14 +6564,14 @@ def run_conversation(
                     agent._cleanup_task_resources(effective_task_id)
                     agent._persist_session(messages, conversation_history)
                     
-                    return {
+                    return _required_safe_terminal_result(agent, {
                         "final_response": "Incomplete REASONING_SCRATCHPAD after 2 retries",
                         "messages": rolled_back_messages,
                         "api_calls": api_call_count,
                         "completed": False,
                         "partial": True,
                         "error": "Incomplete REASONING_SCRATCHPAD after 2 retries"
-                    }
+                    }, messages, conversation_history)
             
             # Reset incomplete scratchpad counter on clean response
             agent._incomplete_scratchpad_retries = 0
@@ -6229,22 +6702,27 @@ def run_conversation(
                         f"({agent._codex_incomplete_retries}/3)"
                     )
                     agent._session_messages = messages
+                    agent._finish_acp_provisional_stream(discard=True)
                     continue
 
                 agent._codex_incomplete_retries = 0
+                agent._finish_acp_provisional_stream(discard=True)
                 agent._persist_session(messages, conversation_history)
-                return {
+                return _required_safe_terminal_result(agent, {
                     "final_response": "Codex response remained incomplete after 3 continuation attempts",
                     "messages": messages,
                     "api_calls": api_call_count,
                     "completed": False,
                     "partial": True,
                     "error": "Codex response remained incomplete after 3 continuation attempts",
-                }
+                }, messages, conversation_history)
             elif hasattr(agent, "_codex_incomplete_retries"):
                 agent._codex_incomplete_retries = 0
             
-            # Check for tool calls
+            # Check for tool calls. Required classification intentionally
+            # happens AFTER tool-name repair below: providers frequently emit
+            # aliases that repair to delegate_task, and flushing provisional
+            # text before repair would leak the candidate.
             if assistant_message.tool_calls:
                 if not agent.quiet_mode:
                     agent._vprint(f"{agent.log_prefix}🔧 Processing {len(assistant_message.tool_calls)} tool call(s)...")
@@ -6271,6 +6749,25 @@ def run_conversation(
                         if repaired:
                             print(f"{agent.log_prefix}🔧 Auto-repaired tool name: '{tc.function.name}' -> '{repaired}'")
                             tc.function.name = repaired
+                _required_launch = (
+                    str(getattr(agent, "platform", "") or "").lower() == "acp"
+                    and getattr(agent, "_delegate_depth", 0) == 0
+                    and any(
+                        tc.function.name == "delegate_task"
+                        for tc in assistant_message.tool_calls
+                    )
+                )
+                if _required_launch:
+                    # Close every visible sink before interim narration or
+                    # persistence. The dispatch handler replaces this latch
+                    # with a controller-owned required record.
+                    agent._required_delegation_launching = True
+                agent._finish_acp_provisional_stream(
+                    discard=(
+                        _required_launch
+                        or agent._has_unconsumed_required_delegations()
+                    )
+                )
                 invalid_tool_calls = [
                     tc.function.name for tc in assistant_message.tool_calls
                     if tc.function.name not in agent.valid_tool_names
@@ -6321,15 +6818,17 @@ def run_conversation(
                         # interrupt aborts (#48879 / #52592) so the next user
                         # turn is not tool→user for strict providers.
                         close_interrupted_tool_sequence(messages, _final_response)
+                        _clear_orphaned_required_launch(agent)
+                        # Persist last so the row captures the closed tool tail.
                         agent._persist_session(messages, conversation_history)
-                        return {
+                        return _required_safe_terminal_result(agent, {
                             "final_response": _final_response,
                             "messages": messages,
                             "api_calls": api_call_count,
                             "completed": False,
                             "partial": True,
                             "error": _final_response
-                        }
+                        }, messages, conversation_history)
 
                     assistant_msg = agent._build_assistant_message(assistant_message, finish_reason)
                     messages.append(assistant_msg)
@@ -6349,6 +6848,7 @@ def run_conversation(
                             "tool_call_id": tc.id,
                             "content": content,
                         })
+                    _clear_orphaned_required_launch(agent)
                     continue
                 # Reset retry counter on successful tool call validation
                 agent._invalid_tool_retries = 0
@@ -6405,15 +6905,16 @@ def run_conversation(
                         # Same tool-tail close as interrupt / invalid-tool
                         # exhaustion — this path never reaches finalize_turn.
                         close_interrupted_tool_sequence(messages, _final_response)
+                        _clear_orphaned_required_launch(agent)
                         agent._persist_session(messages, conversation_history)
-                        return {
+                        return _required_safe_terminal_result(agent, {
                             "final_response": _final_response,
                             "messages": messages,
                             "api_calls": api_call_count,
                             "completed": False,
                             "partial": True,
                             "error": _final_response,
-                        }
+                        }, messages, conversation_history)
 
                     # Track retries for invalid JSON arguments
                     agent._invalid_json_retries += 1
@@ -6424,6 +6925,7 @@ def run_conversation(
                     if agent._invalid_json_retries < 3:
                         agent._buffer_vprint(f"🔄 Retrying API call ({agent._invalid_json_retries}/3)...")
                         # Don't add anything to messages, just retry the API call
+                        _clear_orphaned_required_launch(agent)
                         continue
                     else:
                         # Instead of returning partial, inject tool error results so the model can recover.
@@ -6453,6 +6955,7 @@ def run_conversation(
                                 "tool_call_id": tc.id,
                                 "content": tool_result,
                             })
+                        _clear_orphaned_required_launch(agent)
                         continue
                 
                 # Reset retry counter on successful JSON validation
@@ -6465,6 +6968,12 @@ def run_conversation(
                 assistant_message.tool_calls = agent._deduplicate_tool_calls(
                     assistant_message.tool_calls
                 )
+                if _required_launch and not any(
+                    tc.function.name == "delegate_task"
+                    for tc in assistant_message.tool_calls
+                ):
+                    _required_launch = False
+                    _clear_orphaned_required_launch(agent)
 
                 # Mixed-batch invalid-name handling: collect the invalid
                 # calls now so the assistant message (built below) keeps
@@ -6479,7 +6988,15 @@ def run_conversation(
                     ]
 
                 assistant_msg = agent._build_assistant_message(assistant_message, finish_reason)
-
+                _required_response_guard = (
+                    _required_launch
+                    or agent._has_unconsumed_required_delegations()
+                )
+                if _required_response_guard:
+                    # Prose next to a required call is only a candidate; it is
+                    # neither final nor safe to persist/stream before results.
+                    _sanitize_required_assistant_candidate(assistant_msg)
+                
                 turn_content = assistant_message.content or ""
 
                 # Some local tool-call templates emit a bare bracketed token
@@ -6527,7 +7044,11 @@ def run_conversation(
                 # as a fallback final response. Common pattern: model delivers its
                 # answer and calls memory/skill tools as a side-effect in the same
                 # turn. If the follow-up turn after tools is empty, we use this.
-                if turn_content and agent._has_content_after_think_block(turn_content):
+                if (
+                    not _required_response_guard
+                    and turn_content
+                    and agent._has_content_after_think_block(turn_content)
+                ):
                     agent._last_content_with_tools = turn_content
                     # Only mute subsequent output when EVERY tool call in
                     # this turn is post-response housekeeping (memory, todo,
@@ -6673,10 +7194,89 @@ def run_conversation(
                     failed = True
                     break
 
+                # Nonblocking integrity pass: consume any required result that
+                # became terminal during this tool batch, but keep pending work
+                # supervised so the next model turn can call status/wait/cancel.
+                # A no-tool final candidate below is the hard join boundary.
+                if not _observe_required_delegations(
+                    agent,
+                    messages,
+                    conversation_history,
+                    wait_for_pending=False,
+                ):
+                    interrupted = True
+                    _turn_exit_reason = "required_delegation_interrupted"
+                    break
+
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
                     _turn_exit_reason = "guardrail_halt"
+                    if _required_launch:
+                        # This batch launched a required child. The earlier
+                        # nonblocking observation may already have consumed an
+                        # immediately-terminal result, so current pending state
+                        # alone cannot decide integrity. Hard-join any remainder
+                        # and fail closed with the durable child evidence in
+                        # messages; never emit ordinary controlled-halt prose
+                        # as if it were a complete synthesized answer.
+                        if not _observe_required_delegations(
+                            agent,
+                            messages,
+                            conversation_history,
+                            wait_for_pending=True,
+                        ):
+                            return _required_safe_terminal_result(
+                                agent,
+                                {
+                                    "final_response": None,
+                                    "messages": messages,
+                                    "api_calls": api_call_count,
+                                    "completed": False,
+                                    "interrupted": True,
+                                    "error": (
+                                        "required_delegation_interrupted"
+                                    ),
+                                },
+                                messages,
+                                conversation_history,
+                                interrupt=True,
+                            )
+                        return _required_safe_terminal_result(
+                            agent,
+                            {
+                                "final_response": None,
+                                "messages": messages,
+                                "api_calls": api_call_count,
+                                "completed": False,
+                                "failed": True,
+                                "error": (
+                                    "tool_guardrail_halt_after_"
+                                    "required_delegation"
+                                ),
+                            },
+                            messages,
+                            conversation_history,
+                        )
                     final_response = agent._toolguard_controlled_halt_response(decision)
+                    halt_result = _required_safe_terminal_result(
+                        agent,
+                        {
+                            "final_response": final_response,
+                            "messages": messages,
+                            "api_calls": api_call_count,
+                            "completed": False,
+                            "failed": True,
+                            "error": "tool_guardrail_halt",
+                        },
+                        messages,
+                        conversation_history,
+                    )
+                    if (
+                        halt_result.get("error")
+                        == "required_delegation_observation_failed"
+                    ):
+                        return halt_result
+                    messages = halt_result["messages"]
                     agent._emit_status(
                         f"⚠️ Tool guardrail halted {decision.tool_name}: {decision.code}"
                     )
@@ -6755,6 +7355,10 @@ def run_conversation(
                 if (
                     agent.compression_enabled
                     and compression_attempts < max_compression_attempts
+                    # Never compress while a required child's result is still
+                    # unconsumed: rewriting history before the evidence lands
+                    # can invalidate turn ownership.
+                    and not agent._has_unconsumed_required_delegations()
                     and _compressor.should_compress(_real_tokens)
                 ):
                     compression_attempts += 1
@@ -6887,6 +7491,21 @@ def run_conversation(
                 # an empty tool_calls array — is handled at the finalization
                 # chokepoint below, after final_msg is built, so it catches
                 # every path that reaches turn finalization, not just this one.)
+                agent._finish_acp_provisional_stream(
+                    discard=agent._has_unconsumed_required_delegations()
+                )
+                if agent._has_unconsumed_required_delegations():
+                    # A completion may race the provider response. Never
+                    # append/persist that stale candidate; observe the child
+                    # and ask the model to synthesize from the result.
+                    if not _observe_required_delegations(
+                        agent, messages, conversation_history
+                    ):
+                        interrupted = True
+                        _turn_exit_reason = "required_delegation_interrupted"
+                        break
+                    final_response = None
+                    continue
                 final_response = assistant_message.content or ""
                 
                 # Fix: unmute output when entering the no-tool-call branch
@@ -7599,6 +8218,38 @@ def run_conversation(
                             }
                             messages.append(err_msg)
                 break
+
+            # A local/tool-processing exception can occur after delegate_task
+            # was classified or even after its required controller record was
+            # registered. Never retry the provider through that gap. A mere
+            # response-local latch is cleared; a real record is joined and its
+            # durable observation is appended before any retry or terminal
+            # error response can leave this turn.
+            try:
+                agent._finish_acp_provisional_stream(discard=True)
+                _clear_orphaned_required_launch(agent)
+                if agent._has_unconsumed_required_delegations():
+                    if not _observe_required_delegations(
+                        agent, messages, conversation_history
+                    ):
+                        interrupted = True
+                        _turn_exit_reason = (
+                            "required_delegation_interrupted_after_error"
+                        )
+                        break
+            except Exception:
+                logger.exception(
+                    "Required delegation barrier failed during error recovery"
+                )
+                agent._finish_acp_provisional_stream(discard=True)
+                failed = True
+                agent._required_observation_failed = True
+                _turn_exit_reason = "required_delegation_observation_failed"
+                # Fail closed. Turn finalization and the ACP adapter see no
+                # normal assistant answer while the controller remains
+                # unconsumed; the result carries a structured failure instead.
+                final_response = None
+                break
             
             # Non-tool errors don't need a synthetic message injected.
             # The error is already printed to the user (line above), and
@@ -7623,6 +8274,43 @@ def run_conversation(
                 # session resume (avoids consecutive user messages).
                 messages.append({"role": "assistant", "content": final_response})
                 break
+
+    # A fatal provider/guardrail/budget exit can bypass the normal no-tool
+    # answer gate. Never leave a live required owner behind. Observe it first;
+    # if the loop has no budget left, the finalizer's one toolless summary call
+    # can synthesize from that durable evidence. Any barrier failure remains a
+    # structured fail-closed ACP result with no assistant answer.
+    try:
+        if agent._has_unconsumed_required_delegations():
+            agent._finish_acp_provisional_stream(discard=True)
+            prior_exit_reason = str(_turn_exit_reason or "unknown")
+            if not _observe_required_delegations(
+                agent,
+                messages,
+                conversation_history,
+                wait_for_pending=True,
+            ):
+                interrupted = True
+                final_response = None
+                _turn_exit_reason = "required_delegation_interrupted"
+            else:
+                # Any pre-observation prose/error is not authoritative.
+                final_response = None
+                if prior_exit_reason in {"unknown", "budget_exhausted"}:
+                    _turn_exit_reason = "budget_exhausted"
+                else:
+                    agent._required_observation_failed = True
+                    failed = True
+                    _turn_exit_reason = (
+                        "required_delegation_observation_failed"
+                    )
+    except Exception:
+        logger.exception("Required delegation post-loop barrier failed")
+        agent._finish_acp_provisional_stream(discard=True)
+        agent._required_observation_failed = True
+        failed = True
+        final_response = None
+        _turn_exit_reason = "required_delegation_observation_failed"
     
     # Post-loop turn finalization extracted to agent/turn_finalizer.finalize_turn
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled

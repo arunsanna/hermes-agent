@@ -962,7 +962,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # Touch activity before launching workers so the gateway knows
     # we're executing tools (not stuck).
     agent._current_tool = tool_names_str
-    agent._touch_activity(f"executing {num_tools} tools concurrently: {tool_names_str}")
+    agent._touch_activity(
+        f"executing {num_tools} tools concurrently: {tool_names_str}",
+        meaningful=True,
+    )
 
     def _run_tool(
         index,
@@ -1327,7 +1330,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         ]
                         agent._touch_activity(
                             f"concurrent tools running ({_conc_elapsed}s, "
-                            f"{len(not_done)} remaining: {', '.join(_still_running[:3])})"
+                            f"{len(not_done)} remaining: {', '.join(_still_running[:3])})",
+                            meaningful=False,
                         )
             finally:
                 # Belt-and-braces: any exit from the wait loop that abandoned
@@ -1364,6 +1368,17 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # loop. Prefer that real result over a fabricated timeout message — the
         # tool genuinely succeeded, just slightly late.
         effect_disposition = None
+        # r is None means the executor never got a verified outcome from the
+        # worker: timed out (thread left running detached — see the
+        # executor.shutdown comment above), interrupted before/without
+        # reporting, or the thread died without writing results[i]. That is
+        # NOT real progress — it's the required-delegation supervision
+        # equivalent of a no-op, and stamping meaningful=True here would
+        # reset the no-progress deadline for a child whose tool call may
+        # still be silently running unsupervised, exactly when the deadline
+        # should tighten instead. Only an r that the executor actually
+        # observed (success or tool-level error) counts as meaningful.
+        _worker_result_verified = r is not None
         if i in timed_out_indices and r is None:
             suffix = f"{timeout_s:.1f}s" if timeout_s is not None else "the configured timeout"
             function_result = f"Error executing tool '{name}': timed out after {suffix}"

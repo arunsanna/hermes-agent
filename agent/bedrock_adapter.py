@@ -849,6 +849,7 @@ def stream_converse_with_callbacks(
     on_reasoning_delta=None,
     on_interrupt_check=None,
     on_event=None,
+    on_tool_delta=None,
 ) -> SimpleNamespace:
     """Process a Bedrock ConverseStream event stream with real-time callbacks.
 
@@ -863,6 +864,7 @@ def stream_converse_with_callbacks(
             Anthropic and chat_completions streaming paths).
         on_tool_start: Called with the tool name when a toolUse block begins.
             Lets the TUI show a spinner while tool arguments are generated.
+        on_tool_delta: Called with each nonempty toolUse input JSON delta.
         on_reasoning_delta: Called with reasoning/thinking text chunks.
             Bedrock surfaces thinking via ``reasoning`` content block deltas
             on supported models (Claude 4.6+).
@@ -929,7 +931,10 @@ def stream_converse_with_callbacks(
                     on_text_delta(text)
             elif "toolUse" in delta:
                 if current_tool is not None:
-                    current_tool["input_json"] += delta["toolUse"].get("input", "")
+                    input_delta = delta["toolUse"].get("input", "")
+                    current_tool["input_json"] += input_delta
+                    if input_delta and on_tool_delta:
+                        on_tool_delta(input_delta)
             elif "reasoningContent" in delta:
                 # Claude 4.6+ on Bedrock surfaces thinking via reasoningContent
                 reasoning = delta["reasoningContent"]

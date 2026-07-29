@@ -195,7 +195,7 @@ def test_moa_heartbeat_survives_infinite_stale_timeout(monkeypatch):
         _consecutive_stale_streams=0,
         _interrupt_requested=False,
         _compute_non_stream_stale_timeout=lambda _kwargs: float("inf"),
-        _touch_activity=lambda _message: None,
+        _touch_activity=lambda _message, **_kwargs: None,
         _emit_wait_notice=notices.append,
     )
 
@@ -246,7 +246,7 @@ def test_wait_notice_formatting_error_does_not_abort_request(monkeypatch):
         _consecutive_stale_streams=0,
         _interrupt_requested=False,
         _compute_non_stream_stale_timeout=lambda _kwargs: float("inf"),
-        _touch_activity=lambda _message: None,
+        _touch_activity=lambda _message, **_kwargs: None,
         _emit_wait_notice=lambda _message: None,
     )
 

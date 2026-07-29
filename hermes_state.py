@@ -7488,6 +7488,37 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchone()
 
         return row[0] if row else None
+    def append_messages_atomic(
+        self,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+    ) -> int:
+        """Append a message group in one SQLite transaction.
+
+        Required-delegation observations are a protocol pair: an assistant
+        tool call followed by its tool result. Persisting those rows through
+        separate ``append_message`` transactions can leave an orphaned first
+        row if the second insert fails. This batch surface gives callers an
+        all-or-nothing append while reusing the canonical row encoder.
+        """
+        pending = [dict(message) for message in messages]
+        if not pending:
+            return 0
+
+        def _do(conn):
+            inserted, tool_calls_total = self._insert_message_rows(
+                conn, session_id, pending
+            )
+            conn.execute(
+                """UPDATE sessions
+                   SET message_count = message_count + ?,
+                       tool_call_count = tool_call_count + ?
+                   WHERE id = ?""",
+                (inserted, tool_calls_total, session_id),
+            )
+            return inserted
+
+        return self._execute_write(_do)
 
     def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
         """Insert *messages* as fresh active rows for *session_id*.

@@ -48,7 +48,13 @@ from hermes_state import SessionDB
 @pytest.fixture()
 def mock_manager():
     """SessionManager with a mock agent factory."""
-    return SessionManager(agent_factory=lambda: MagicMock(name="MockAIAgent"))
+    def _agent_factory():
+        agent = MagicMock(name="MockAIAgent")
+        agent._required_delegation_launching = False
+        agent._has_unconsumed_required_delegations.return_value = False
+        return agent
+
+    return SessionManager(agent_factory=_agent_factory)
 
 
 @pytest.fixture()
@@ -583,6 +589,299 @@ class TestPrompt:
         resp = await agent.prompt(prompt=prompt, session_id="nonexistent")
         assert isinstance(resp, PromptResponse)
         assert resp.stop_reason == "refusal"
+
+    @pytest.mark.asyncio
+    async def test_prompt_runs_agent(self, agent):
+        """The prompt method should call run_conversation on the agent."""
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        # Mock the agent's run_conversation
+        state.agent.run_conversation = MagicMock(return_value={
+            "final_response": "Hello! How can I help?",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "Hello! How can I help?"},
+            ],
+        })
+
+        # Set up a mock connection
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        prompt = [TextContentBlock(type="text", text="hello")]
+        resp = await agent.prompt(prompt=prompt, session_id=new_resp.session_id)
+
+        assert isinstance(resp, PromptResponse)
+        assert resp.stop_reason == "end_turn"
+        state.agent.run_conversation.assert_called_once()
+        assert state.agent.tool_progress_callback is not None
+        assert state.agent.step_callback is not None
+        assert state.agent.stream_delta_callback is not None
+        assert state.agent.reasoning_callback is not None
+        assert state.agent.thinking_callback is None
+    @pytest.mark.asyncio
+    async def test_prompt_updates_history(self, agent):
+        """After a prompt, session history should be updated."""
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        expected_history = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hey"},
+        ]
+        state.agent.run_conversation = MagicMock(return_value={
+            "final_response": "hey",
+            "messages": expected_history,
+        })
+
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        prompt = [TextContentBlock(type="text", text="hi")]
+        await agent.prompt(prompt=prompt, session_id=new_resp.session_id)
+
+        assert state.history == expected_history
+    @pytest.mark.asyncio
+    async def test_prompt_sends_final_message_update(self, agent):
+        """The final response should be sent as an AgentMessageChunk."""
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        state.agent.run_conversation = MagicMock(return_value={
+            "final_response": "I can help with that!",
+            "messages": [],
+        })
+
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        prompt = [TextContentBlock(type="text", text="help me")]
+        await agent.prompt(prompt=prompt, session_id=new_resp.session_id)
+
+        # session_update should include the final message (usage_update may follow it)
+        mock_conn.session_update.assert_called()
+        updates = [
+            call.kwargs.get("update") or call.args[1]
+            for call in mock_conn.session_update.call_args_list
+        ]
+        assert any(update.session_update == "agent_message_chunk" for update in updates)
+    @pytest.mark.asyncio
+    async def test_prompt_suppresses_cancel_interrupt_sentinel(self, agent):
+        """ACP cancel status text should not be emitted as assistant output."""
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        sentinel = "Operation interrupted: waiting for model response (3.3s elapsed)."
+
+        def mock_run(*args, **kwargs):
+            state.cancel_event.set()
+            return {
+                "final_response": sentinel,
+                "messages": list(state.history),
+                "interrupted": True,
+                "completed": False,
+            }
+
+        state.agent.run_conversation = mock_run
+
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        with patch("agent.title_generator.maybe_auto_title") as mock_title:
+            prompt = [TextContentBlock(type="text", text="please do a long task")]
+            resp = await agent.prompt(prompt=prompt, session_id=new_resp.session_id)
+
+        updates = [
+            call.kwargs.get("update") or call.args[1]
+            for call in mock_conn.session_update.call_args_list
+        ]
+        agent_texts = [
+            update.content.text
+            for update in updates
+            if update.session_update == "agent_message_chunk"
+        ]
+        assert resp.stop_reason == "cancelled"
+        assert sentinel not in agent_texts
+        assert not any(text.startswith("Operation interrupted:") for text in agent_texts)
+        mock_title.assert_not_called()
+    @pytest.mark.asyncio
+    async def test_prompt_suppresses_final_response_when_cancel_wins(self, agent):
+        """STOP is authoritative until the final ACP message is delivered."""
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        final_text = "The actual model answer arrived before cancellation settled."
+
+        def mock_run(*args, **kwargs):
+            state.cancel_event.set()
+            return {
+                "final_response": final_text,
+                "messages": [],
+                "interrupted": True,
+            }
+
+        state.agent.run_conversation = mock_run
+
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        prompt = [TextContentBlock(type="text", text="finish if you can")]
+        resp = await agent.prompt(prompt=prompt, session_id=new_resp.session_id)
+
+        updates = [
+            call.kwargs.get("update") or call.args[1]
+            for call in mock_conn.session_update.call_args_list
+        ]
+        agent_texts = [
+            update.content.text
+            for update in updates
+            if update.session_update == "agent_message_chunk"
+        ]
+        assert resp.stop_reason == "cancelled"
+        assert final_text not in agent_texts
+        assert agent_texts == []
+    @pytest.mark.asyncio
+    async def test_prompt_propagates_hermes_session_id_env(self, agent, monkeypatch):
+        """ACP must propagate the originating session id to the agent loop
+        via ``HERMES_SESSION_ID`` so tools that want to stamp side-effects
+        with it (e.g. ``kanban_create``) can read the env var inside
+        ``run_conversation``. The variable must be visible during the
+        agent call AND restored afterwards so a re-used executor thread
+        doesn't leak one session's id into another."""
+        # Pre-condition: env is clean.
+        monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        captured: dict[str, str | None] = {}
+
+        def mock_run(user_message, conversation_history=None, task_id=None, **kwargs):
+            # Inside the agent loop the env var must reflect the active
+            # ACP session id. ``task_id`` is also the session id at this
+            # boundary; assert both for symmetry.
+            captured["env"] = os.environ.get("HERMES_SESSION_ID")
+            captured["task_id"] = task_id
+            return {"final_response": "ok", "messages": []}
+
+        state.agent.run_conversation = mock_run
+
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        prompt = [TextContentBlock(type="text", text="hi")]
+        await agent.prompt(prompt=prompt, session_id=new_resp.session_id)
+
+        assert captured["env"] == new_resp.session_id, (
+            "HERMES_SESSION_ID must be set to the originating ACP session id "
+            "while the agent loop is running"
+        )
+        assert captured["task_id"] == new_resp.session_id
+        # Post-condition: must be restored to the prior value (None here).
+        assert os.environ.get("HERMES_SESSION_ID") is None, (
+            "HERMES_SESSION_ID must be restored after the agent call so "
+            "a re-used executor thread doesn't leak the id into the next "
+            "session's tools"
+        )
+    @pytest.mark.asyncio
+    async def test_prompt_restores_prior_hermes_session_id(self, agent, monkeypatch):
+        """If the env already had HERMES_SESSION_ID set (e.g. nested
+        agent loops), the prior value must be restored after the inner
+        prompt completes — not popped, not left at the inner id."""
+        monkeypatch.setenv("HERMES_SESSION_ID", "outer-sess")
+
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        captured: dict[str, str | None] = {}
+
+        def mock_run(*args, **kwargs):
+            captured["inner"] = os.environ.get("HERMES_SESSION_ID")
+            return {"final_response": "ok", "messages": []}
+
+        state.agent.run_conversation = mock_run
+
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        prompt = [TextContentBlock(type="text", text="hi")]
+        await agent.prompt(prompt=prompt, session_id=new_resp.session_id)
+
+        assert captured["inner"] == new_resp.session_id
+        # Outer scope must be restored.
+        assert os.environ.get("HERMES_SESSION_ID") == "outer-sess"
+    @pytest.mark.asyncio
+    async def test_prompt_does_not_duplicate_streamed_final_message(self, agent):
+        """If ACP already streamed response chunks, final_response should not be sent again."""
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        def mock_run(*args, **kwargs):
+            state.agent.stream_delta_callback("streamed answer")
+            return {"final_response": "streamed answer", "messages": []}
+
+        state.agent.run_conversation = mock_run
+
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        prompt = [TextContentBlock(type="text", text="hello")]
+        await agent.prompt(prompt=prompt, session_id=new_resp.session_id)
+
+        updates = [
+            call.kwargs.get("update") or call.args[1]
+            for call in mock_conn.session_update.call_args_list
+        ]
+        agent_chunks = [update for update in updates if update.session_update == "agent_message_chunk"]
+        assert len(agent_chunks) == 1
+        assert agent_chunks[0].content.text == "streamed answer"
+    @pytest.mark.asyncio
+    async def test_prompt_delivers_transformed_response_after_streaming(self, agent):
+        """If a transform_llm_output plugin hook modifies the response after
+        streaming, ACP must deliver the transformed final_response so the
+        appended/rewritten text reaches the client.
+        """
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        def mock_run(*args, **kwargs):
+            state.agent.stream_delta_callback("original answer")
+            return {
+                "final_response": "original answer\n\n[plugin appended this]",
+                "response_transformed": True,
+                "messages": [],
+            }
+
+        state.agent.run_conversation = mock_run
+
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        prompt = [TextContentBlock(type="text", text="hello")]
+        await agent.prompt(prompt=prompt, session_id=new_resp.session_id)
+
+        updates = [
+            call.kwargs.get("update") or call.args[1]
+            for call in mock_conn.session_update.call_args_list
+        ]
+        # The streamed chunk and the post-stream transformed message should
+        # both be present (final delivery is a separate update_agent_message_text
+        # call carrying the full transformed text).
+        all_texts = [
+            getattr(getattr(u, "content", None), "text", None)
+            for u in updates
+        ]
+        assert any(
+            text and "[plugin appended this]" in text for text in all_texts
+        ), f"expected transformed final to be delivered, got: {all_texts!r}"
 
     @pytest.mark.asyncio
     async def test_prompt_binds_session_id_into_subprocess_env(self, agent, mock_manager):

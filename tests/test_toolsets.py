@@ -103,6 +103,182 @@ class TestResolveToolset:
 
 
 
+    def test_required_delegation_controls_are_acp_only(self):
+        import json
+        from types import SimpleNamespace
+
+        import tools.delegate_tool  # noqa: F401 - registers real schemas
+        from tools.delegate_tool import _required_control
+        from tools.registry import registry
+
+        controls = {
+            "delegation_status", "delegation_wait", "delegation_cancel",
+        }
+        acp_tools = set(resolve_toolset("hermes-acp"))
+        coding_tools = set(resolve_toolset("coding"))
+        assert controls <= acp_tools
+        assert controls.isdisjoint(coding_tools)
+        assert controls.isdisjoint(resolve_toolset("hermes-cli"))
+        assert controls.isdisjoint(resolve_toolset("all"))
+        assert controls.isdisjoint(resolve_toolset("*"))
+        assert validate_toolset("acp_delegation_control") is False
+        assert {
+            registry.get_toolset_for_tool(name) for name in controls
+        } == {"hermes-acp"}
+        denied = json.loads(_required_control(
+            "status",
+            {"delegation_id": "unknown"},
+            SimpleNamespace(platform="cli", _delegate_depth=0),
+        ))
+        assert denied["status"] == "unavailable"
+        acp_definitions = registry.get_definitions(acp_tools, quiet=True)
+        acp_definition_names = {
+            item["function"]["name"] for item in acp_definitions
+        }
+        coding_definitions = registry.get_definitions(coding_tools, quiet=True)
+        coding_definition_names = {
+            item["function"]["name"] for item in coding_definitions
+        }
+        assert controls <= acp_definition_names
+        assert controls.isdisjoint(coding_definition_names)
+
+    def test_acp_children_never_inherit_root_delegation_controls(
+        self, monkeypatch
+    ):
+        from types import SimpleNamespace
+
+        import model_tools
+        import tools.delegate_tool  # noqa: F401 - registers real schemas
+        from tools.delegate_tool import (
+            _build_child_agent,
+            _blocked_toolsets_for_role,
+            _strip_blocked_tools,
+        )
+
+        controls = {
+            "delegation_status", "delegation_wait", "delegation_cancel",
+        }
+        default_definitions = model_tools.get_tool_definitions(
+            enabled_toolsets=None,
+            quiet_mode=True,
+        )
+        assert controls.isdisjoint({
+            item["function"]["name"] for item in default_definitions
+        })
+        explicit_acp_definitions = model_tools.get_tool_definitions(
+            enabled_toolsets=["hermes-acp"],
+            quiet_mode=True,
+        )
+        assert controls <= {
+            item["function"]["name"]
+            for item in explicit_acp_definitions
+        }
+
+        inherited = _strip_blocked_tools(["hermes-acp"])
+        assert inherited == ["hermes-acp-child"]
+
+        for role in ("leaf", "orchestrator"):
+            enabled = list(inherited)
+            if role == "orchestrator":
+                enabled.append("delegation")
+            definitions = model_tools.get_tool_definitions(
+                enabled_toolsets=enabled,
+                disabled_toolsets=_blocked_toolsets_for_role(role),
+                quiet_mode=True,
+            )
+            valid_tool_names = {
+                item["function"]["name"] for item in definitions
+            }
+            assert controls.isdisjoint(valid_tool_names)
+            if role == "orchestrator":
+                assert "delegate_task" in valid_tool_names
+            else:
+                assert "delegate_task" not in valid_tool_names
+
+        # Exercise the real child builder and real schema resolver together.
+        # The constructor shim avoids provider/client setup but derives the
+        # exact schema from the builder's effective enabled/disabled scopes.
+        captured = {}
+
+        def _schema_child(**kwargs):
+            definitions = model_tools.get_tool_definitions(
+                enabled_toolsets=kwargs["enabled_toolsets"],
+                disabled_toolsets=kwargs["disabled_toolsets"],
+                quiet_mode=True,
+            )
+            child = SimpleNamespace(
+                tools=definitions,
+                valid_tool_names={
+                    item["function"]["name"] for item in definitions
+                },
+                _active_children=[],
+            )
+            captured["child"] = child
+            captured["kwargs"] = kwargs
+            return child
+
+        monkeypatch.setattr("run_agent.AIAgent", _schema_child)
+        monkeypatch.setattr(
+            "tools.delegate_tool._load_config", lambda: {}
+        )
+        parent = SimpleNamespace(
+            platform="acp",
+            _delegate_depth=0,
+            _subagent_id=None,
+            _required_delegation_ancestor_binding=(
+                "controller-test",
+                "direct-child-test",
+            ),
+            enabled_toolsets=["hermes-acp"],
+            disabled_toolsets=None,
+            valid_tool_names={
+                item["function"]["name"]
+                for item in explicit_acp_definitions
+            },
+            model="test/model",
+            provider="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+            api_key="test-key",
+            api_mode="chat_completions",
+            _client_kwargs={},
+            _fallback_chain=[],
+            providers_allowed=None,
+            providers_ignored=None,
+            providers_order=None,
+            provider_sort=None,
+            provider_require_parameters=False,
+            provider_data_collection="",
+            openrouter_min_coding_score=None,
+            reasoning_config=None,
+            prefill_messages=None,
+            max_tokens=None,
+            acp_command=None,
+            acp_args=[],
+            session_id="parent",
+            _active_children=[],
+            _active_children_lock=None,
+            tool_progress_callback=None,
+        )
+        child = _build_child_agent(
+            task_index=0,
+            goal="inspect",
+            context=None,
+            toolsets=None,
+            model=None,
+            max_iterations=2,
+            task_count=1,
+            parent_agent=parent,
+            role="leaf",
+        )
+        assert captured["kwargs"]["enabled_toolsets"] == [
+            "hermes-acp-child"
+        ]
+        assert controls.isdisjoint(child.valid_tool_names)
+        assert child._required_delegation_ancestor_binding == (
+            "controller-test",
+            "direct-child-test",
+        )
+
 
 class TestResolveMultipleToolsets:
     def test_combines_and_deduplicates(self):

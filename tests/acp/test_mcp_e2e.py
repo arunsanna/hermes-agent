@@ -36,7 +36,13 @@ from acp_adapter.tools import build_tool_start
 
 @pytest.fixture()
 def mock_manager():
-    return SessionManager(agent_factory=lambda: MagicMock(name="MockAIAgent"))
+    def _agent_factory():
+        agent = MagicMock(name="MockAIAgent")
+        agent._required_delegation_launching = False
+        agent._has_unconsumed_required_delegations.return_value = False
+        return agent
+
+    return SessionManager(agent_factory=_agent_factory)
 
 
 @pytest.fixture()

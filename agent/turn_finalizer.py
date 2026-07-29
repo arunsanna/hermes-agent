@@ -109,6 +109,37 @@ def finalize_turn(
     """
     from agent.conversation_loop import logger
 
+    required_gate_blocked = bool(
+        getattr(agent, "_required_observation_failed", False)
+    )
+    if not required_gate_blocked:
+        try:
+            required_gate_blocked = bool(
+                agent._has_unconsumed_required_delegations()
+            )
+        except Exception:
+            if str(getattr(agent, "platform", "") or "").lower() == "acp":
+                required_gate_blocked = True
+                logger.exception(
+                    "Required delegation final gate check failed"
+                )
+    if required_gate_blocked:
+        # This is not a normal assistant response. Keep every visible output
+        # hook closed and return a structured failure; the next ACP turn
+        # abandons the old owner only after this result has been surfaced.
+        final_response = None
+        failed = True
+        _pending_verification_response = None
+        _pending_verification_response_previewed = False
+        _turn_exit_reason = "required_delegation_observation_failed"
+        try:
+            agent._finish_acp_provisional_stream(discard=True)
+        except Exception:
+            logger.debug(
+                "Required final-gate provisional cleanup failed",
+                exc_info=True,
+            )
+
     budget_exhausted = (
         api_call_count >= agent.max_iterations
         or agent.iteration_budget.remaining <= 0
@@ -523,7 +554,7 @@ def finalize_turn(
     #     an empty response, the "(empty)" terminal sentinel, or a
     #     suspiciously short partial fragment with no terminating
     #     punctuation (e.g. "The").  A real short answer keeps its text.
-    if not interrupted:
+    if not interrupted and not required_gate_blocked:
         try:
             if agent._turn_completion_explainer_enabled():
                 _stripped = (final_response or "").strip()
@@ -707,6 +738,9 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
+    if required_gate_blocked:
+        result["error"] = "required_delegation_observation_failed"
+        result["required_delegation_pending"] = True
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Persistence failures already set failed=True + an explanation in

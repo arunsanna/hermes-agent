@@ -230,12 +230,12 @@ class _BoundedOutputCollector:
             return head[:head_chars] + notice[:available] + rendered_tail + suffix
 
 
-def set_activity_callback(cb: Callable[[str], None] | None) -> None:
+def set_activity_callback(cb: Callable[..., None] | None) -> None:
     """Register a callback that _wait_for_process fires periodically."""
     _activity_callback_local.callback = cb
 
 
-def get_activity_callback() -> Callable[[str], None] | None:
+def get_activity_callback() -> Callable[..., None] | None:
     """Return the thread-local activity callback (see ``set_activity_callback``).
 
     Public accessor for callers outside this module that need to capture the
@@ -246,9 +246,22 @@ def get_activity_callback() -> Callable[[str], None] | None:
     return getattr(_activity_callback_local, "callback", None)
 
 
+def _fire_activity_callback(label: str, *, meaningful: bool) -> None:
+    """Report liveness/progress with compatibility for one-argument callbacks."""
+    cb = get_activity_callback()
+    if not cb:
+        return
+    try:
+        cb(label, meaningful=meaningful)
+    except TypeError:
+        cb(label)
+
+
 def touch_activity_if_due(
     state: dict,
     label: str,
+    *,
+    meaningful: bool = False,
 ) -> None:
     """Fire the activity callback at most once every ``state['interval']`` seconds.
 
@@ -264,10 +277,14 @@ def touch_activity_if_due(
         return
     state["last_touch"] = now
     try:
-        cb = get_activity_callback()
-        if cb:
-            elapsed = int(now - state["start"])
-            cb(f"{label} ({elapsed}s elapsed)")
+        # Route through _fire_activity_callback so the `meaningful` flag this
+        # function already accepts actually reaches the callback; calling the
+        # callback directly would silently drop it.
+        elapsed = int(now - state["start"])
+        _fire_activity_callback(
+            f"{label} ({elapsed}s elapsed)",
+            meaningful=meaningful,
+        )
     except Exception:
         pass
 
@@ -1026,6 +1043,22 @@ class BaseEnvironment(ABC):
         # ``Popen``) so binary or mis-encoded output is preserved with
         # U+FFFD substitution rather than clobbering the whole buffer.
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        _output_activity_now = time.monotonic()
+        _output_activity_state = {
+            "last_touch": _output_activity_now - 1.0,
+            "start": _output_activity_now,
+            "interval": 1.0,
+        }
+
+        def _append_output(text: str) -> None:
+            if not text:
+                return
+            output.append(text)
+            touch_activity_if_due(
+                _output_activity_state,
+                "terminal command produced output",
+                meaningful=True,
+            )
 
         def _drain_iterable(stream):
             # Fallback path: ``stream`` is not backed by a real OS file
@@ -1040,16 +1073,16 @@ class BaseEnvironment(ABC):
                     if piece is None:
                         continue
                     if isinstance(piece, bytes):
-                        output.append(decoder.decode(piece))
+                        _append_output(decoder.decode(piece))
                     else:
-                        output.append(str(piece))
+                        _append_output(str(piece))
             except Exception:
                 pass
             finally:
                 try:
                     tail = decoder.decode(b"", final=True)
                     if tail:
-                        output.append(tail)
+                        _append_output(tail)
                 except Exception:
                     pass
 
@@ -1080,14 +1113,14 @@ class BaseEnvironment(ABC):
                         chunk = os.read(fd, 4096)
                         if not chunk:
                             break
-                        output.append(decoder.decode(chunk))
+                        _append_output(decoder.decode(chunk))
                 except (ValueError, OSError):
                     pass
                 finally:
                     try:
                         tail = decoder.decode(b"", final=True)
                         if tail:
-                            output.append(tail)
+                            _append_output(tail)
                     except Exception:
                         pass
                 return
@@ -1105,7 +1138,7 @@ class BaseEnvironment(ABC):
                             break
                         if not chunk:
                             break  # true EOF — all writers closed
-                        output.append(decoder.decode(chunk))
+                        _append_output(decoder.decode(chunk))
                         idle_after_exit = 0
                     elif proc.poll() is not None:
                         # bash is gone and the pipe was idle for ~100ms.  Give
@@ -1121,7 +1154,7 @@ class BaseEnvironment(ABC):
                 try:
                     tail = decoder.decode(b"", final=True)
                     if tail:
-                        output.append(tail)
+                        _append_output(tail)
                 except Exception:
                     pass
 
