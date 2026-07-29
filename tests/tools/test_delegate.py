@@ -2713,6 +2713,70 @@ class TestMaxSpawnDepth(unittest.TestCase):
         self.assertEqual(_get_max_spawn_depth(), 1)
 
 
+class TestRequiredDelegationTimeoutConfig(unittest.TestCase):
+    """Fix 2: config.yaml > env > default plumbing for the three required-
+    delegation supervision timeouts (idle 300s, start 300s, in-flight 1500s)."""
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_defaults_when_unconfigured(self, mock_cfg):
+        from tools.delegate_tool import (
+            _get_required_no_progress_timeout_seconds,
+            _get_required_start_timeout_seconds,
+            _get_required_in_flight_timeout_seconds,
+        )
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(_get_required_no_progress_timeout_seconds(), 300.0)
+            self.assertEqual(_get_required_start_timeout_seconds(), 300.0)
+            self.assertEqual(_get_required_in_flight_timeout_seconds(), 1500.0)
+
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={
+            "required_no_progress_timeout_seconds": 45,
+            "required_start_timeout_seconds": 60,
+            "required_in_flight_timeout_seconds": 900,
+        },
+    )
+    def test_config_values_honored(self, mock_cfg):
+        from tools.delegate_tool import (
+            _get_required_no_progress_timeout_seconds,
+            _get_required_start_timeout_seconds,
+            _get_required_in_flight_timeout_seconds,
+        )
+        self.assertEqual(_get_required_no_progress_timeout_seconds(), 45.0)
+        self.assertEqual(_get_required_start_timeout_seconds(), 60.0)
+        self.assertEqual(_get_required_in_flight_timeout_seconds(), 900.0)
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_env_var_overrides_honored(self, mock_cfg):
+        from tools.delegate_tool import (
+            _get_required_no_progress_timeout_seconds,
+            _get_required_start_timeout_seconds,
+            _get_required_in_flight_timeout_seconds,
+        )
+        with patch.dict(os.environ, {
+            "DELEGATION_REQUIRED_NO_PROGRESS_TIMEOUT_SECONDS": "12",
+            "DELEGATION_REQUIRED_START_TIMEOUT_SECONDS": "34",
+            "DELEGATION_REQUIRED_IN_FLIGHT_TIMEOUT_SECONDS": "56",
+        }):
+            self.assertEqual(_get_required_no_progress_timeout_seconds(), 12.0)
+            self.assertEqual(_get_required_start_timeout_seconds(), 34.0)
+            self.assertEqual(_get_required_in_flight_timeout_seconds(), 56.0)
+
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={"required_no_progress_timeout_seconds": "not-a-number"},
+    )
+    def test_invalid_config_value_falls_back_to_default_with_warning(self, mock_cfg):
+        import logging
+        from tools.delegate_tool import _get_required_no_progress_timeout_seconds
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertLogs("tools.delegate_tool", level=logging.WARNING) as cm:
+                result = _get_required_no_progress_timeout_seconds()
+        self.assertEqual(result, 300.0)
+        self.assertTrue(any("not a valid number" in m for m in cm.output))
+
+
 # =========================================================================
 # role param plumbing
 # =========================================================================

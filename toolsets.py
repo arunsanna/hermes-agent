@@ -80,6 +80,32 @@ _HERMES_CORE_TOOLS = [
     "computer_use",
 ]
 
+# Tools that are meaningful only when an ACP parent turn owns a required
+# delegation. They may be selected explicitly through ``hermes-acp``, but
+# must never leak into broad aliases such as ``all``/``*`` or another
+# platform's inferred schema.
+_ACP_ONLY_TOOLS = frozenset({
+    "delegation_status",
+    "delegation_wait",
+    "delegation_cancel",
+})
+
+_HERMES_ACP_TOOLS = [
+    "web_search", "web_extract",
+    "terminal", "process",
+    "read_file", "write_file", "patch", "search_files",
+    "vision_analyze",
+    "skills_list", "skill_view", "skill_manage",
+    "browser_navigate", "browser_snapshot", "browser_click",
+    "browser_type", "browser_scroll", "browser_back",
+    "browser_press", "browser_get_images",
+    "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
+    "todo", "memory",
+    "session_search",
+    "execute_code", "delegate_task",
+    "delegation_status", "delegation_wait", "delegation_cancel",
+]
+
 # Webhook events may originate from untrusted third-party content (for example,
 # public PR titles/comments). Keep the default webhook toolset intentionally
 # constrained to avoid local file/system execution by prompt injection.
@@ -379,19 +405,17 @@ TOOLSETS = {
 
     "hermes-acp": {
         "description": "Editor integration (VS Code, Zed, JetBrains) — coding-focused tools without messaging, audio, or clarify UI",
+        "tools": _HERMES_ACP_TOOLS,
+        "includes": []
+    },
+
+    # Internal child-safe derivative. Delegated ACP children inherit the
+    # editor tool surface but never the root turn's controller protocol.
+    "hermes-acp-child": {
+        "description": "ACP child tools without root delegation controls",
         "tools": [
-            "web_search", "web_extract",
-            "terminal", "process",
-            "read_file", "write_file", "patch", "search_files",
-            "vision_analyze",
-            "skills_list", "skill_view", "skill_manage",
-            "browser_navigate", "browser_snapshot", "browser_click",
-            "browser_type", "browser_scroll", "browser_back",
-            "browser_press", "browser_get_images",
-            "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
-            "todo", "memory",
-            "session_search",
-            "execute_code", "delegate_task",
+            name for name in _HERMES_ACP_TOOLS
+            if name not in _ACP_ONLY_TOOLS
         ],
         "includes": []
     },
@@ -717,7 +741,9 @@ def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bo
             # Use a fresh visited set per branch to avoid cross-branch contamination
             resolved = resolve_toolset(toolset_name, visited.copy(), include_registry=include_registry)
             all_tools.update(resolved)
-        return sorted(all_tools)
+        # ``all`` is a platform-neutral convenience alias, not permission to
+        # expose controls whose runtime contract requires ACP turn ownership.
+        return sorted(all_tools - _ACP_ONLY_TOOLS)
 
     # Check for cycles / already-resolved (diamond deps).
     # Silently return [] — either this is a diamond (not a bug, tools already

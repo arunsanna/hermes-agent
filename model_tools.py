@@ -387,10 +387,11 @@ def _compute_tool_definitions(
             elif not quiet_mode:
                 print(f"⚠️  Unknown toolset: {toolset_name}")
     else:
-        # Default: start with everything
-        from toolsets import get_all_toolsets
-        for ts_name in get_all_toolsets():
-            tools_to_include.update(resolve_toolset(ts_name))
+        # Default: start with the platform-neutral ``all`` alias. Resolving
+        # every toolset independently would re-add ACP turn-controller tools
+        # from ``hermes-acp`` even though ``resolve_toolset("all")`` correctly
+        # excludes them. ACP roots opt in explicitly via ``hermes-acp``.
+        tools_to_include.update(resolve_toolset("all"))
 
     # Always apply disabled toolsets as a subtraction step at the end.
     # This ensures that even if a composite toolset (like hermes-cli)
@@ -1037,6 +1038,7 @@ def handle_function_call(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    parent_agent: Optional[Any] = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1058,6 +1060,9 @@ def handle_function_call(
                        matching ``get_tool_definitions`` semantics.
         disabled_toolsets: The session's disabled toolsets, applied as a
                        subtraction when scoping the bridge catalog.
+        parent_agent: The live agent invoking the tool. Registry handlers that
+                       implement agent-owned protocol controls may use this
+                       capability; ordinary handlers ignore it.
 
     Returns:
         Function result as a JSON string.
@@ -1141,6 +1146,7 @@ def handle_function_call(
                 tool_request_middleware_trace=list(_tool_middleware_trace),
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
+                parent_agent=parent_agent,
             )
 
     _tool_original_args = dict(function_args)
@@ -1267,6 +1273,7 @@ def handle_function_call(
                         task_id=task_id,
                         session_id=session_id,
                         enabled_tools=sandbox_enabled,
+                        parent_agent=parent_agent,
                     )
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
@@ -1275,6 +1282,7 @@ def handle_function_call(
                         task_id=task_id,
                         session_id=session_id,
                         user_task=user_task,
+                        parent_agent=parent_agent,
                     )
             from hermes_cli.middleware import run_tool_execution_middleware
 
