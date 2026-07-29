@@ -23,13 +23,19 @@ makes the corresponding assertion fail.
 """
 
 import copy
+import json
+import threading
+import time
 from types import SimpleNamespace
 from pathlib import Path
 import tempfile
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from agent.tool_dispatch_helpers import make_tool_result_message
 from run_agent import AIAgent
+from agent.chat_completion_helpers import interruptible_streaming_api_call
 
 
 def _make_tool_defs(*names: str) -> list:
@@ -89,6 +95,49 @@ def _mock_response(content="Hello", finish_reason="stop", tool_calls=None):
     return SimpleNamespace(choices=[choice], model="test/model", usage=None)
 
 
+def _stream_chunk(*, content=None, tool_calls=None, finish_reason=None):
+    delta = SimpleNamespace(
+        content=content,
+        tool_calls=tool_calls,
+        reasoning_content=None,
+        reasoning=None,
+    )
+    choice = SimpleNamespace(delta=delta, finish_reason=finish_reason)
+    return SimpleNamespace(choices=[choice], model="test/model", usage=None)
+
+
+def test_content_after_first_tool_delta_uses_provisional_gate():
+    agent = _make_agent()
+    delivered = []
+    agent.platform = "acp"
+    agent.stream_delta_callback = delivered.append
+    agent._stream_callback = None
+    agent._acp_provisional_stream_active = True
+    agent._acp_provisional_stream_buffer = []
+    tool_delta = SimpleNamespace(
+        index=0,
+        id="delegate-1",
+        type="function",
+        function=SimpleNamespace(name="delegate_task", arguments="{}"),
+        extra_content=None,
+    )
+    agent.client.chat.completions.create.return_value = iter([
+        _stream_chunk(tool_calls=[tool_delta]),
+        _stream_chunk(content="candidate after tool"),
+        _stream_chunk(finish_reason="tool_calls"),
+    ])
+
+    response = interruptible_streaming_api_call(
+        agent, {"model": "test/model", "messages": []}
+    )
+
+    assert response.choices[0].message.tool_calls[0].function.name == "delegate_task"
+    assert delivered == []
+    assert agent._acp_provisional_stream_buffer == [
+        ("stream_delta", "candidate after tool")
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Contract 1: run_conversation persists the assistant tool-call block BEFORE
 # tool execution begins.
@@ -140,6 +189,1034 @@ def test_run_conversation_flushes_assistant_tool_call_before_execution():
     assert last[-1]["role"] == "assistant"
     assert last[-1]["tool_calls"][0]["id"] == "c1"
     assert result["final_response"] == "done"
+
+
+def test_acp_repaired_delegate_persists_one_observed_result_before_synthesis(
+    tmp_path,
+    monkeypatch,
+):
+    from tools import async_delegation as ad
+    import tools.delegate_tool as delegate_module
+    from hermes_state import SessionDB
+
+    ad._reset_for_tests()
+    agent = _make_agent()
+    db = SessionDB(db_path=tmp_path / "state.db")
+    agent._session_db = db
+    agent._session_db_created = False
+    agent.platform = "acp"
+    agent.valid_tool_names = {
+        "delegate_task", "delegation_status",
+        "delegation_wait", "delegation_cancel",
+    }
+    agent.tools = _make_tool_defs(*sorted(agent.valid_tool_names))
+    delivered = []
+    delivered_interim = []
+    agent.stream_delta_callback = delivered.append
+    agent.interim_assistant_callback = (
+        lambda text, **_kwargs: delivered_interim.append(text)
+    )
+    alias_delta = SimpleNamespace(
+        index=0,
+        id="delegate-call",
+        type="function",
+        function=SimpleNamespace(
+            name="delegate",
+            arguments='{"goal":"child"}',
+        ),
+        extra_content=None,
+    )
+    api_calls = {"count": 0}
+    child_release = threading.Event()
+
+    def _response(**_kwargs):
+        api_calls["count"] += 1
+        if api_calls["count"] == 1:
+            agent._fire_streamed_codex_commentary(
+                "candidate codex commentary"
+            )
+            return iter([
+                _stream_chunk(content="candidate before delegate "),
+                _stream_chunk(tool_calls=[alias_delta]),
+                _stream_chunk(content="candidate after tool delta"),
+                _stream_chunk(finish_reason="tool_calls"),
+            ])
+        if api_calls["count"] == 2:
+            # The parent is allowed iterative supervision while the child
+            # runs, but this no-tool candidate is provisional. Release the
+            # child only after the candidate is generated; the hard boundary
+            # must discard it, observe durably, then make a new synthesis call.
+            child_release.set()
+            return iter([
+                _stream_chunk(content="premature final without child"),
+                _stream_chunk(finish_reason="stop"),
+            ])
+        durable = db.get_messages_as_conversation(agent.session_id)
+        assert any(
+            msg.get("role") == "tool"
+            and msg.get("tool_name") == "delegation_wait"
+            for msg in durable
+        ), "required result was not durable before the synthesis call"
+        return iter([
+            _stream_chunk(content="final from child"),
+            _stream_chunk(finish_reason="stop"),
+        ])
+
+    agent.client.chat.completions.create.side_effect = _response
+    agent._repair_tool_call = MagicMock(
+        side_effect=lambda name: "delegate_task" if name == "delegate" else None
+    )
+    child = SimpleNamespace(
+        _subagent_id="child-real-execute",
+        _delegate_role="leaf",
+        interrupt=MagicMock(),
+    )
+
+    def _build_child_agent(*_args, **_kwargs):
+        with agent._active_children_lock:
+            agent._active_children.append(child)
+        return child
+
+    monkeypatch.setattr(
+        delegate_module, "_build_child_agent", _build_child_agent
+    )
+    monkeypatch.setattr(
+        delegate_module,
+        "_run_single_child",
+        lambda task_index, *_args, **_kwargs: (
+            child_release.wait(timeout=2)
+            and {
+                "task_index": task_index,
+                "status": "completed",
+                "summary": "child evidence",
+                "api_calls": 1,
+                "duration_seconds": 0,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        delegate_module,
+        "_resolve_delegation_credentials",
+        lambda *_args, **_kwargs: {
+            "model": None,
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+            "request_overrides": None,
+            "max_output_tokens": None,
+            "command": None,
+            "args": None,
+        },
+    )
+
+    try:
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("delegate this")
+    finally:
+        child_release.set()
+        ad._reset_for_tests()
+
+    assert result["final_response"] == "final from child"
+    # Existing callback protocol closes the pre-tool response box with None
+    # and prepends one paragraph break to the first post-tool delta.
+    assert delivered[0] is None
+    delivered_text = "".join(
+        item for item in delivered if isinstance(item, str)
+    )
+    assert delivered_text.strip() == "final from child"
+    assert "candidate before delegate" not in delivered_text
+    assert "candidate after tool delta" not in delivered_text
+    assert "premature final without child" not in delivered_text
+    assert delivered_interim == []
+    messages = result["messages"]
+    wait_assistants = [
+        msg for msg in messages
+        if msg.get("role") == "assistant"
+        and any(
+            tc.get("function", {}).get("name") == "delegation_wait"
+            for tc in msg.get("tool_calls", [])
+        )
+    ]
+    wait_results = [
+        msg for msg in messages
+        if msg.get("role") == "tool" and msg.get("name") == "delegation_wait"
+    ]
+    assert len(wait_assistants) == 1
+    assert len(wait_results) == 1
+    assert "child evidence" in wait_results[0]["content"]
+    assert getattr(agent, "_last_content_with_tools", None) is None
+    replay = db.get_messages_as_conversation(agent.session_id)
+    replay_wait_assistants = [
+        msg for msg in replay
+        if msg.get("role") == "assistant"
+        and any(
+            tc.get("function", {}).get("name") == "delegation_wait"
+            for tc in msg.get("tool_calls", [])
+        )
+    ]
+    replay_wait_results = [
+        msg for msg in replay
+        if (
+            msg.get("role") == "tool"
+            and msg.get("tool_name") == "delegation_wait"
+        )
+    ]
+    assert len(replay_wait_assistants) == 1
+    assert len(replay_wait_results) == 1
+    assert "child evidence" in replay_wait_results[0]["content"]
+    assert "candidate before delegate" not in json.dumps(replay)
+    assert "candidate after tool delta" not in json.dumps(replay)
+
+
+def test_required_child_can_be_supervised_iteratively_before_final_join(
+    tmp_path,
+    monkeypatch,
+):
+    from hermes_state import SessionDB
+    from tools import async_delegation as ad
+    import tools.delegate_tool as delegate_module
+    import tools.delegation_live_log as live_log
+
+    ad._reset_for_tests()
+    agent = _make_agent()
+    agent._session_db = SessionDB(db_path=tmp_path / "iterative-state.db")
+    agent._session_db_created = False
+    agent.platform = "acp"
+    agent.valid_tool_names = {
+        "delegate_task",
+        "delegation_status",
+        "delegation_wait",
+        "delegation_cancel",
+    }
+    agent.tools = _make_tool_defs(*sorted(agent.valid_tool_names))
+    child_release = threading.Event()
+    premature_candidate_returned = threading.Event()
+    api_calls = {"count": 0}
+    delegation = {}
+
+    def _response(**_kwargs):
+        api_calls["count"] += 1
+        call_number = api_calls["count"]
+        if call_number == 1:
+            return _mock_response(
+                content="premature launch prose",
+                finish_reason="tool_calls",
+                tool_calls=[
+                    _mock_tool_call(
+                        name="delegate_task",
+                        arguments='{"goal":"child"}',
+                        call_id="launch",
+                    )
+                ],
+            )
+        if call_number in {2, 3}:
+            delegation_id = delegation.setdefault(
+                "id",
+                ad.list_unconsumed_required(agent)[0]["delegation_id"],
+            )
+        if call_number == 2:
+            return _mock_response(
+                content="",
+                finish_reason="tool_calls",
+                tool_calls=[
+                    _mock_tool_call(
+                        name="delegation_status",
+                        arguments=json.dumps(
+                            {"delegation_id": delegation_id}
+                        ),
+                        call_id="status",
+                    )
+                ],
+            )
+        if call_number == 3:
+            return _mock_response(
+                content="",
+                finish_reason="tool_calls",
+                tool_calls=[
+                    _mock_tool_call(
+                        name="delegation_wait",
+                        arguments=json.dumps(
+                            {
+                                "delegation_id": delegation_id,
+                                "timeout_seconds": 0,
+                            }
+                        ),
+                        call_id="model-wait",
+                    )
+                ],
+            )
+        if call_number == 4:
+            premature_candidate_returned.set()
+            return _mock_response(
+                content="premature final without child evidence",
+                finish_reason="stop",
+            )
+        return _mock_response(
+            content="final synthesized child evidence",
+            finish_reason="stop",
+        )
+
+    agent.client.chat.completions.create.side_effect = _response
+    child = SimpleNamespace(
+        _subagent_id="child-iterative",
+        _delegate_role="leaf",
+        interrupt=MagicMock(),
+        close=MagicMock(),
+        tool_progress_callback=None,
+    )
+
+    def _build_child(*_args, **_kwargs):
+        with agent._active_children_lock:
+            agent._active_children.append(child)
+        return child
+
+    def _run_child(task_index, *_args, **_kwargs):
+        child_release.wait(timeout=10)
+        return {
+            "task_index": task_index,
+            "status": "completed",
+            "summary": "child evidence",
+            "api_calls": 1,
+            "duration_seconds": 0,
+        }
+
+    monkeypatch.setattr(delegate_module, "_build_child_agent", _build_child)
+    monkeypatch.setattr(delegate_module, "_run_single_child", _run_child)
+    monkeypatch.setattr(
+        live_log,
+        "create_live_transcripts",
+        lambda *_args, **_kwargs: (None, [], []),
+    )
+    monkeypatch.setattr(
+        delegate_module,
+        "_resolve_delegation_credentials",
+        lambda *_args, **_kwargs: {
+            "model": None,
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+            "request_overrides": None,
+            "max_output_tokens": None,
+            "command": None,
+            "args": None,
+        },
+    )
+
+    result_holder = {}
+
+    def _run_parent():
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result_holder["result"] = agent.run_conversation(
+                "delegate and supervise"
+            )
+
+    parent_thread = threading.Thread(target=_run_parent, daemon=True)
+    try:
+        parent_thread.start()
+        assert premature_candidate_returned.wait(timeout=3)
+        # The no-tool candidate cannot end the turn while the child is live.
+        parent_thread.join(timeout=0.1)
+        assert parent_thread.is_alive()
+        child_release.set()
+        parent_thread.join(timeout=5)
+        assert not parent_thread.is_alive()
+    finally:
+        child_release.set()
+        ad._reset_for_tests()
+
+    result = result_holder["result"]
+    assert result["final_response"] == "final synthesized child evidence"
+    assert api_calls["count"] == 5
+    tool_names = [
+        message.get("name")
+        for message in result["messages"]
+        if message.get("role") == "tool"
+    ]
+    assert "delegation_status" in tool_names
+    assert "delegation_wait" in tool_names
+    assert tool_names.count("delegation_wait") == 2
+    replay = json.dumps(result["messages"])
+    assert "child evidence" in replay
+    assert "premature launch prose" not in replay
+    assert "premature final without child evidence" not in replay
+
+
+def test_required_observation_atomic_second_row_failure_rolls_back_and_retries_once(
+    tmp_path,
+):
+    from agent.conversation_loop import _observe_required_delegations
+    from tools import async_delegation as ad
+    from hermes_state import SessionDB
+
+    ad._reset_for_tests()
+    agent = _make_agent()
+    agent.platform = "acp"
+    agent._current_turn_id = "turn-1"
+    db = SessionDB(db_path=tmp_path / "atomic-state.db")
+    agent._session_db = db
+    agent._session_db_created = False
+    dispatch = ad.dispatch_async_delegation_batch(
+        goals=["child"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model=None,
+        session_key=agent.session_id,
+        parent_session_id=agent.session_id,
+        parent_turn_id=agent._current_turn_id,
+        runner=lambda: {
+            "results": [{"status": "completed", "summary": "child evidence"}],
+            "total_duration_seconds": 0,
+        },
+        required=True,
+    )
+    delegation_id = dispatch["delegation_id"]
+    assert ad.wait_required(
+        agent, delegation_id, timeout_seconds=1.0
+    )["terminal"]
+    messages = []
+    real_insert = db._insert_message_rows
+
+    def _fail_after_first_row(conn, session_id, pending):
+        real_insert(conn, session_id, pending[:1])
+        raise RuntimeError("injected second-row failure")
+
+    try:
+        with (
+            patch.object(
+                db,
+                "_insert_message_rows",
+                side_effect=_fail_after_first_row,
+            ),
+            pytest.raises(RuntimeError, match="second-row failure"),
+        ):
+            _observe_required_delegations(agent, messages, [])
+        status = ad.required_status(agent, delegation_id)
+        assert messages == []
+        assert status["terminal"] is True
+        assert status["consumed"] is False
+        failed_replay = db.get_messages_as_conversation(agent.session_id)
+        assert not any(
+            message.get("tool_calls") for message in failed_replay
+        )
+        assert not any(
+            message.get("tool_call_id") == f"required_wait_{delegation_id}"
+            for message in failed_replay
+        )
+
+        assert _observe_required_delegations(agent, messages, []) is True
+        replay = db.get_messages_as_conversation(agent.session_id)
+        consumed = ad.required_status(agent, delegation_id)["consumed"]
+    finally:
+        ad._reset_for_tests()
+
+    wait_calls = [
+        message for message in replay
+        if message.get("role") == "assistant"
+        and any(
+            call.get("id") == f"required_wait_{delegation_id}"
+            for call in message.get("tool_calls", [])
+        )
+    ]
+    wait_results = [
+        message for message in replay
+        if (
+            message.get("role") == "tool"
+            and message.get("tool_call_id")
+            == f"required_wait_{delegation_id}"
+        )
+    ]
+    assert len(wait_calls) == 1
+    assert len(wait_results) == 1
+    assert consumed is True
+
+
+def test_model_wait_keeps_gate_closed_until_one_atomic_synthetic_observation(
+    tmp_path,
+):
+    from agent.conversation_loop import _observe_required_delegations
+    from hermes_state import SessionDB
+    from tools import async_delegation as ad
+    from tools.delegate_tool import _required_control
+
+    ad._reset_for_tests()
+    agent = _make_agent()
+    agent.platform = "acp"
+    agent._delegate_depth = 0
+    agent._current_turn_id = "turn-model-wait"
+    agent._session_db = SessionDB(db_path=tmp_path / "model-wait-state.db")
+    agent._session_db_created = False
+    dispatch = ad.dispatch_async_delegation_batch(
+        goals=["child"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model=None,
+        session_key=agent.session_id,
+        parent_session_id=agent.session_id,
+        parent_turn_id=agent._current_turn_id,
+        runner=lambda: {
+            "results": [{
+                "status": "completed",
+                "summary": "canonical child evidence",
+            }],
+            "total_duration_seconds": 0,
+        },
+        required=True,
+    )
+    delegation_id = dispatch["delegation_id"]
+    assert ad.wait_required(
+        agent, delegation_id, timeout_seconds=1.0
+    )["terminal"]
+    wait_call = _mock_tool_call(
+        name="delegation_wait",
+        arguments=json.dumps({
+            "delegation_id": delegation_id,
+            "timeout_seconds": 0,
+        }),
+        call_id="model-wait",
+    )
+    wait_content = _required_control(
+        "wait",
+        {"delegation_id": delegation_id, "timeout_seconds": 0},
+        agent,
+    )
+    wait_payload = json.loads(wait_content)
+    messages = [{
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{
+            "id": wait_call.id,
+            "type": "function",
+            "function": {
+                "name": wait_call.function.name,
+                "arguments": wait_call.function.arguments,
+            },
+        }],
+    }, make_tool_result_message(
+        "delegation_wait", wait_content, wait_call.id
+    )]
+
+    try:
+        assert wait_payload["terminal"] is True
+        assert wait_payload["observation_pending"] is True
+        assert "result" not in wait_payload
+        assert ad.required_status(agent, delegation_id)["consumed"] is False
+        assert _observe_required_delegations(agent, messages, []) is True
+        replay = agent._session_db.get_messages_as_conversation(
+            agent.session_id
+        )
+        consumed = ad.required_status(agent, delegation_id)["consumed"]
+    finally:
+        ad._reset_for_tests()
+
+    evidence_results = [
+        message for message in replay
+        if (
+            message.get("role") == "tool"
+            and "canonical child evidence" in str(message.get("content"))
+        )
+    ]
+    assert len(evidence_results) == 1
+    assert evidence_results[0]["tool_call_id"] == (
+        f"required_wait_{delegation_id}"
+    )
+    assert consumed is True
+
+
+def test_model_cancel_keeps_result_for_one_atomic_synthetic_observation(
+    tmp_path,
+):
+    from agent.conversation_loop import _observe_required_delegations
+    from hermes_state import SessionDB
+    from tools import async_delegation as ad
+    from tools.delegate_tool import _required_control
+
+    ad._reset_for_tests()
+    release = threading.Event()
+    agent = _make_agent()
+    agent.platform = "acp"
+    agent._delegate_depth = 0
+    agent._current_turn_id = "turn-model-cancel"
+    agent._session_db = SessionDB(
+        db_path=tmp_path / "model-cancel-state.db"
+    )
+    agent._session_db_created = False
+    dispatch = ad.dispatch_async_delegation_batch(
+        goals=["child"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model=None,
+        session_key=agent.session_id,
+        parent_session_id=agent.session_id,
+        parent_turn_id=agent._current_turn_id,
+        runner=lambda: (
+            release.wait(timeout=2)
+            and {
+                "results": [{
+                    "task_index": 0,
+                    "child_id": "child-cancel",
+                    "status": "completed",
+                    "summary": "late result",
+                }],
+                "total_duration_seconds": 0,
+            }
+        ),
+        interrupt_fn=release.set,
+        child_ids=["child-cancel"],
+        required=True,
+    )
+    delegation_id = dispatch["delegation_id"]
+    ad.note_required_progress(
+        delegation_id,
+        child_id="child-cancel",
+        current_tool=None,
+        activity="started",
+        meaningful=False,
+        state="running",
+    )
+    cancel_content = _required_control(
+        "cancel", {"delegation_id": delegation_id}, agent
+    )
+    cancel_payload = json.loads(cancel_content)
+    messages = [{
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{
+            "id": "model-cancel",
+            "type": "function",
+            "function": {
+                "name": "delegation_cancel",
+                "arguments": json.dumps({
+                    "delegation_id": delegation_id
+                }),
+            },
+        }],
+    }, make_tool_result_message(
+        "delegation_cancel", cancel_content, "model-cancel"
+    )]
+
+    try:
+        assert cancel_payload["terminal"] is True
+        assert cancel_payload["observation_pending"] is True
+        assert "result" not in cancel_payload
+        assert _observe_required_delegations(agent, messages, []) is True
+        replay = agent._session_db.get_messages_as_conversation(
+            agent.session_id
+        )
+    finally:
+        release.set()
+        ad._reset_for_tests()
+
+    evidence_results = [
+        message for message in replay
+        if (
+            message.get("role") == "tool"
+            and message.get("tool_name") == "delegation_wait"
+            and '"status": "cancelled"' in str(message.get("content"))
+        )
+    ]
+    assert len(evidence_results) == 1
+
+
+def test_required_join_emits_acp_visible_wait_activity_for_queued_child():
+    from agent.conversation_loop import _observe_required_delegations
+    from tools import async_delegation as ad
+
+    ad._reset_for_tests()
+    release = threading.Event()
+    agent = _make_agent()
+    agent.platform = "acp"
+    agent._current_turn_id = "turn-visible-wait"
+    visible_waits = []
+    agent._emit_wait_notice = visible_waits.append
+    agent._persist_required_observation_pair = MagicMock()
+    dispatch = ad.dispatch_async_delegation_batch(
+        goals=["queued child"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model=None,
+        session_key=agent.session_id,
+        parent_session_id=agent.session_id,
+        parent_turn_id=agent._current_turn_id,
+        runner=lambda: (
+            release.wait(timeout=2)
+            and {
+                "results": [],
+                "total_duration_seconds": 0,
+            }
+        ),
+        interrupt_fn=release.set,
+        child_ids=["queued-child"],
+        required=True,
+        no_progress_timeout_seconds=1000,
+        start_timeout_seconds=0.4,
+    )
+    messages = []
+    try:
+        assert _observe_required_delegations(
+            agent, messages, [], wait_for_pending=True
+        ) is True
+        terminal = ad.required_status(
+            agent, dispatch["delegation_id"]
+        )
+    finally:
+        release.set()
+        ad._reset_for_tests()
+
+    assert visible_waits
+    assert dispatch["delegation_id"] in visible_waits[0]
+    assert "queued" in visible_waits[0]
+    assert terminal["status"] == "timeout"
+
+
+def test_terminal_wrapper_hard_joins_and_replaces_stale_rollback_messages():
+    from agent.conversation_loop import _required_safe_terminal_result
+    from tools import async_delegation as ad
+
+    ad._reset_for_tests()
+    release = threading.Event()
+    agent = _make_agent()
+    agent.platform = "acp"
+    agent._current_turn_id = "turn-terminal-wrapper"
+    agent._persist_required_observation_pair = MagicMock()
+    dispatch = ad.dispatch_async_delegation_batch(
+        goals=["child"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model=None,
+        session_key=agent.session_id,
+        parent_session_id=agent.session_id,
+        parent_turn_id=agent._current_turn_id,
+        runner=lambda: (
+            release.wait(timeout=2)
+            and {
+                "results": [{
+                    "status": "completed",
+                    "summary": "joined evidence",
+                }],
+                "total_duration_seconds": 0,
+            }
+        ),
+        required=True,
+    )
+    live_messages = [{"role": "user", "content": "live"}]
+    stale_messages = [{"role": "user", "content": "rolled back"}]
+    result_holder = {}
+
+    def _finish():
+        result_holder["result"] = _required_safe_terminal_result(
+            agent,
+            {
+                "final_response": "explicit failure",
+                "messages": stale_messages,
+                "api_calls": 2,
+                "completed": False,
+                "failed": True,
+                "error": "retry_exhausted",
+            },
+            live_messages,
+            [],
+        )
+
+    thread = threading.Thread(target=_finish)
+    thread.start()
+    threading.Event().wait(0.05)
+    assert thread.is_alive()
+    release.set()
+    thread.join(timeout=1)
+    assert not thread.is_alive()
+    try:
+        terminal = result_holder["result"]
+        assert terminal["final_response"] == "explicit failure"
+        assert terminal["messages"] is live_messages
+        assert any(
+            message.get("name") == "delegation_wait"
+            and "joined evidence" in str(message.get("content"))
+            for message in live_messages
+        )
+        assert ad.required_status(
+            agent, dispatch["delegation_id"]
+        )["consumed"] is True
+    finally:
+        ad._reset_for_tests()
+
+
+def test_mixed_guardrail_after_required_dispatch_fails_closed_without_prose():
+    from tools import async_delegation as ad
+
+    ad._reset_for_tests()
+    agent = _make_agent()
+    agent.platform = "acp"
+    agent.valid_tool_names = {"delegate_task", "web_search"}
+    agent.tools = _make_tool_defs("delegate_task", "web_search")
+    agent._persist_required_observation_pair = MagicMock()
+    calls = [
+        _mock_tool_call(
+            name="delegate_task",
+            arguments='{"goal":"child"}',
+            call_id="delegate-mixed",
+        ),
+        _mock_tool_call(
+            name="web_search",
+            arguments='{"query":"second tool"}',
+            call_id="guarded-second",
+        ),
+    ]
+    agent.client.chat.completions.create.return_value = _mock_response(
+        content="candidate must not escape",
+        finish_reason="tool_calls",
+        tool_calls=calls,
+    )
+
+    def _execute(_assistant_message, messages, *_args):
+        dispatch = ad.dispatch_async_delegation_batch(
+            goals=["child"],
+            context=None,
+            toolsets=None,
+            role="leaf",
+            model=None,
+            session_key=agent.session_id,
+            parent_session_id=agent.session_id,
+            parent_turn_id=agent._current_turn_id,
+            runner=lambda: {
+                "results": [{
+                    "status": "completed",
+                    "summary": "immediate child evidence",
+                }],
+                "total_duration_seconds": 0,
+            },
+            required=True,
+        )
+        messages.append(make_tool_result_message(
+            "delegate_task",
+            json.dumps({
+                "status": "dispatched",
+                "delegation_id": dispatch["delegation_id"],
+            }),
+            "delegate-mixed",
+        ))
+        messages.append(make_tool_result_message(
+            "web_search",
+            json.dumps({"error": "guarded"}),
+            "guarded-second",
+        ))
+        agent._tool_guardrail_halt_decision = SimpleNamespace(
+            tool_name="web_search",
+            code="test_guardrail",
+        )
+
+    try:
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(
+                agent, "_execute_tool_calls", side_effect=_execute
+            ),
+        ):
+            result = agent.run_conversation("delegate and guarded tool")
+    finally:
+        ad._reset_for_tests()
+
+    assert result["final_response"] is None
+    assert result["error"] == (
+        "tool_guardrail_halt_after_required_delegation"
+    )
+    assert "candidate must not escape" not in json.dumps(
+        result["messages"]
+    )
+    assert "immediate child evidence" in json.dumps(result["messages"])
+
+
+def test_required_dispatch_processing_error_observes_child_and_clears_latch(
+    tmp_path,
+):
+    from tools import async_delegation as ad
+    from hermes_state import SessionDB
+
+    ad._reset_for_tests()
+    agent = _make_agent()
+    agent._session_db = SessionDB(db_path=tmp_path / "error-state.db")
+    agent._session_db_created = False
+    agent.platform = "acp"
+    # The mocked exception originates in this test module rather than one of
+    # the production-local processing modules used by phase classification.
+    # Bound the loop so this test isolates one recovery/observation cycle.
+    agent.max_iterations = 2
+    agent.valid_tool_names = {"delegate_task"}
+    agent.tools = _make_tool_defs("delegate_task")
+    agent.client.chat.completions.create.return_value = _mock_response(
+        content="candidate",
+        finish_reason="tool_calls",
+        tool_calls=[_mock_tool_call(
+            name="delegate_task", arguments="{}", call_id="delegate-error"
+        )],
+    )
+
+    def _execute(_assistant_message, messages, *_args):
+        dispatch = ad.dispatch_async_delegation_batch(
+            goals=["child"],
+            context=None,
+            toolsets=None,
+            role="leaf",
+            model=None,
+            session_key=agent.session_id,
+            parent_session_id=agent.session_id,
+            parent_turn_id=agent._current_turn_id,
+            runner=lambda: {
+                "results": [{
+                    "status": "completed",
+                    "summary": "evidence before local failure",
+                }],
+                "total_duration_seconds": 0,
+            },
+            required=True,
+        )
+        messages.append(make_tool_result_message(
+            "delegate_task",
+            json.dumps({
+                "status": "dispatched",
+                "mode": "required",
+                "delegation_id": dispatch["delegation_id"],
+            }),
+            "delegate-error",
+        ))
+        raise RuntimeError("local post-dispatch failure")
+
+    try:
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_execute_tool_calls", side_effect=_execute),
+        ):
+            result = agent.run_conversation("delegate then fail locally")
+    finally:
+        ad._reset_for_tests()
+
+    assert result["completed"] is True
+    assert "local post-dispatch failure" in result["final_response"]
+    wait_results = [
+        message for message in result["messages"]
+        if (
+            message.get("role") == "tool"
+            and message.get("name") == "delegation_wait"
+        )
+    ]
+    assert len(wait_results) == 1
+    assert "evidence before local failure" in wait_results[0]["content"]
+    assert agent._required_delegation_launching is False
+    assert agent._acp_provisional_stream_active is False
+
+
+def test_required_launch_latch_clears_after_truncated_validation_exit():
+    agent = _make_agent()
+    agent.platform = "acp"
+    agent.valid_tool_names = {"delegate_task"}
+    agent.tools = _make_tool_defs("delegate_task")
+    agent.client.chat.completions.create.return_value = _mock_response(
+        content="candidate",
+        finish_reason="tool_calls",
+        tool_calls=[_mock_tool_call(
+            name="delegate_task",
+            arguments='{"goal":"unfinished',
+            call_id="bad-delegate",
+        )],
+    )
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        failed = agent.run_conversation("delegate malformed")
+
+    assert failed["partial"] is True
+    assert agent._required_delegation_launching is False
+    assert agent._acp_provisional_stream_active is False
+
+    agent.client.chat.completions.create.return_value = _mock_response(
+        content="clean next turn", finish_reason="stop"
+    )
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        recovered = agent.run_conversation("new turn")
+    assert recovered["final_response"] == "clean next turn"
+
+
+def test_next_acp_turn_cancels_and_consumes_orphaned_required_owner():
+    from tools import async_delegation as ad
+
+    ad._reset_for_tests()
+    agent = _make_agent()
+    agent.platform = "acp"
+    agent._current_turn_id = "old-turn"
+    started = threading.Event()
+    release = threading.Event()
+    interrupted = []
+
+    def _runner():
+        started.set()
+        release.wait(timeout=2)
+        return {
+            "results": [{"status": "completed", "summary": "late child"}],
+            "total_duration_seconds": 0,
+        }
+
+    dispatch = ad.dispatch_async_delegation_batch(
+        goals=["orphaned child"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model=None,
+        session_key=agent.session_id,
+        parent_session_id=agent.session_id,
+        parent_turn_id=agent._current_turn_id,
+        runner=_runner,
+        interrupt_fn=lambda: (interrupted.append("stop"), release.set()),
+        required=True,
+    )
+    delegation_id = dispatch["delegation_id"]
+    assert started.wait(timeout=1)
+    agent.client.chat.completions.create.return_value = _mock_response(
+        content="clean next turn", finish_reason="stop"
+    )
+
+    try:
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("new turn")
+        with ad._records_lock:
+            record = dict(ad._records[delegation_id])
+    finally:
+        release.set()
+        ad._reset_for_tests()
+
+    assert result["final_response"] == "clean next turn"
+    assert agent._current_turn_id != "old-turn"
+    assert record["status"] == "cancelled"
+    assert record["consumed_at"] is not None
+    assert interrupted == ["stop"]
 
 
 # ---------------------------------------------------------------------------
@@ -250,3 +1327,182 @@ def test_execute_tool_calls_concurrent_flushes_each_tool_result_in_order():
     # production flush call breaks one of these assertions.
     assert flushed_tool_ids == ["c1", "c2"]
     assert flush_lengths == [1, 2]
+
+
+def test_concurrent_timed_out_tool_completion_does_not_advance_last_meaningful_at():
+    """Adversarial review follow-up (MEDIUM): a concurrent tool call that hits
+    the batch deadline is left running "detached" (agent/tool_executor.py's
+    own comment) — the executor gives up on it, but the worker thread may
+    still be genuinely wedged. The late/never-verified completion touch for
+    that tool must NOT be meaningful=True: stamping it would refresh a
+    required-delegation child's no-progress deadline exactly when
+    supervision should be tightening, not resetting, and would let a child
+    that keeps hitting per-tool timeouts reset its ceiling for free."""
+    from tools import async_delegation as ad
+
+    agent = _make_agent()
+    owner_token = "owner-timeout"
+    agent._required_delegation_owner_token = owner_token
+    agent.session_id = "parent-timeout"
+    agent._current_turn_id = "turn-timeout"
+
+    runner_release = threading.Event()
+
+    def _runner():
+        runner_release.wait(timeout=10)
+        return {"results": [{"task_index": 0, "status": "completed"}]}
+
+    dispatch = ad.dispatch_async_delegation_batch(
+        goals=["hung tool work"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model=None,
+        session_key=agent.session_id,
+        parent_session_id=agent.session_id,
+        parent_owner_token=owner_token,
+        parent_turn_id=agent._current_turn_id,
+        runner=_runner,
+        child_ids=["child-timeout"],
+        required=True,
+        max_async_children=3,
+        no_progress_timeout_seconds=1000.0,
+        in_flight_no_progress_timeout_seconds=1000.0,
+    )
+    delegation_id = dispatch["delegation_id"]
+    try:
+        agent._required_delegation_id = delegation_id
+        agent._subagent_id = "child-timeout"
+        ad.note_required_progress(
+            delegation_id,
+            child_id="child-timeout",
+            current_tool=None,
+            activity="started",
+            meaningful=False,
+            state="running",
+        )
+
+        tool_calls = [_mock_tool_call(name="web_search", call_id="c1")]
+        messages: list = []
+        assistant_message = SimpleNamespace(content="", tool_calls=tool_calls)
+
+        # Sleeps far longer than the configured batch timeout — the executor
+        # gives up and reports it timed out while the worker is still
+        # genuinely running in the background (daemon thread; exits on its
+        # own after 0.3s, well after this test has already asserted).
+        def _hung_invoke(function_name, function_args, effective_task_id, tool_call_id, **kwargs):
+            threading.Event().wait(0.3)
+            return "should never be observed by the executor"
+
+        before = time.time()
+        with (
+            patch.object(agent, "_invoke_tool", side_effect=_hung_invoke),
+            patch("agent.tool_executor._resolve_concurrent_tool_timeout", return_value=0.05),
+            patch(
+                "agent.tool_executor.maybe_persist_tool_result",
+                side_effect=lambda **kwargs: kwargs["content"],
+            ),
+        ):
+            agent._execute_tool_calls_concurrent(assistant_message, messages, "task-1")
+
+        # The executor reported the timeout in the returned tool message.
+        assert len(messages) == 1
+        assert "timed out" in messages[0]["content"]
+
+        with ad._records_lock:
+            child = ad._records[delegation_id]["child_supervision"]["child-timeout"]
+            last_meaningful_at = child["last_meaningful_at"]
+
+        # last_meaningful_at must still reflect the batch START touch (fired
+        # once, unconditionally, before any worker launched) — NOT a fresh
+        # stamp from the abandoned tool's completion touch. The batch took
+        # ~50ms+ (the configured timeout) to return, so a bug that stamps
+        # meaningful=True on the timed-out completion would push
+        # last_meaningful_at well past `before + small epsilon`.
+        assert last_meaningful_at <= before + 0.03, (
+            "last_meaningful_at advanced past the batch start — the "
+            "timed-out tool's completion touch was (incorrectly) meaningful"
+        )
+    finally:
+        runner_release.set()
+        ad._reset_for_tests()
+
+
+def test_concurrent_normal_completion_still_advances_last_meaningful_at():
+    """Companion to the timeout test above: a tool the executor DID verify
+    complete (success or tool-level error) must still count as real
+    progress — the fix must not blanket-suppress meaningful=True for every
+    concurrent completion, only for the unverified (r is None) ones."""
+    from tools import async_delegation as ad
+
+    agent = _make_agent()
+    owner_token = "owner-normal"
+    agent._required_delegation_owner_token = owner_token
+    agent.session_id = "parent-normal"
+    agent._current_turn_id = "turn-normal"
+
+    runner_release = threading.Event()
+
+    def _runner():
+        runner_release.wait(timeout=10)
+        return {"results": [{"task_index": 0, "status": "completed"}]}
+
+    dispatch = ad.dispatch_async_delegation_batch(
+        goals=["normal tool work"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model=None,
+        session_key=agent.session_id,
+        parent_session_id=agent.session_id,
+        parent_owner_token=owner_token,
+        parent_turn_id=agent._current_turn_id,
+        runner=_runner,
+        child_ids=["child-normal"],
+        required=True,
+        max_async_children=3,
+        no_progress_timeout_seconds=1000.0,
+        in_flight_no_progress_timeout_seconds=1000.0,
+    )
+    delegation_id = dispatch["delegation_id"]
+    try:
+        agent._required_delegation_id = delegation_id
+        agent._subagent_id = "child-normal"
+        ad.note_required_progress(
+            delegation_id,
+            child_id="child-normal",
+            current_tool=None,
+            activity="started",
+            meaningful=False,
+            state="running",
+        )
+        with ad._records_lock:
+            # Force the clock stale so a real advance is unambiguous.
+            ad._records[delegation_id]["child_supervision"]["child-normal"][
+                "last_meaningful_at"
+            ] -= 100.0
+            before_stale = ad._records[delegation_id]["child_supervision"][
+                "child-normal"
+            ]["last_meaningful_at"]
+
+        tool_calls = [_mock_tool_call(name="web_search", call_id="c1")]
+        messages: list = []
+        assistant_message = SimpleNamespace(content="", tool_calls=tool_calls)
+
+        with (
+            patch.object(agent, "_invoke_tool", return_value="ok result"),
+            patch(
+                "agent.tool_executor.maybe_persist_tool_result",
+                side_effect=lambda **kwargs: kwargs["content"],
+            ),
+        ):
+            agent._execute_tool_calls_concurrent(assistant_message, messages, "task-1")
+
+        with ad._records_lock:
+            last_meaningful_at = ad._records[delegation_id]["child_supervision"][
+                "child-normal"
+            ]["last_meaningful_at"]
+        assert last_meaningful_at > before_stale + 50.0
+    finally:
+        runner_release.set()
+        ad._reset_for_tests()

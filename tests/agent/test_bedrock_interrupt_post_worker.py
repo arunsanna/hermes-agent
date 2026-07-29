@@ -49,6 +49,9 @@ class _FakeAgent:
     def _safe_print(self, *a, **k):
         pass
 
+    def _touch_activity(self, *a, **k):
+        pass
+
 
 def test_bedrock_stream_interrupt_not_swallowed_post_worker():
     """A /stop arriving MID-stream: the pre-flight check (top of function) has

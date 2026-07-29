@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from hermes_constants import get_hermes_home
 
+import asyncio
 import copy
 import json
 import logging
@@ -21,9 +22,24 @@ import uuid
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from threading import Lock
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+_TRANSCRIPT_CORRECTION_POISON_KEY = "acp_transcript_correction_poisoned"
+
+
+class UnsafeSessionTranscriptError(RuntimeError):
+    """Refuse a session whose rejected assistant candidate remains durable."""
+
+    def __init__(self, session_id: str):
+        super().__init__(
+            "ACP session "
+            f"{session_id} is blocked because its transcript could not be "
+            "safely corrected; do not resume it until the durable history is repaired"
+        )
+        self.session_id = session_id
 
 
 def _translate_acp_cwd(cwd: str) -> str:
@@ -168,8 +184,12 @@ class SessionState:
     is_running: bool = False
     queued_prompts: List[str] = field(default_factory=list)
     runtime_lock: Any = field(default_factory=Lock)
+    turn_terminal_lock: Any = field(default_factory=asyncio.Lock)
+    turn_terminal_winner: str | None = None
     current_prompt_text: str = ""
     interrupted_prompt_text: str = ""
+    transcript_correction_poisoned: bool = False
+    transcript_correction_poison_persisted: bool | None = None
 
 
 class SessionManager:
@@ -226,6 +246,7 @@ class SessionManager:
         with self._lock:
             state = self._sessions.get(session_id)
         if state is not None:
+            self._raise_if_transcript_poisoned(state)
             return state
         # Attempt to restore from database.
         return self._restore(session_id)
@@ -406,6 +427,26 @@ class SessionManager:
             return self._persist(state)
         return False
 
+    def mark_transcript_correction_poisoned(self, state: SessionState) -> bool:
+        """Persist a fail-closed marker without rewriting unsafe messages."""
+        state.transcript_correction_poisoned = True
+        persisted = self._persist(state, persist_history=False)
+        state.transcript_correction_poison_persisted = persisted
+        return persisted
+
+    def clear_transcript_correction_poisoned(self, state: SessionState) -> bool:
+        """Clear the marker only after the caller verifies durable correction."""
+        state.transcript_correction_poisoned = False
+        persisted = self._persist(state, persist_history=False)
+        if not persisted:
+            # The durable row may still be poisoned. Keep the in-memory owner
+            # blocked too rather than claiming the session is safe.
+            state.transcript_correction_poisoned = True
+            state.transcript_correction_poison_persisted = False
+            return False
+        state.transcript_correction_poison_persisted = None
+        return True
+
     # ---- persistence via SessionDB ------------------------------------------
 
     def _get_db(self):
@@ -430,7 +471,12 @@ class SessionManager:
             logger.debug("SessionDB unavailable for ACP persistence", exc_info=True)
             return None
 
-    def _persist(self, state: SessionState) -> bool:
+    def _persist(
+        self,
+        state: SessionState,
+        *,
+        persist_history: bool = True,
+    ) -> bool:
         """Write session state to the database.
 
         Creates the session record if it doesn't exist, then replaces all
@@ -452,6 +498,8 @@ class SessionManager:
             session_meta["base_url"] = base_url.strip()
         if isinstance(api_mode, str) and api_mode.strip():
             session_meta["api_mode"] = api_mode.strip()
+        if state.transcript_correction_poisoned:
+            session_meta[_TRANSCRIPT_CORRECTION_POISON_KEY] = True
         cwd_json = json.dumps(session_meta)
 
         try:
@@ -462,11 +510,14 @@ class SessionManager:
                     session_id=state.session_id,
                     source="acp",
                     model=model_str,
-                    model_config={"cwd": state.cwd},
+                    model_config=session_meta,
                 )
             else:
                 # Update model_config (contains cwd) if changed.
                 db.update_session_meta(state.session_id, cwd_json, model_str)
+
+            if not persist_history:
+                return True
 
             # When the agent owns persistence to this same SessionDB it has
             # already flushed the live transcript incrementally during
@@ -514,6 +565,85 @@ class SessionManager:
             logger.warning("Failed to persist ACP session %s", state.session_id, exc_info=True)
             return False
 
+    def _self_heal_poisoned_history(
+        self,
+        *,
+        db: Any,
+        session_id: str,
+        history: List[Dict[str, Any]],
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Attempt to redo a stuck correction on a poisoned session at restore time.
+
+        The durable poison marker means "correction may not have completed" —
+        it is a redo flag, not a tombstone. Two shapes reach here:
+
+        1. ``replace_messages`` genuinely succeeded last time and only the
+           subsequent marker CLEAR failed transiently (the round-2 defect
+           this method exists to fix): ``history`` is already the sanitized,
+           safe version. Re-running sanitize is then a true no-op (nothing
+           left to strip — ``_sanitize_required_assistant_candidate`` clears
+           an already-empty ``content``/absent ``api_content``/etc
+           idempotently), re-running ``replace_messages`` rewrites the same
+           safe bytes, and only the clear needs to actually take effect this
+           time.
+        2. The correction never completed at all (a genuine crash-window
+           hit, or a persistently failing correction): ``history`` still
+           carries the tainted candidate. Sanitize strips it for real this
+           time, and the rewrite durably persists the correction.
+
+        In both cases the boundary is "everything after the most recent
+        user message" — the only turn a poisoned session can ever have
+        pending, since a poisoned session can never accept a new user turn
+        (``_raise_if_transcript_poisoned`` / this same poison check refuses
+        before one could ever be appended). Forcing
+        ``_sanitize_failed_turn_history``'s baseline-clamp fallback (passing
+        a ``baseline_count`` past the end of the list) computes exactly that
+        boundary instead of risking sanitizing an unrelated, already-
+        completed earlier turn.
+
+        Returns the (possibly sanitized) history on success, or ``None`` if
+        the redo could not be proven safe — callers must then refuse exactly
+        as before (fail closed, unchanged from the pre-self-heal behavior).
+        """
+        from acp_adapter.server import (
+            _rewrite_agent_active_history,
+            _sanitize_failed_turn_history,
+        )
+
+        safe_history = _sanitize_failed_turn_history(
+            history, baseline_count=len(history) + 1
+        )
+        correction_target = SimpleNamespace(_session_db=db, session_id=session_id)
+        temp_state = SessionState(
+            session_id=session_id,
+            agent=correction_target,
+            transcript_correction_poisoned=True,
+        )
+        try:
+            healed = _rewrite_agent_active_history(
+                correction_target, safe_history, temp_state, self
+            )
+        except Exception:
+            logger.warning(
+                "Poisoned-session self-heal redo raised for ACP session %s",
+                session_id,
+                exc_info=True,
+            )
+            return None
+        if not healed:
+            logger.warning(
+                "Poisoned-session self-heal redo did not complete for ACP "
+                "session %s; refusing resume",
+                session_id,
+            )
+            return None
+        logger.info(
+            "Poisoned ACP session %s self-healed on restore (%d messages)",
+            session_id,
+            len(safe_history),
+        )
+        return safe_history
+
     def _restore(self, session_id: str) -> Optional[SessionState]:
         """Load a session from the database into memory, recreating the AIAgent."""
         import threading
@@ -535,16 +665,20 @@ class SessionManager:
         if row.get("source") != "acp":
             return None
 
-        # Extract cwd from model_config.
+        # Extract cwd/provider metadata from model_config. Reading this is
+        # safe even for a poisoned session — it is routing/identity data,
+        # not the protected message content the poison marker guards.
         cwd = "."
         requested_provider = row.get("billing_provider")
         restored_base_url = row.get("billing_base_url")
         restored_api_mode = None
+        poisoned = False
         mc = row.get("model_config")
         if mc:
             try:
                 meta = json.loads(mc)
                 if isinstance(meta, dict):
+                    poisoned = bool(meta.get(_TRANSCRIPT_CORRECTION_POISON_KEY))
                     cwd = meta.get("cwd", ".")
                     requested_provider = meta.get("provider") or requested_provider
                     restored_base_url = meta.get("base_url") or restored_base_url
@@ -566,6 +700,17 @@ class SessionManager:
         except Exception:
             logger.warning("Failed to load messages for ACP session %s", session_id, exc_info=True)
             history = []
+
+        if poisoned:
+            # The marker means "correction may not have completed" — redo it
+            # before resuming. Proceed only on full success; otherwise keep
+            # refusing exactly as before self-heal existed.
+            healed_history = self._self_heal_poisoned_history(
+                db=db, session_id=session_id, history=history
+            )
+            if healed_history is None:
+                raise UnsafeSessionTranscriptError(session_id)
+            history = healed_history
 
         try:
             agent = self._make_agent(
@@ -593,6 +738,11 @@ class SessionManager:
         _register_task_cwd(session_id, cwd)
         logger.info("Restored ACP session %s from DB (%d messages)", session_id, len(history))
         return state
+
+    @staticmethod
+    def _raise_if_transcript_poisoned(state: SessionState) -> None:
+        if state.transcript_correction_poisoned:
+            raise UnsafeSessionTranscriptError(state.session_id)
 
     def _delete_persisted(self, session_id: str) -> bool:
         """Delete a session from the database. Returns True if it existed."""

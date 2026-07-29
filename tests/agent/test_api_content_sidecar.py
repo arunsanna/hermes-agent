@@ -1033,3 +1033,118 @@ class TestStaleConfirmationRedactionDropsSidecar:
         )
         assert cleaned[0]["content"] != "confirm forced restart"
         assert "api_content" not in cleaned[0]
+
+
+class TestRequiredCandidateSanitizeDropsDurableApiContent:
+    """A rejected required-delegation assistant candidate's api_content
+    sidecar must not survive the ACP fail-closed sanitize+rewrite.
+
+    api_content replays VERBATIM — no sanitize_context, no strip — at every
+    API-bound message-build site (agent.turn_context.substitute_api_content)
+    and on every durable reload (get_messages_as_conversation returns the
+    column unchanged). Clearing `content` alone leaves that sidecar in
+    place, so a rejected candidate can re-enter the API payload on the next
+    model call, or resurrect on a durable reload after the process restarts.
+
+    This exercises the full real round trip end to end: the production write
+    path that stamps the sidecar when sent bytes diverge from clean content
+    (AIAgent._flush_messages_to_session_db, run_agent.py:2015-2122), the
+    sanitizer under test (agent.conversation_loop.
+    _sanitize_required_assistant_candidate), the durable correction path
+    used by acp_adapter.server._rewrite_agent_active_history
+    (SessionDB.replace_messages), a fresh SQLite reload
+    (get_messages_as_conversation), and the real replay substitution
+    (agent.turn_context.substitute_api_content) that would otherwise
+    resurrect the rejected text into the outgoing API payload.
+    """
+
+    def _make_agent(self, db, sid):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            session_db=db,
+            session_id=sid,
+        )
+        agent._session_db_created = True
+        return agent
+
+    def test_sanitize_and_durable_rewrite_close_api_content_escape(self, tmp_path):
+        from agent.conversation_loop import _sanitize_required_assistant_candidate
+        from agent.turn_context import substitute_api_content
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        sid = "sess-required-fail"
+        db.create_session(session_id=sid, source="acp")
+        try:
+            agent = self._make_agent(db, sid)
+
+            # A rejected required-delegation candidate whose sent bytes
+            # (api_content) diverge from the clean stored content — the
+            # exact fixture the sidecar exists for: get_messages_as_conversation
+            # replays user/assistant content through
+            # sanitize_context(content).strip(), so a <memory-context> fence
+            # in the sent text would otherwise replay differently after
+            # reload than what actually went out on the wire.
+            leaked_content = (
+                "STALE REQUIRED CANDIDATE\n\n"
+                "<memory-context>\nleaked child result\n</memory-context>\n"
+            )
+            messages = [
+                {"role": "user", "content": "do the required work"},
+                {
+                    "role": "assistant",
+                    "content": leaked_content,
+                    "tool_calls": [
+                        {
+                            "id": "delegate-1",
+                            "type": "function",
+                            "function": {
+                                "name": "delegate_task",
+                                "arguments": "{}",
+                            },
+                        }
+                    ],
+                },
+            ]
+            # Real production write path (run_agent.py:2015-2122): computes
+            # and stamps the api_content sidecar because sanitize_context
+            # would rewrite this content on reload.
+            agent._flush_messages_to_session_db(messages, None)
+
+            pre_fix = db.get_messages_as_conversation(sid)
+            # Read path sanitizes stored content (strips the memory-context
+            # fence); the sidecar is the byte-fidelity escape hatch that
+            # bypasses that sanitize on replay.
+            assert pre_fix[-1]["content"] == "STALE REQUIRED CANDIDATE"
+            assert pre_fix[-1]["api_content"] == leaked_content
+
+            # The fail-closed sanitize + durable rewrite
+            # (acp_adapter.server._sanitize_failed_turn_history +
+            # _rewrite_agent_active_history) operates on a freshly loaded
+            # copy, exactly like the ACP exception/direct-return handlers.
+            reloaded_for_sanitize = db.get_messages_as_conversation(sid)
+            _sanitize_required_assistant_candidate(reloaded_for_sanitize[-1])
+            db.replace_messages(sid, reloaded_for_sanitize, active_only=True)
+
+            # Fresh read path — a brand-new load, not the in-memory list the
+            # sanitize call mutated. Proves the correction is durable, not
+            # just an in-process side effect.
+            fresh = db.get_messages_as_conversation(sid)
+            sanitized_row = fresh[-1]
+            assert sanitized_row["role"] == "assistant"
+            assert sanitized_row["content"] == ""
+            assert "api_content" not in sanitized_row
+            assert "STALE REQUIRED CANDIDATE" not in json.dumps(fresh)
+
+            # The real replay substitution (used at every API-bound
+            # message-build site) must find nothing left to resurrect.
+            api_msg = dict(sanitized_row)
+            substitute_api_content(api_msg)
+            assert api_msg["content"] == ""
+        finally:
+            db.close()

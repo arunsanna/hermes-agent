@@ -18,6 +18,13 @@ class FakeAgent:
         self.valid_tool_names = set()
         self.steers = []
         self.runs = []
+        self._required_delegation_launching = False
+
+    def _has_unconsumed_required_delegations(self):
+        return False
+
+    def _finish_acp_provisional_stream(self, *, discard):
+        return None
 
     def steer(self, text):
         self.steers.append(text)
@@ -54,6 +61,9 @@ class NoopDb:
         return None
 
     def update_session(self, *_args, **_kwargs):
+        return None
+
+    def replace_messages(self, *_args, **_kwargs):
         return None
 
 

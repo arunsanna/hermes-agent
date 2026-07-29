@@ -568,7 +568,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # Touch activity before launching workers so the gateway knows
     # we're executing tools (not stuck).
     agent._current_tool = tool_names_str
-    agent._touch_activity(f"executing {num_tools} tools concurrently: {tool_names_str}")
+    agent._touch_activity(
+        f"executing {num_tools} tools concurrently: {tool_names_str}",
+        meaningful=True,
+    )
 
     def _run_tool(index, tool_call, function_name, function_args, middleware_trace):
         """Worker function executed in a thread."""
@@ -807,7 +810,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         ]
                         agent._touch_activity(
                             f"concurrent tools running ({_conc_elapsed}s, "
-                            f"{len(not_done)} remaining: {', '.join(_still_running[:3])})"
+                            f"{len(not_done)} remaining: {', '.join(_still_running[:3])})",
+                            meaningful=False,
                         )
             finally:
                 # On abandon (interrupt or deadline) we intentionally do NOT
@@ -835,6 +839,17 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # loop. Prefer that real result over a fabricated timeout message — the
         # tool genuinely succeeded, just slightly late.
         effect_disposition = None
+        # r is None means the executor never got a verified outcome from the
+        # worker: timed out (thread left running detached — see the
+        # executor.shutdown comment above), interrupted before/without
+        # reporting, or the thread died without writing results[i]. That is
+        # NOT real progress — it's the required-delegation supervision
+        # equivalent of a no-op, and stamping meaningful=True here would
+        # reset the no-progress deadline for a child whose tool call may
+        # still be silently running unsupervised, exactly when the deadline
+        # should tighten instead. Only an r that the executor actually
+        # observed (success or tool-level error) counts as meaningful.
+        _worker_result_verified = r is not None
         if i in timed_out_indices and r is None:
             suffix = f"{timeout_s:.1f}s" if timeout_s is not None else "the configured timeout"
             function_result = f"Error executing tool '{name}': timed out after {suffix}"
@@ -940,7 +955,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 print(f"  ✅ Tool {i+1} completed in {tool_duration:.2f}s - {response_preview}")
 
         agent._current_tool = None
-        agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s)")
+        agent._touch_activity(
+            f"tool completed: {name} ({tool_duration:.1f}s)",
+            meaningful=_worker_result_verified,
+        )
 
         if not blocked and agent.tool_complete_callback:
             try:
@@ -1158,7 +1176,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         if not _execution_blocked:
             agent._current_tool = function_name
-            agent._touch_activity(f"executing tool: {function_name}")
+            agent._touch_activity(
+                f"executing tool: {function_name}",
+                meaningful=True,
+            )
 
         # Set activity callback for long-running tool execution (terminal
         # commands, etc.) so the gateway's inactivity monitor doesn't kill
@@ -1495,6 +1516,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                     disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                     tool_request_middleware_trace=list(middleware_trace),
+                    parent_agent=agent,
                 )
                 _spinner_result = function_result
             except KeyboardInterrupt:
@@ -1537,6 +1559,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                     disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                     tool_request_middleware_trace=list(middleware_trace),
+                    parent_agent=agent,
                 )
             except KeyboardInterrupt:
                 _emit_cancelled_terminal_post_tool_call(
@@ -1631,7 +1654,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 logging.debug(f"Tool progress callback error: {cb_err}")
 
         agent._current_tool = None
-        agent._touch_activity(f"tool completed: {function_name} ({tool_duration:.1f}s)")
+        agent._touch_activity(
+            f"tool completed: {function_name} ({tool_duration:.1f}s)",
+            meaningful=True,
+        )
 
         if agent.verbose_logging:
             logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")

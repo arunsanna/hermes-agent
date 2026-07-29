@@ -86,6 +86,12 @@ class TestStreamingAccumulator:
         )
         agent.api_mode = "chat_completions"
         agent._interrupt_requested = False
+        touch_calls = []
+        agent._touch_activity = (
+            lambda desc, **kwargs: touch_calls.append(
+                (desc, kwargs.get("meaningful", True))
+            )
+        )
 
         response = agent._interruptible_streaming_api_call({})
 
@@ -221,6 +227,12 @@ class TestStreamingAccumulator:
         )
         agent.api_mode = "chat_completions"
         agent._interrupt_requested = False
+        touch_calls = []
+        agent._touch_activity = (
+            lambda desc, **kwargs: touch_calls.append(
+                (desc, kwargs.get("meaningful", False))
+            )
+        )
 
         response = agent._interruptible_streaming_api_call({})
 
@@ -230,6 +242,14 @@ class TestStreamingAccumulator:
         assert tc[0].id == "call_123"
         assert tc[0].function.name == "terminal"
         assert tc[0].function.arguments == '{"command": "ls"}'
+        assert touch_calls.count(
+            ("receiving tool call arguments", True)
+        ) == 2
+        assert all(
+            meaningful is False
+            for desc, meaningful in touch_calls
+            if desc == "receiving stream response"
+        )
 
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
@@ -467,11 +487,17 @@ class TestStreamingCallbacks:
         agent._interrupt_requested = False
 
         touch_calls = []
-        agent._touch_activity = lambda desc: touch_calls.append(desc)
+        agent._touch_activity = (
+            lambda desc, **kwargs: touch_calls.append(
+                (desc, kwargs.get("meaningful", True))
+            )
+        )
 
         agent._interruptible_streaming_api_call({})
 
-        assert touch_calls.count("receiving stream response") == len(chunks)
+        assert touch_calls.count(
+            ("receiving stream response", False)
+        ) == len(chunks)
 
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
@@ -1034,7 +1060,11 @@ class TestCodexStreamCallbacks:
         agent._interrupt_requested = False
 
         touch_calls = []
-        agent._touch_activity = lambda desc: touch_calls.append(desc)
+        agent._touch_activity = (
+            lambda desc, **kwargs: touch_calls.append(
+                (desc, kwargs.get("meaningful", False))
+            )
+        )
 
         events = [
             SimpleNamespace(type="response.output_text.delta", delta="Hello"),
@@ -1056,7 +1086,82 @@ class TestCodexStreamCallbacks:
 
         agent._run_codex_stream({}, client=mock_client)
 
-        assert touch_calls.count("receiving stream response") == 3
+        assert touch_calls.count(
+            ("receiving stream response", False)
+        ) == 3
+
+    def test_codex_function_argument_deltas_are_meaningful_progress(self):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "codex_responses"
+        agent._interrupt_requested = False
+
+        touch_calls = []
+        agent._touch_activity = (
+            lambda desc, **kwargs: touch_calls.append(
+                (desc, kwargs.get("meaningful", False))
+            )
+        )
+        events = [
+            SimpleNamespace(
+                type="response.output_item.added",
+                item=SimpleNamespace(
+                    type="function_call", name="terminal"
+                ),
+            ),
+            SimpleNamespace(
+                type="response.function_call_arguments.delta",
+                delta='{"command":',
+            ),
+            SimpleNamespace(
+                type="response.function_call_arguments.delta",
+                delta='"ls"}',
+            ),
+            SimpleNamespace(
+                type="response.output_item.done",
+                item=SimpleNamespace(
+                    type="function_call",
+                    name="terminal",
+                    arguments='{"command":"ls"}',
+                ),
+            ),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(
+                    status="completed", id="r-tools", usage=None
+                ),
+            ),
+        ]
+
+        class _FakeCreateStream:
+            def __iter__(self_inner):
+                return iter(events)
+
+            def close(self_inner):
+                return None
+
+        mock_client = MagicMock()
+        mock_client.responses.create.return_value = _FakeCreateStream()
+
+        agent._run_codex_stream({}, client=mock_client)
+
+        assert touch_calls.count(
+            ("receiving stream response", False)
+        ) == len(events)
+        assert touch_calls.count(
+            ("receiving tool call: terminal", True)
+        ) == 1
+        assert touch_calls.count(
+            ("receiving tool call arguments", True)
+        ) == 2
 
     def test_codex_remote_protocol_error_retries_then_raises(self):
         """Transport errors from ``responses.create`` retry once then re-raise.
@@ -1112,7 +1217,11 @@ class TestCodexStreamCallbacks:
         agent.api_mode = "codex_responses"
 
         touch_calls = []
-        agent._touch_activity = lambda desc: touch_calls.append(desc)
+        agent._touch_activity = (
+            lambda desc, **kwargs: touch_calls.append(
+                (desc, kwargs.get("meaningful", False))
+            )
+        )
 
         events = [
             SimpleNamespace(type="response.output_text.delta", delta="Hello"),
@@ -1145,7 +1254,9 @@ class TestCodexStreamCallbacks:
             client=mock_client,
         )
 
-        assert touch_calls.count("receiving stream response") == len(events)
+        assert touch_calls.count(
+            ("receiving stream response", False)
+        ) == len(events)
 
 
 class TestAnthropicStreamCallbacks:
@@ -1166,7 +1277,11 @@ class TestAnthropicStreamCallbacks:
         agent._interrupt_requested = False
 
         touch_calls = []
-        agent._touch_activity = lambda desc: touch_calls.append(desc)
+        agent._touch_activity = (
+            lambda desc, **kwargs: touch_calls.append(
+                (desc, kwargs.get("meaningful", True))
+            )
+        )
 
         events = [
             SimpleNamespace(
@@ -1180,6 +1295,18 @@ class TestAnthropicStreamCallbacks:
             SimpleNamespace(
                 type="content_block_start",
                 content_block=SimpleNamespace(type="tool_use", name="terminal"),
+            ),
+            SimpleNamespace(
+                type="content_block_delta",
+                delta=SimpleNamespace(
+                    type="input_json_delta", partial_json='{"command":'
+                ),
+            ),
+            SimpleNamespace(
+                type="content_block_delta",
+                delta=SimpleNamespace(
+                    type="input_json_delta", partial_json='"ls"}'
+                ),
             ),
         ]
 
@@ -1202,7 +1329,12 @@ class TestAnthropicStreamCallbacks:
 
         agent._interruptible_streaming_api_call({})
 
-        assert touch_calls.count("receiving stream response") == len(events)
+        assert touch_calls.count(
+            ("receiving stream response", False)
+        ) == len(events)
+        assert touch_calls.count(
+            ("receiving tool call arguments", True)
+        ) == 2
 
     @patch("run_agent.AIAgent._rebuild_anthropic_client")
     @patch("run_agent.AIAgent._replace_primary_openai_client")
@@ -2016,14 +2148,16 @@ def test_on_event_fires_per_bedrock_event():
         {"messageStop": {"stopReason": "end_turn"}},
         {"metadata": {"usage": {"inputTokens": 1, "outputTokens": 1}}},
     ]
-    calls = {"n": 0}
+    calls = {"n": 0, "tool_deltas": []}
 
     stream_converse_with_callbacks(
         {"stream": iter(events)},
         on_event=lambda: calls.__setitem__("n", calls["n"] + 1),
+        on_tool_delta=calls["tool_deltas"].append,
     )
 
     assert calls["n"] == len(events)
+    assert calls["tool_deltas"] == ["{}"]
 
 
 def test_on_event_exception_is_swallowed():

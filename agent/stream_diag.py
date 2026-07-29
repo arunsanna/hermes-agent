@@ -264,7 +264,8 @@ def emit_stream_drop(
         )
         agent._touch_activity(
             f"stream retry {attempt}/{max_attempts} "
-            f"after {type(error).__name__}"
+            f"after {type(error).__name__}",
+            meaningful=False,
         )
     except Exception:
         pass

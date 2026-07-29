@@ -44,7 +44,13 @@ from hermes_state import SessionDB
 @pytest.fixture()
 def mock_manager():
     """SessionManager with a mock agent factory."""
-    return SessionManager(agent_factory=lambda: MagicMock(name="MockAIAgent"))
+    def _agent_factory():
+        agent = MagicMock(name="MockAIAgent")
+        agent._required_delegation_launching = False
+        agent._has_unconsumed_required_delegations.return_value = False
+        return agent
+
+    return SessionManager(agent_factory=_agent_factory)
 
 
 @pytest.fixture()
@@ -1316,8 +1322,8 @@ class TestPrompt:
         mock_title.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_prompt_keeps_real_final_response_on_cancelled_turn(self, agent):
-        """A cancel flag must not suppress actual assistant/model text."""
+    async def test_prompt_suppresses_final_response_when_cancel_wins(self, agent):
+        """STOP is authoritative until the final ACP message is delivered."""
         new_resp = await agent.new_session(cwd=".")
         state = agent.session_manager.get_session(new_resp.session_id)
         final_text = "The actual model answer arrived before cancellation settled."
@@ -1349,7 +1355,8 @@ class TestPrompt:
             if update.session_update == "agent_message_chunk"
         ]
         assert resp.stop_reason == "cancelled"
-        assert final_text in agent_texts
+        assert final_text not in agent_texts
+        assert agent_texts == []
 
     @pytest.mark.asyncio
     async def test_prompt_propagates_hermes_session_id_env(self, agent, monkeypatch):
