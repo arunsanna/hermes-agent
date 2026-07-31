@@ -245,28 +245,43 @@ class OwnedSessions:
             self._owned.add(session_id)
 
     def check_first_bind(self, session_id: str) -> str | None:
-        """Enforce bind-on-first-load for ``session/load``/``session/resume``.
+        """Enforce bind-on-load for ``session/load``/``session/resume``.
 
         Returns ``None`` when *session_id* is allowed — either it is
-        already owned, or this is the legitimate first bind for an unbound
-        process. Returns a human-readable denial reason when spawn-time
-        pinning (``HERMES_EXPECTED_ACP_SESSION_ID``) rejects an unbound
-        process's first load, or when the process is already bound and
-        *session_id* is foreign to it.
+        already owned, or the bind is legitimate for this process's
+        topology. Returns a human-readable denial reason otherwise.
+
+        Two topologies exist. A *dedicated* process — spawned by Switchboard
+        for exactly one conversation, marked by ``HERMES_SESSION_CHAT_ID``
+        and/or ``HERMES_EXPECTED_ACP_SESSION_ID`` in its environment — may
+        bind only once: its first ``session/load``/``session/resume`` (or
+        ``session/new``) claims the process, and every later load of a
+        different id is refused. A *generic* multi-session host (Zed, Buzz —
+        one long-lived process serving several independent conversations)
+        has neither marker set; each ``session/load`` of a not-yet-owned id
+        is an additional legitimate bind. Handlers other than load/resume
+        always require prior membership regardless of topology.
         """
         if not session_id:
             return "empty session id"
+        expected = (os.environ.get("HERMES_EXPECTED_ACP_SESSION_ID") or "").strip()
+        dedicated = bool(
+            expected or (os.environ.get("HERMES_SESSION_CHAT_ID") or "").strip()
+        )
         with self._lock:
             if session_id in self._owned:
                 return None
-            already_bound = bool(self._owned)
-        if already_bound:
-            return "not owned by this process"
-        expected = (os.environ.get("HERMES_EXPECTED_ACP_SESSION_ID") or "").strip()
-        if expected and expected != session_id:
-            return f"does not match spawn-pinned session {expected!r}"
-        self.add(session_id)
-        return None
+            if self._owned:
+                if dedicated:
+                    return "not owned by this process"
+                self._owned.add(session_id)
+                return None
+            if expected and expected != session_id:
+                return f"does not match spawn-pinned session {expected!r}"
+            if self._primary_id is None:
+                self._primary_id = session_id
+            self._owned.add(session_id)
+            return None
 
 
 class SessionManager:

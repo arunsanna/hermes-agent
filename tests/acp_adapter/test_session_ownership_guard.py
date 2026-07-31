@@ -99,8 +99,8 @@ class _FakeDbWithRow:
     row already exists, written by some earlier process/turn.
     """
 
-    def __init__(self, session_id, *, model_config=None):
-        self._session_id = session_id
+    def __init__(self, session_id, *extra_ids, model_config=None):
+        self._session_ids = {session_id, *extra_ids}
         self._row = {
             "source": "acp",
             "model_config": model_config,
@@ -110,7 +110,7 @@ class _FakeDbWithRow:
         }
 
     def get_session(self, session_id):
-        if session_id == self._session_id:
+        if session_id in self._session_ids:
             return dict(self._row)
         return None
 
@@ -133,6 +133,7 @@ class _FakeDbWithRow:
 @pytest.fixture(autouse=True)
 def _clear_pin_env(monkeypatch):
     monkeypatch.delenv("HERMES_EXPECTED_ACP_SESSION_ID", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
 
 
 @pytest.fixture(autouse=True)
@@ -197,12 +198,23 @@ def test_owned_sessions_check_first_bind_allows_unpinned_first_call(monkeypatch)
     assert owned.primary_id == "some-id"
 
 
-def test_owned_sessions_check_first_bind_refuses_foreign_id_once_bound():
+def test_owned_sessions_check_first_bind_refuses_foreign_id_once_bound(monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "switchboard-chat-id")
     owned = OwnedSessions()
     owned.add("primary-id")
     denial = owned.check_first_bind("foreign-id")
     assert denial is not None
     assert not owned.is_owned("foreign-id")
+
+
+def test_owned_sessions_check_first_bind_extra_bind_allowed_for_generic_host():
+    """No Switchboard env markers → generic multi-session host: a later
+    load of a not-yet-owned id is an additional legitimate bind."""
+    owned = OwnedSessions()
+    owned.add("primary-id")
+    assert owned.check_first_bind("second-thread-id") is None
+    assert owned.is_owned("second-thread-id")
+    assert owned.primary_id == "primary-id"
 
 
 def test_owned_sessions_check_first_bind_pin_mismatch_refused(monkeypatch):
@@ -260,6 +272,41 @@ async def test_prompt_for_foreign_session_is_refused_after_bind(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_prompt_for_foreign_but_real_row_is_blocked_before_restore(monkeypatch):
+    """The production incident shape: the foreign id EXISTS in the shared
+    SessionDB (written by a sibling process). The guard must refuse before
+    ``get_session``/``_restore`` can rehydrate it into this connection.
+    """
+    foreign_id = "sibling-process-live-session"
+    db = _FakeDbWithRow(foreign_id)
+    acp_agent, manager, _fake, _conn = _make_prompt_agent(monkeypatch, db=db)
+    manager.create_session(cwd=".")
+
+    with pytest.raises(RequestError):
+        await acp_agent.prompt(
+            session_id=foreign_id,
+            prompt=[TextContentBlock(type="text", text="hello")],
+        )
+
+    assert not manager.owned_sessions.is_owned(foreign_id)
+    assert manager.peek_session(foreign_id) is None
+
+
+@pytest.mark.asyncio
+async def test_cancel_for_foreign_but_real_row_is_blocked_before_restore(monkeypatch):
+    foreign_id = "sibling-process-live-session"
+    db = _FakeDbWithRow(foreign_id)
+    acp_agent, manager, _fake, _conn = _make_prompt_agent(monkeypatch, db=db)
+    manager.create_session(cwd=".")
+
+    with pytest.raises(RequestError):
+        await acp_agent.cancel(session_id=foreign_id)
+
+    assert not manager.owned_sessions.is_owned(foreign_id)
+    assert manager.peek_session(foreign_id) is None
+
+
+@pytest.mark.asyncio
 async def test_prompt_for_owned_session_still_works_after_bind(monkeypatch):
     acp_agent, manager, _fake, _conn = _make_prompt_agent(monkeypatch)
     state = manager.create_session(cwd=".")
@@ -296,6 +343,7 @@ async def test_cancel_for_foreign_session_is_refused_after_bind(monkeypatch, cap
 
 @pytest.mark.asyncio
 async def test_load_session_for_foreign_id_is_refused_after_bind(monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "switchboard-chat-id")
     acp_agent, manager, _fake, _conn = _make_prompt_agent(monkeypatch)
     manager.create_session(cwd=".")
 
@@ -305,6 +353,7 @@ async def test_load_session_for_foreign_id_is_refused_after_bind(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_resume_session_for_foreign_id_is_refused_after_bind(monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "switchboard-chat-id")
     acp_agent, manager, _fake, _conn = _make_prompt_agent(monkeypatch)
     manager.create_session(cwd=".")
 
@@ -333,12 +382,13 @@ async def test_load_session_as_first_bind_on_fresh_process_restores_existing_ses
 
 @pytest.mark.asyncio
 async def test_load_session_for_second_different_id_refused_once_bound(monkeypatch):
-    """The FIRST session/load binds the process; a second, different id is
-    then just another foreign reference and must be refused like any other
-    protocol handler.
+    """Dedicated (Switchboard-spawned) topology: the FIRST session/load binds
+    the process; a second, different id is then just another foreign
+    reference and must be refused like any other protocol handler.
     """
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "switchboard-chat-id")
     first_id = "first-loaded-session"
-    db = _FakeDbWithRow(first_id)
+    db = _FakeDbWithRow(first_id, "a-totally-different-session")
     acp_agent, manager, _fake, _conn = _make_prompt_agent(monkeypatch, db=db)
 
     first = await acp_agent.load_session(cwd=".", session_id=first_id)
@@ -346,6 +396,28 @@ async def test_load_session_for_second_different_id_refused_once_bound(monkeypat
 
     with pytest.raises(RequestError):
         await acp_agent.load_session(cwd=".", session_id="a-totally-different-session")
+    assert not manager.owned_sessions.is_owned("a-totally-different-session")
+
+
+@pytest.mark.asyncio
+async def test_second_load_binds_additional_session_for_generic_host(monkeypatch):
+    """Generic multi-session host topology (Zed/Buzz: no Switchboard env
+    markers): one long-lived process may open additional, independent
+    conversations via session/load — each load is a legitimate extra bind.
+    """
+    first_id = "editor-thread-one"
+    second_id = "editor-thread-two"
+    db = _FakeDbWithRow(first_id, second_id)
+    acp_agent, manager, _fake, _conn = _make_prompt_agent(monkeypatch, db=db)
+
+    first = await acp_agent.load_session(cwd=".", session_id=first_id)
+    assert first is not None
+
+    second = await acp_agent.load_session(cwd=".", session_id=second_id)
+    assert second is not None
+    assert manager.owned_sessions.is_owned(first_id)
+    assert manager.owned_sessions.is_owned(second_id)
+    assert manager.owned_sessions.primary_id == first_id
 
 
 # ---------------------------------------------------------------------------
