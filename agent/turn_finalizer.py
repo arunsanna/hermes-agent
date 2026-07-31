@@ -431,7 +431,11 @@ def finalize_turn(
     # Gate: only applied when a real text response exists for this
     # turn and the user didn't interrupt.  Empty/interrupted turns
     # already have other surface text that shouldn't be augmented.
-    if final_response and not interrupted:
+    if (
+        final_response
+        and not interrupted
+        and _turn_exit_reason != "direct_tool_response"
+    ):
         try:
             _failed = getattr(agent, "_turn_failed_file_mutations", None) or {}
             if _failed and agent._file_mutation_verifier_enabled():
@@ -457,7 +461,11 @@ def finalize_turn(
     #     an empty response, the "(empty)" terminal sentinel, or a
     #     suspiciously short partial fragment with no terminating
     #     punctuation (e.g. "The").  A real short answer keeps its text.
-    if not interrupted and not required_gate_blocked:
+    if (
+        not interrupted
+        and not required_gate_blocked
+        and _turn_exit_reason != "direct_tool_response"
+    ):
         try:
             if agent._turn_completion_explainer_enabled():
                 _stripped = (final_response or "").strip()
@@ -504,7 +512,11 @@ def finalize_turn(
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can transform the LLM's output text before it's returned.
     # First hook to return a string wins; None/empty return leaves text unchanged.
-    if final_response and not interrupted:
+    if (
+        final_response
+        and not interrupted
+        and _turn_exit_reason != "direct_tool_response"
+    ):
         try:
             from hermes_cli.plugins import invoke_hook as _invoke_hook
             _transform_results = _invoke_hook(

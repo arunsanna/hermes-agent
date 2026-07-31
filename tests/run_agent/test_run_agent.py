@@ -2391,6 +2391,70 @@ class TestExecuteToolCalls:
         assert messages[0]["role"] == "tool"
         assert "search result" in messages[0]["content"]
 
+    def test_terminal_return_direct_yields_to_pending_steer(self, agent):
+        agent.valid_tool_names = {"terminal"}
+        tc = _mock_tool_call(
+            name="terminal",
+            arguments=json.dumps(
+                {
+                    "command": "usage --markdown",
+                    "return_direct": True,
+                }
+            ),
+            call_id="usage-1",
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        messages = []
+        agent.steer("Actually, show only Codex.")
+
+        with patch(
+            "run_agent.handle_function_call",
+            return_value=json.dumps(
+                {
+                    "output": "| Provider | Weekly |\n| --- | ---: |\n| Codex | 43% |",
+                    "exit_code": 0,
+                    "error": None,
+                }
+            ),
+        ):
+            result = agent._execute_tool_calls(mock_msg, messages, "task-1")
+
+        assert result is None
+        assert "Actually, show only Codex." in messages[-1]["content"]
+
+    def test_terminal_return_direct_is_disabled_for_multi_tool_batches(self, agent):
+        agent.valid_tool_names = {"terminal"}
+        tool_calls = [
+            _mock_tool_call(
+                name="terminal",
+                arguments=json.dumps(
+                    {
+                        "command": f"usage --markdown --section {section}",
+                        "return_direct": True,
+                    }
+                ),
+                call_id=f"usage-{section}",
+            )
+            for section in ("providers", "summary")
+        ]
+        mock_msg = _mock_assistant_msg(content="", tool_calls=tool_calls)
+        messages = []
+
+        with patch(
+            "run_agent.handle_function_call",
+            return_value=json.dumps(
+                {
+                    "output": "formatted output",
+                    "exit_code": 0,
+                    "error": None,
+                }
+            ),
+        ):
+            result = agent._execute_tool_calls(mock_msg, messages, "task-1")
+
+        assert result is None
+        assert len(messages) == 2
+
     def test_sequential_memory_remove_notifies_provider_with_tool_result(self, agent):
         old_text = "stale preference entry"
         tc = _mock_tool_call(
@@ -4311,6 +4375,135 @@ class TestRunConversation:
             result = agent.run_conversation("hello")
         assert result["final_response"] == "Final answer"
         assert result["completed"] is True
+
+    def test_terminal_return_direct_bypasses_model_rewrite_and_preserves_markdown(
+        self,
+        agent,
+    ):
+        self._setup_agent(agent)
+        agent.platform = "acp"
+        agent.valid_tool_names = {"terminal", "delegate_task"}
+        agent.tools = _make_tool_defs("terminal", "delegate_task")
+        interim_messages = []
+        agent.interim_assistant_callback = (
+            lambda text, **kwargs: interim_messages.append(text)
+        )
+
+        table = (
+            "| Provider | Session | Weekly |\n"
+            "| --- | ---: | ---: |\n"
+            "| Codex | 100% | 43% |\n"
+        )
+        tool_turn = _mock_response(
+            content="I will fetch that now.",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call(
+                    name="terminal",
+                    arguments=json.dumps(
+                        {
+                            "command": "usage --markdown",
+                            "return_direct": True,
+                        }
+                    ),
+                    call_id="usage-1",
+                )
+            ],
+        )
+        agent.client.chat.completions.create.return_value = tool_turn
+        invoked_hooks = []
+
+        def _invoke_hook(hook_name, **kwargs):
+            invoked_hooks.append(hook_name)
+            if hook_name == "transform_llm_output":
+                return ["flattened by hook"]
+            return []
+
+        with (
+            patch(
+                "run_agent.handle_function_call",
+                return_value=json.dumps(
+                    {
+                        "output": table,
+                        "exit_code": 0,
+                        "error": None,
+                    }
+                ),
+            ),
+            patch("hermes_cli.plugins.invoke_hook", side_effect=_invoke_hook),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("Get me my AI usage")
+
+        assert agent.client.chat.completions.create.call_count == 1
+        assert result["api_calls"] == 1
+        assert result["completed"] is True
+        assert result["turn_exit_reason"] == "direct_tool_response"
+        assert result["final_response"] == table
+        assert result["response_transformed"] is False
+        assert "transform_llm_output" not in invoked_hooks
+        assert interim_messages == []
+        assert result["messages"][-1]["role"] == "assistant"
+        assert result["messages"][-1]["content"] == table
+
+    def test_terminal_return_direct_failure_uses_normal_model_follow_up(
+        self,
+        agent,
+    ):
+        self._setup_agent(agent)
+        agent.platform = "acp"
+        agent.valid_tool_names = {"terminal", "delegate_task"}
+        agent.tools = _make_tool_defs("terminal", "delegate_task")
+        tool_turn = _mock_response(
+            content="Checking now.",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call(
+                    name="terminal",
+                    arguments=json.dumps(
+                        {
+                            "command": "usage --markdown",
+                            "return_direct": True,
+                        }
+                    ),
+                    call_id="usage-1",
+                )
+            ],
+        )
+        normal_follow_up = _mock_response(
+            content="The usage command failed; no report was returned.",
+            finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [
+            tool_turn,
+            normal_follow_up,
+        ]
+
+        with (
+            patch(
+                "run_agent.handle_function_call",
+                return_value=json.dumps(
+                    {
+                        "output": "",
+                        "exit_code": 1,
+                        "error": "usage command failed",
+                    }
+                ),
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("Get me my AI usage")
+
+        assert agent.client.chat.completions.create.call_count == 2
+        assert result["turn_exit_reason"].startswith("text_response")
+        assert (
+            result["final_response"]
+            == "The usage command failed; no report was returned."
+        )
 
     def test_codex_content_filter_incomplete_routes_to_policy_fallback(self, agent):
         self._setup_agent(agent)

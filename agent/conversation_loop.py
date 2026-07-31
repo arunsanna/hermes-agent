@@ -5205,6 +5205,30 @@ def run_conversation(
                         for tc in assistant_message.tool_calls
                     )
                 )
+                _direct_output_requested = False
+                if len(assistant_message.tool_calls) == 1:
+                    _direct_call = assistant_message.tool_calls[0]
+                    try:
+                        from agent.tool_executor import (
+                            _parse_tool_arguments,
+                            terminal_direct_output_requested,
+                        )
+
+                        _direct_args, _direct_args_error = _parse_tool_arguments(
+                            _direct_call.function.arguments
+                        )
+                        _direct_output_requested = (
+                            _direct_args_error is None
+                            and terminal_direct_output_requested(
+                                _direct_call.function.name,
+                                _direct_args,
+                            )
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Direct terminal-output classification failed",
+                            exc_info=True,
+                        )
                 if _required_launch:
                     # Close every visible sink before interim narration or
                     # persistence. The dispatch handler replaces this latch
@@ -5213,6 +5237,7 @@ def run_conversation(
                 agent._finish_acp_provisional_stream(
                     discard=(
                         _required_launch
+                        or _direct_output_requested
                         or agent._has_unconsumed_required_delegations()
                     )
                 )
@@ -5526,7 +5551,7 @@ def run_conversation(
                     and previous_interim_visible == current_interim_visible
                 )
                 messages.append(assistant_msg)
-                if not duplicate_previous_interim:
+                if not duplicate_previous_interim and not _direct_output_requested:
                     agent._emit_interim_assistant_message(assistant_msg)
 
                 # Mixed batch: error-result the invalid calls and strip them
@@ -5575,7 +5600,12 @@ def run_conversation(
                     except Exception:
                         pass
 
-                agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+                direct_tool_response = agent._execute_tool_calls(
+                    assistant_message,
+                    messages,
+                    effective_task_id,
+                    api_call_count,
+                )
 
                 # Nonblocking integrity pass: consume any required result that
                 # became terminal during this tool batch, but keep pending work
@@ -5677,6 +5707,13 @@ def run_conversation(
                                 agent.stream_delta_callback(None)
                             except Exception:
                                 pass
+                    break
+
+                if direct_tool_response is not None:
+                    final_response = direct_tool_response
+                    _turn_exit_reason = "direct_tool_response"
+                    agent._mute_post_response = False
+                    agent._finish_acp_provisional_stream(discard=True)
                     break
 
                 # Reset per-turn retry counters after successful tool
