@@ -3581,6 +3581,11 @@ TERMINAL_SCHEMA = {
                 "description": "Run in pseudo-terminal (PTY) mode for interactive CLI tools like Codex, Claude Code, or Python REPL. Only works with local and SSH backends. Default: false.",
                 "default": False
             },
+            "return_direct": {
+                "type": "boolean",
+                "description": "Return successful stdout as the complete user-facing answer without asking the model to rewrite it. Use only when a foreground, non-PTY command already emits the final answer in the exact required format (for example a deterministic Markdown report). Ignored for background/PTY commands, failures, empty output, or multi-tool turns.",
+                "default": False
+            },
             "notify_on_complete": {
                 "type": "boolean",
                 "description": "With background=true: get exactly one notification when the process exits. The right choice for nearly every bounded long task — set it and keep working. MUTUALLY EXCLUSIVE with watch_patterns (watch_patterns is dropped when both are set).",
