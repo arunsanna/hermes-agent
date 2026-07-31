@@ -272,6 +272,7 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
         messages.append({"role": "user", "content": text})
 
     agent._current_streamed_assistant_text = ""
+    agent._stream_visible_text_started = False
     agent._stream_needs_break = True
 
 

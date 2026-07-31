@@ -988,6 +988,11 @@ def init_agent(
     # commentary when the provider later returns it as a completed interim
     # assistant message.
     agent._current_streamed_assistant_text = ""
+    # Whether any visible delta has been emitted for the current model
+    # response. Gates the stream-start leading-newline strip independently of
+    # _current_streamed_assistant_text, which ACP provisional buffering leaves
+    # empty for the entire stream.
+    agent._stream_visible_text_started = False
     # Completed interim messages delivered during the current user turn.
     # Unlike token-stream tracking, this spans Codex continuation/tool calls so
     # repeated commentary is not re-sent before normalization can deduplicate it.

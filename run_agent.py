@@ -6361,6 +6361,7 @@ class AIAgent:
             # attempt may be replayed if a later attempt classifies ordinary.
             self._acp_provisional_stream_buffer = []
         self._current_streamed_assistant_text = ""
+        self._stream_visible_text_started = False
 
     def _record_streamed_assistant_text(self, text: str) -> None:
         """Accumulate visible assistant text emitted through stream callbacks."""
@@ -6712,13 +6713,22 @@ class AIAgent:
             else:
                 # Defensive: legacy callers without the scrubber attribute.
                 text = sanitize_context(text)
-            # Only strip leading newlines on the first delta — mid-stream "\n" is legitimate markdown.
-            if not prepended_break and not getattr(
-                self, "_current_streamed_assistant_text", ""
+            # Only strip leading newlines before the first visible delta —
+            # mid-stream "\n" is legitimate markdown. The accumulator check
+            # alone cannot detect "first": ACP provisional buffering returns
+            # before _record_streamed_assistant_text, so the accumulator stays
+            # empty for the whole stream and every standalone "\n" delta
+            # (vLLM/Qwen token shape) would be stripped to nothing — collapsing
+            # markdown tables into one run-on line on every client.
+            if (
+                not prepended_break
+                and not getattr(self, "_stream_visible_text_started", False)
+                and not getattr(self, "_current_streamed_assistant_text", "")
             ):
                 text = text.lstrip("\n")
         if not text:
             return
+        self._stream_visible_text_started = True
         self._deliver_scrubbed_stream_delta(text)
 
     def _deliver_scrubbed_stream_delta(self, text: str) -> None:
@@ -6763,6 +6773,14 @@ class AIAgent:
         self._acp_provisional_stream_active = False
         self._acp_provisional_stream_buffer = []
         if discard:
+            # Nothing buffered ever reached a client, so re-derive the
+            # visible-text flag from actually-delivered text. Otherwise a
+            # discarded attempt (e.g. a final-response candidate racing a
+            # required delegation) leaves the flag stuck True and the retried
+            # response's stream-start leading-newline strip never re-arms.
+            self._stream_visible_text_started = bool(
+                getattr(self, "_current_streamed_assistant_text", "")
+            )
             return
         for entry in buffered:
             # Accept legacy plain-text entries defensively for callers that
