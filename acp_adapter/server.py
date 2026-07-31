@@ -99,6 +99,12 @@ from tools.approval import (
 
 logger = logging.getLogger(__name__)
 
+# JSON-RPC 2.0 reserves -32000..-32099 for implementation-defined server
+# errors (acp.exceptions.RequestError already uses -32000 for auth_required
+# and -32002 for resource_not_found). This is the cross-session ownership
+# guard's own code in that same reserved band.
+_CROSS_SESSION_GUARD_ERROR_CODE = -32001
+
 
 def _named_custom_provider_catalogs() -> list[tuple[str, str, list[tuple[str, str]]]]:
     """Return ``(slug, label, [(model_id, description), ...])`` for named endpoints.
@@ -1909,6 +1915,60 @@ class HermesACPAgent(acp.Agent):
                     if plan_update is not None and not await _send(plan_update):
                         return
 
+    # ---- Cross-session ownership guard --------------------------------------
+
+    def _guard_owned_session(self, session_id: str, method: str) -> None:
+        """Refuse *session_id* unless it belongs to this process's owned set.
+
+        Applies to every protocol handler that takes a client-supplied
+        ``session_id`` for an operation other than binding. ``session/new``
+        never reaches this (it mints its own id); ``session/load`` and
+        ``session/resume`` use :meth:`_guard_first_bind` instead, since
+        those two are the legitimate ways an unbound process binds to an
+        existing id in the first place.
+        """
+        owned = self.session_manager.owned_sessions
+        if owned.is_owned(session_id):
+            return
+        primary = owned.primary_id
+        logger.warning(
+            "cross-session guard: refused %s for session %s; process owns %s",
+            method,
+            session_id,
+            primary,
+        )
+        raise acp.RequestError(
+            _CROSS_SESSION_GUARD_ERROR_CODE,
+            f"session {session_id} is not owned by this process",
+            {"session_id": session_id, "owned_primary": primary, "method": method},
+        )
+
+    def _guard_first_bind(self, session_id: str, method: str) -> None:
+        """Bind-on-first-load gate for ``session/load``/``session/resume``.
+
+        The first such call this process handles binds it to *session_id*
+        (subject to ``HERMES_EXPECTED_ACP_SESSION_ID`` spawn-time pinning —
+        see :meth:`OwnedSessions.check_first_bind`). Once bound, later
+        calls to either method fall through to the same ownership check as
+        every other protocol handler.
+        """
+        owned = self.session_manager.owned_sessions
+        denial = owned.check_first_bind(session_id)
+        if denial is None:
+            return
+        primary = owned.primary_id
+        logger.warning(
+            "cross-session guard: refused %s for session %s; process owns %s",
+            method,
+            session_id,
+            primary,
+        )
+        raise acp.RequestError(
+            _CROSS_SESSION_GUARD_ERROR_CODE,
+            f"session {session_id} refused: {denial}",
+            {"session_id": session_id, "owned_primary": primary, "method": method},
+        )
+
     async def new_session(
         self,
         cwd: str,
@@ -1937,6 +1997,7 @@ class HermesACPAgent(acp.Agent):
         mcp_servers: list | None = None,
         **kwargs: Any,
     ) -> LoadSessionResponse | None:
+        self._guard_first_bind(session_id, "session/load")
         state = self.session_manager.update_cwd(session_id, cwd)
         if state is None:
             logger.warning("load_session: session %s not found", session_id)
@@ -1985,6 +2046,7 @@ class HermesACPAgent(acp.Agent):
         mcp_servers: list | None = None,
         **kwargs: Any,
     ) -> ResumeSessionResponse:
+        self._guard_first_bind(session_id, "session/resume")
         state = self.session_manager.update_cwd(session_id, cwd)
         if state is None:
             logger.warning("resume_session: session %s not found, creating new", session_id)
@@ -2015,6 +2077,7 @@ class HermesACPAgent(acp.Agent):
         )
 
     async def cancel(self, session_id: str, **kwargs: Any) -> None:
+        self._guard_owned_session(session_id, "session/cancel")
         state = self.session_manager.get_session(session_id)
         if state and state.cancel_event:
             async with state.turn_terminal_lock:
@@ -2062,6 +2125,7 @@ class HermesACPAgent(acp.Agent):
         mcp_servers: list | None = None,
         **kwargs: Any,
     ) -> ForkSessionResponse:
+        self._guard_owned_session(session_id, "session/fork")
         state = self.session_manager.fork_session(session_id, cwd=cwd)
         new_id = state.session_id if state else ""
         if state is not None:
@@ -2135,6 +2199,7 @@ class HermesACPAgent(acp.Agent):
         **kwargs: Any,
     ) -> PromptResponse:
         """Run Hermes on the user's prompt and stream events back to the editor."""
+        self._guard_owned_session(session_id, "session/prompt")
         try:
             state = self.session_manager.get_session(session_id)
         except UnsafeSessionTranscriptError as exc:
@@ -3619,6 +3684,7 @@ class HermesACPAgent(acp.Agent):
         self, model_id: str, session_id: str, **kwargs: Any
     ) -> SetSessionModelResponse | None:
         """Switch the model for a session (called by ACP protocol)."""
+        self._guard_owned_session(session_id, "session/set_model")
         state = self.session_manager.get_session(session_id)
         if state:
             current_provider = getattr(state.agent, "provider", None)
@@ -3652,6 +3718,7 @@ class HermesACPAgent(acp.Agent):
         self, mode_id: str, session_id: str, **kwargs: Any
     ) -> SetSessionModeResponse | None:
         """Persist the editor-requested mode so ACP clients do not fail on mode switches."""
+        self._guard_owned_session(session_id, "session/set_mode")
         state = self.session_manager.get_session(session_id)
         if state is None:
             logger.warning("Session %s: mode switch requested for missing session", session_id)
@@ -3668,6 +3735,7 @@ class HermesACPAgent(acp.Agent):
         self, config_id: str, session_id: str, value: str, **kwargs: Any
     ) -> SetSessionConfigOptionResponse | None:
         """Accept ACP config option updates even when Hermes has no typed ACP config surface yet."""
+        self._guard_owned_session(session_id, "session/set_config_option")
         state = self.session_manager.get_session(session_id)
         if state is None:
             logger.warning("Session %s: config update requested for missing session", session_id)

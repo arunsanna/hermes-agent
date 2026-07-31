@@ -192,6 +192,83 @@ class SessionState:
     transcript_correction_poison_persisted: bool | None = None
 
 
+class OwnedSessions:
+    """Tracks which ACP session ids THIS process may legitimately serve.
+
+    Every hermes-acp process serving Switchboard can share one on-disk
+    SessionDB (``~/.hermes/state.db``) with sibling processes, each serving
+    an unrelated Switchboard/editor session (see ``get_hermes_home``).
+    Without this gate, ``SessionManager.get_session`` happily restores ANY
+    session id that happens to exist in that shared database — even one
+    live in a DIFFERENT process's connection right now — letting output
+    leak across sessions (#delegation-cross-session-leak, 2026-07-25).
+
+    The first ``session/new`` or ``session/load``/``session/resume`` this
+    process handles establishes its *primary* id (see :meth:`add` and
+    :meth:`check_first_bind`). Every id this process creates afterwards —
+    a fork, or any other in-process session creation — joins the owned set
+    automatically. Every other ACP protocol entry point that takes a
+    client-supplied ``session_id`` must be a member of the set or be
+    refused; see the ``_guard_owned_session`` / ``_guard_first_bind``
+    helpers on ``HermesACPAgent`` for where that refusal happens.
+    """
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._owned: set[str] = set()
+        self._primary_id: str | None = None
+
+    @property
+    def primary_id(self) -> str | None:
+        with self._lock:
+            return self._primary_id
+
+    def is_owned(self, session_id: str) -> bool:
+        """Return True if *session_id* belongs to this process's owned set."""
+        if not session_id:
+            return False
+        with self._lock:
+            return session_id in self._owned
+
+    def add(self, session_id: str) -> None:
+        """Record *session_id* as owned (in-process creation: new/fork/etc.).
+
+        The first id ever added becomes the process's primary id. This is
+        never refused — the id was minted or explicitly bound by this
+        process itself, so there is nothing foreign to guard against.
+        """
+        if not session_id:
+            return
+        with self._lock:
+            if self._primary_id is None:
+                self._primary_id = session_id
+            self._owned.add(session_id)
+
+    def check_first_bind(self, session_id: str) -> str | None:
+        """Enforce bind-on-first-load for ``session/load``/``session/resume``.
+
+        Returns ``None`` when *session_id* is allowed — either it is
+        already owned, or this is the legitimate first bind for an unbound
+        process. Returns a human-readable denial reason when spawn-time
+        pinning (``HERMES_EXPECTED_ACP_SESSION_ID``) rejects an unbound
+        process's first load, or when the process is already bound and
+        *session_id* is foreign to it.
+        """
+        if not session_id:
+            return "empty session id"
+        with self._lock:
+            if session_id in self._owned:
+                return None
+            already_bound = bool(self._owned)
+        if already_bound:
+            return "not owned by this process"
+        expected = (os.environ.get("HERMES_EXPECTED_ACP_SESSION_ID") or "").strip()
+        if expected and expected != session_id:
+            return f"does not match spawn-pinned session {expected!r}"
+        self.add(session_id)
+        return None
+
+
 class SessionManager:
     """Thread-safe manager for ACP sessions backed by Hermes AIAgent instances.
 
@@ -213,6 +290,12 @@ class SessionManager:
         self._lock = Lock()
         self._agent_factory = agent_factory
         self._db_instance = db  # None → lazy-init on first use
+        self._owned_sessions = OwnedSessions()
+
+    @property
+    def owned_sessions(self) -> OwnedSessions:
+        """This process's session-ownership gate (see :class:`OwnedSessions`)."""
+        return self._owned_sessions
 
     # ---- public API ---------------------------------------------------------
 
@@ -232,6 +315,7 @@ class SessionManager:
         )
         with self._lock:
             self._sessions[session_id] = state
+        self._owned_sessions.add(session_id)
         _register_task_cwd(session_id, cwd)
         self._persist(state)
         logger.info("Created ACP session %s (cwd=%s)", session_id, cwd)
@@ -305,6 +389,7 @@ class SessionManager:
         )
         with self._lock:
             self._sessions[new_id] = state
+        self._owned_sessions.add(new_id)
         _register_task_cwd(new_id, cwd)
         self._persist(state)
         logger.info("Forked ACP session %s -> %s", session_id, new_id)
