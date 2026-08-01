@@ -479,6 +479,8 @@ def note_turn_start(agent, turn_id: str):
     prev_started = getattr(agent, "_inflight_turn_started", 0.0)
     agent._inflight_turn_id = turn_id
     agent._inflight_turn_started = time.time()
+    # New turn, fresh time budget: the check-in nudge may fire once per turn.
+    agent._turn_checkin_fired = False
     overlap = None
     if prev and prev != turn_id:
         logger.warning(

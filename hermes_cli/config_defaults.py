@@ -30,6 +30,11 @@ DEFAULT_CONFIG = {
     "max_live_sessions": 16,
     "agent": {
         "max_turns": 500,
+        # Turn time budget (minutes) before the model is nudged to pause,
+        # summarize progress, and ask the user whether to continue. The
+        # nudge fires once per turn at the next tool-round boundary; the
+        # user's reply resumes as an ordinary next turn. 0 disables.
+        "turn_checkin_minutes": 15,
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has

@@ -1271,6 +1271,78 @@ def _sanitize_required_assistant_candidate(
             assistant_msg.pop("anthropic_content_blocks", None)
 
 
+def _turn_checkin_minutes(agent) -> float:
+    """Turn time budget in minutes before the check-in nudge; <= 0 disables.
+
+    Config key: ``agent.turn_checkin_minutes`` (default 15). Read directly
+    from config (delegation-tool pattern) rather than plumbed through the
+    AIAgent constructor; consulted at most a handful of times per turn.
+    """
+    del agent  # reserved for per-agent overrides
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        agent_cfg = cfg.get("agent") if isinstance(cfg, dict) else None
+        if isinstance(agent_cfg, dict):
+            return float(agent_cfg.get("turn_checkin_minutes", 15.0))
+    except Exception:
+        pass
+    return 15.0
+
+
+_TURN_CHECKIN_NOTICE = (
+    "\n\n[TURN TIME BUDGET] This turn has been running for over "
+    "{minutes:.0f} minutes. Stop investigating NOW. In your next reply: "
+    "(1) summarize what you have done and found so far, (2) state what "
+    "remains or what you would do next, (3) ask the user whether to "
+    "continue. Do not call more tools in this reply unless one final call "
+    "is required to conclude safely — the user will answer (for example "
+    "'continue') to resume where you left off."
+)
+
+
+def _maybe_request_turn_checkin(agent, messages) -> None:
+    """After the turn time budget elapses, nudge the model once to pause.
+
+    The nudge piggybacks on the LAST tool-role message — the same mechanism
+    the /steer drain uses — so provider role alternation is preserved. The
+    model's check-in reply is then a normal final message (``end_turn`` on
+    the wire): no new stop reasons, no finalizer branches, and the user's
+    reply resumes as an ordinary next turn with full history. If no tool
+    message exists yet the nudge stays pending for a later iteration; a
+    tool-free turn ends on its own with the model's first reply anyway.
+    """
+    if getattr(agent, "_turn_checkin_fired", False):
+        return
+    minutes = _turn_checkin_minutes(agent)
+    if minutes <= 0:
+        return
+    started = float(getattr(agent, "_inflight_turn_started", 0.0) or 0.0)
+    if not started or (time.time() - started) < minutes * 60.0:
+        return
+    notice = _TURN_CHECKIN_NOTICE.format(minutes=minutes)
+    for idx in range(len(messages) - 1, -1, -1):
+        message = messages[idx]
+        if not (isinstance(message, dict) and message.get("role") == "tool"):
+            continue
+        existing = message.get("content", "")
+        if isinstance(existing, str):
+            message["content"] = existing + notice
+        else:
+            try:
+                blocks = list(existing) if existing else []
+                blocks.append({"type": "text", "text": notice})
+                message["content"] = blocks
+            except Exception:
+                return
+        agent._turn_checkin_fired = True
+        logger.info(
+            "turn check-in nudge injected after %.0f minutes", minutes
+        )
+        return
+
+
 def _clear_orphaned_required_launch(agent) -> None:
     """Clear a response-local latch only when no controller record owns it."""
     if not getattr(agent, "_required_delegation_launching", False):
@@ -1984,6 +2056,12 @@ def run_conversation(
                 agent._safe_print("\n⚡ Breaking out of tool loop due to interrupt...")
             break
         
+        # Turn time budget: after agent.turn_checkin_minutes of this turn,
+        # nudge the model once to pause, summarize, and ask whether to
+        # continue instead of silently burning tokens for however long the
+        # investigation takes.
+        _maybe_request_turn_checkin(agent, messages)
+
         api_call_count += 1
         agent._api_call_count = api_call_count
         agent._touch_activity(
