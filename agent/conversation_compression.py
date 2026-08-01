@@ -2258,6 +2258,13 @@ def compress_context(
     except Exception:
         pass
 
+    # Attempt-start timestamp for the compression telemetry call sites below.
+    # Restored after merge c71b9a28e kept upstream's `started_at=` usages
+    # (356ff9903) but dropped this assignment in conflict resolution, which
+    # made every compression attempt die with a NameError. Assigned before
+    # any branch so every telemetry site can see it.
+    _attempt_started_at = time.monotonic()
+
     # Codex app-server sessions: the codex agent owns the real thread context;
     # Hermes' summarizer would only rewrite a local mirror without shrinking
     # the actual thread (#36801). Route compaction to the app server's own
