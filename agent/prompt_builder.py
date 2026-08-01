@@ -394,7 +394,14 @@ PARALLEL_TOOL_CALL_GUIDANCE = (
     "the whole conversation on every extra round-trip.\n"
     "Only serialize calls when a later call genuinely depends on an earlier "
     "call's result (e.g. you must read a file before you can patch it). When "
-    "in doubt and the calls are independent, batch them."
+    "in doubt and the calls are independent, batch them.\n"
+    "Escalate to delegate_task when parallelism needs judgment, not just "
+    "calls: if each independent source requires its own multi-step "
+    "investigation (browse, extract, compare) before results can be judged, "
+    "dispatch one delegate_task call with a `tasks` array — one task per "
+    "source — so each source gets isolated reasoning, then synthesize the "
+    "returned summaries. Batched direct calls are for one-shot lookups; "
+    "delegate_task `tasks` is for parallel investigations."
 )
 
 # OpenAI GPT/Codex-specific execution guidance.  Addresses known failure modes
