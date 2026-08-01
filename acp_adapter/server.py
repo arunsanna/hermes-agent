@@ -99,6 +99,38 @@ from tools.approval import (
 
 logger = logging.getLogger(__name__)
 
+_TURN_KEEPALIVE_INTERVAL_DEFAULT = 45.0
+_TURN_KEEPALIVE_MAX_SILENT_DEFAULT = 1800.0
+
+
+def _turn_keepalive_settings() -> tuple[float, float]:
+    """(interval_seconds, max_silent_seconds) for the in-turn ACP keepalive.
+
+    interval <= 0 disables the keepalive entirely. max_silent bounds how long
+    the loop will vouch for an agent that shows no internal liveness touches;
+    past it the loop goes quiet so the gateway stall watchdog can reclaim a
+    genuinely wedged turn. Config keys (config.yaml):
+    ``acp.turn_keepalive_interval_seconds`` and
+    ``acp.turn_keepalive_max_silent_seconds``.
+    """
+    interval = _TURN_KEEPALIVE_INTERVAL_DEFAULT
+    max_silent = _TURN_KEEPALIVE_MAX_SILENT_DEFAULT
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        acp_cfg = cfg.get("acp") if isinstance(cfg, dict) else None
+        if isinstance(acp_cfg, dict):
+            interval = float(
+                acp_cfg.get("turn_keepalive_interval_seconds", interval)
+            )
+            max_silent = float(
+                acp_cfg.get("turn_keepalive_max_silent_seconds", max_silent)
+            )
+    except Exception:
+        pass
+    return interval, max_silent
+
 # JSON-RPC 2.0 reserves -32000..-32099 for implementation-defined server
 # errors (acp.exceptions.RequestError already uses -32000 for auth_required
 # and -32002 for resource_not_found). This is the cross-session ownership
@@ -1375,6 +1407,56 @@ class HermesACPAgent(acp.Agent):
                 exc_info=True,
             )
 
+    async def _turn_keepalive_loop(self, state: SessionState) -> None:
+        """Feed the gateway's turn-stall watchdog during long SILENT work.
+
+        The Switchboard gateway force-closes a turn after
+        HERMES_TURN_STALL_SECS (default 300s) with zero ``session/update``
+        frames, but several healthy operations are wire-silent far longer:
+        blocking LLM calls (reasoning TTFB floors reach 600s), MCP tools
+        (300s default timeout), the compression summarizer (300s floor), and
+        long single tool runs. None of them emit progress frames while they
+        block, so the watchdog killed genuinely working turns at 5 minutes.
+
+        This loop emits a schema-valid ``usage_update`` at a bounded rate
+        while the agent still shows internal liveness
+        (``agent._last_activity_ts``). usage_update is deliberate: the
+        gateway treats it as non-content-bearing bookkeeping (resets the
+        watchdog, opens no turn, renders nothing), and it keeps the client's
+        context gauge fresh as a side benefit.
+
+        Wedge detection stays intact: once the agent has recorded no
+        liveness touch for ``max_silent`` seconds (default 30 min) the loop
+        goes quiet — without unblocking — so a truly hung turn is still
+        reclaimed by the gateway one stall window later. STOP-driven
+        interrupt escalation is unaffected either way.
+        """
+        interval, max_silent = _turn_keepalive_settings()
+        if interval <= 0:
+            return
+        agent = getattr(state, "agent", None)
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                if not state.is_running:
+                    return
+                last = (
+                    float(getattr(agent, "_last_activity_ts", 0.0) or 0.0)
+                    if agent is not None
+                    else 0.0
+                )
+                if last and (time.time() - last) > max_silent:
+                    continue
+                await self._send_usage_update(state)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug(
+                "turn keepalive loop for session %s exited",
+                getattr(state, "session_id", "?"),
+                exc_info=True,
+            )
+
     def _provenance_meta(
         self,
         acp_session_id: str,
@@ -2366,6 +2448,15 @@ class HermesACPAgent(acp.Agent):
                 )
                 await self._conn.session_update(session_id, update)
             return PromptResponse(stop_reason="end_turn")
+        # Turn claimed (not queued): keep the gateway stall watchdog fed while
+        # silent-but-healthy work runs. Self-terminates when is_running drops,
+        # so every return path is covered even without an explicit cancel.
+        keepalive_task: asyncio.Task | None = None
+        if queued_depth is None:
+            keepalive_task = asyncio.create_task(
+                self._turn_keepalive_loop(state)
+            )
+
         if queued_depth is not None:
             if self._conn:
                 update = acp.update_agent_message_text(
@@ -3305,6 +3396,9 @@ class HermesACPAgent(acp.Agent):
             with state.runtime_lock:
                 state.is_running = False
                 state.current_prompt_text = ""
+
+            if keepalive_task is not None:
+                keepalive_task.cancel()
 
             await self._drain_queued_prompts(state, session_id, conn)
 
