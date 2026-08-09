@@ -410,6 +410,20 @@ class _StreamErrorEvent(Exception):
         }
 
 
+def _run_required_interrupt_off_thread(interrupt_fn, agent) -> None:
+    """Cancel an agent's required delegations without blocking the caller.
+
+    Runs on a daemon thread so ``AIAgent.interrupt()`` — which ACP calls while
+    holding ``state.runtime_lock`` — never waits on child terminal callbacks.
+    Swallows everything: a failed cancellation must not surface on, or kill,
+    the interrupt path.
+    """
+    try:
+        interrupt_fn(agent, reason="parent interrupted")
+    except Exception:
+        logger.debug("Failed to interrupt required delegations", exc_info=True)
+
+
 class AIAgent:
     """
     AI Agent with tool calling capabilities.
@@ -3244,10 +3258,26 @@ class AIAgent:
         # Required ACP children are detached from ``_active_children`` so the
         # parent model can inspect/cancel them while they run. Cancel them at
         # the controller boundary before propagating to attached sync children.
+        #
+        # Dispatched to a daemon thread on purpose. ACP's cancel() calls this
+        # while holding ``state.runtime_lock`` (upstream contract: the hard stop
+        # must be published before another prompt can take that lock and mistake
+        # the turn for redirectable work). Required-child cancellation runs
+        # ``child_terminal_fn`` callbacks that emit ACP session updates and
+        # contend with worker lifecycle locks, so doing it inline would hold
+        # runtime_lock — and the ACP event loop — across that work. Fire-and-
+        # forget keeps the interrupt publication O(1) while the children still
+        # get cancelled. Cancellation is idempotent and lock-win (see
+        # cancel_required), so ordering against a concurrent finalize is safe.
         try:
             from tools.async_delegation import interrupt_required_for_agent
 
-            interrupt_required_for_agent(self, reason="parent interrupted")
+            threading.Thread(
+                target=_run_required_interrupt_off_thread,
+                args=(interrupt_required_for_agent, self),
+                name="required-interrupt",
+                daemon=True,
+            ).start()
         except Exception:
             logger.debug("Failed to interrupt required delegations", exc_info=True)
 
