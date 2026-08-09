@@ -537,6 +537,85 @@ class TestCompactThread:
 # ---- approval bridge ----
 
 class TestServerRequestRouting:
+    def test_approval_drain_ignores_foreign_child_completion(self):
+        """Child frames queued beside an approval request must be filtered
+        before display callbacks, projection, or final-text mutation."""
+        client = FakeClient()
+        client.queue_server_request(
+            "item/commandExecution/requestApproval",
+            request_id="approval-foreign-child",
+            command="pwd",
+            cwd="/tmp",
+        )
+        client.queue_notification(
+            "item/completed",
+            threadId="thread-child-001",
+            turnId="turn-child-001",
+            item={
+                "type": "agentMessage",
+                "id": "child-message",
+                "text": "STALE CHILD APPROVAL ANSWER",
+            },
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-child-001",
+            turn={
+                "id": "turn-child-001",
+                "status": "completed",
+                "error": None,
+            },
+        )
+
+        events: list[dict] = []
+
+        def approve_and_release_parent(
+            command,
+            description,
+            *,
+            allow_permanent=True,
+        ):
+            client.queue_notification(
+                "item/completed",
+                threadId="thread-fake-001",
+                turnId="turn-fake-001",
+                item={
+                    "type": "agentMessage",
+                    "id": "parent-message",
+                    "text": "CURRENT PARENT APPROVAL ANSWER",
+                },
+            )
+            client.queue_notification(
+                "turn/completed",
+                threadId="thread-fake-001",
+                turn={
+                    "id": "turn-fake-001",
+                    "status": "completed",
+                    "error": None,
+                },
+            )
+            return "once"
+
+        result = make_session(
+            client,
+            approval_callback=approve_and_release_parent,
+            on_event=events.append,
+        ).run_turn("delegate then approve", turn_timeout=2.0)
+
+        assert result.final_text == "CURRENT PARENT APPROVAL ANSWER"
+        assert result.projected_messages == [
+            {
+                "role": "assistant",
+                "content": "CURRENT PARENT APPROVAL ANSWER",
+            }
+        ]
+        assert not any(
+            (event.get("params") or {}).get("threadId")
+            == "thread-child-001"
+            for event in events
+        )
+        assert client._notifications == []
+
 
 
 
@@ -1077,6 +1156,147 @@ class TestClassifyOAuthFailure:
 # ---- straggler-notification guard (2026-07-26 Switchboard stale-echo) ----
 
 class TestStragglerNotificationGuard:
+    def test_foreign_child_completion_does_not_end_parent_turn(self):
+        """A hosted child thread shares the app-server notification queue,
+        but its answer and completion must not terminate the root turn."""
+        client = FakeClient()
+        client.queue_notification(
+            "item/started",
+            threadId="thread-child-001",
+            turnId="turn-child-001",
+            item={
+                "type": "fileChange",
+                "id": "child-file-change",
+                "changes": [{"path": "/tmp/child-only", "kind": "add"}],
+            },
+        )
+        client.queue_notification(
+            "thread/tokenUsage/updated",
+            threadId="thread-child-001",
+            turnId="turn-child-001",
+            tokenUsage={
+                "last": {
+                    "inputTokens": 999,
+                    "outputTokens": 999,
+                    "totalTokens": 1998,
+                },
+                "total": {
+                    "inputTokens": 999,
+                    "outputTokens": 999,
+                    "totalTokens": 1998,
+                },
+                "modelContextWindow": 200000,
+            },
+        )
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "agentMessage",
+                "id": "child-message",
+                "text": "STALE CHILD ANSWER",
+            },
+            threadId="thread-child-001",
+            turnId="turn-child-001",
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-child-001",
+            turn={
+                "id": "turn-child-001",
+                "status": "completed",
+                "error": None,
+            },
+        )
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "agentMessage",
+                "id": "parent-message",
+                "text": "CURRENT PARENT ANSWER",
+            },
+            threadId="thread-fake-001",
+            turnId="turn-fake-001",
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={
+                "id": "turn-fake-001",
+                "status": "completed",
+                "error": None,
+            },
+        )
+
+        session = make_session(client)
+        result = session.run_turn("delegate", turn_timeout=2.0)
+
+        assert result.final_text == "CURRENT PARENT ANSWER"
+        assert result.projected_messages == [
+            {"role": "assistant", "content": "CURRENT PARENT ANSWER"}
+        ]
+        assert result.token_usage_last is None
+        assert session._pending_file_changes == {}
+        assert client._notifications == []
+
+    @pytest.mark.parametrize(
+        "note,expected",
+        [
+            (
+                {
+                    "params": {
+                        "item": {
+                            "thread_id": "nested-thread",
+                            "turn_id": "nested-turn",
+                        }
+                    }
+                },
+                ("nested-thread", "nested-turn"),
+            ),
+            (
+                {
+                    "params": {
+                        "turn": {
+                            "threadId": "turn-thread",
+                            "id": "turn-id",
+                        }
+                    }
+                },
+                ("turn-thread", "turn-id"),
+            ),
+        ],
+    )
+    def test_notification_scope_extraction_supports_nested_aliases(
+        self,
+        note,
+        expected,
+    ):
+        assert session_mod._notification_scope_ids(note) == expected
+
+    def test_unscoped_legacy_notifications_still_flow(self):
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "agentMessage",
+                "id": "legacy-message",
+                "text": "legacy unscoped answer",
+            },
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={
+                "id": "turn-fake-001",
+                "status": "completed",
+                "error": None,
+            },
+        )
+
+        result = make_session(client).run_turn("legacy", turn_timeout=2.0)
+
+        assert result.final_text == "legacy unscoped answer"
+        assert result.error is None
+
     """Codex keeps emitting notifications for a turn after run_turn()
     returned (watchdog interrupt, deadline fallback, late flush). They land
     in the ONE shared notification queue, and without a turn-id guard the
