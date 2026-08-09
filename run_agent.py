@@ -3996,7 +3996,13 @@ class AIAgent:
                 pass
         if force_persist:
             reset_session_activity_persist_window(self)
-        self._persist_session_activity_if_due()
+        # getattr guard: test doubles (SimpleNamespace / object.__new__) that
+        # drive _touch_activity directly lack the durable-heartbeat method.
+        # The stamp above is the contract; the SessionDB projection is
+        # best-effort, so its absence must never break an activity touch.
+        _persist_due = getattr(self, "_persist_session_activity_if_due", None)
+        if callable(_persist_due):
+            _persist_due()
 
     def _persist_session_activity_if_due(self) -> None:
         """Best-effort durable activity heartbeat for SessionDB consumers.

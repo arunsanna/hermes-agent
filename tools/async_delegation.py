@@ -3041,6 +3041,12 @@ def list_async_delegations() -> List[Dict[str, Any]]:
     with _records_lock:
         items = []
         for r in _records.values():
+            # Required delegations are process-local and same-turn: they are
+            # joined before the reply finalizes and must never surface on the
+            # legacy detached-completion rail, which is for background work
+            # that re-enters the conversation on its own.
+            if r.get("required"):
+                continue
             item = {
                 k: v
                 for k, v in r.items()
