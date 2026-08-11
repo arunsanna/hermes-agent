@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 from datetime import datetime, timezone
 import base64
 import contextvars
@@ -13,6 +14,7 @@ import time
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Deque, Optional
 from urllib.parse import unquote, urlparse
 
@@ -1580,24 +1582,15 @@ class HermesACPAgent(acp.Agent):
         self,
         state: SessionState,
         mcp_servers: list[McpServerStdio | McpServerHttp | McpServerSse] | None,
-    ) -> None:
-        """Register ACP-provided MCP servers and refresh the agent tool surface."""
+    ) -> bool:
+        """Register ACP-provided MCP servers and retain their safe session config."""
         if not mcp_servers:
-            return
+            return True
 
         try:
             from acp_adapter.orchestration import enforce_session_mcp_registration
-            from tools.mcp_tool import (
-                register_mcp_servers,
-                registered_mcp_server_matches_config,
-            )
 
             config_map: dict[str, dict] = {}
-            setattr(
-                state.agent,
-                "_switchboard_orchestration_mcp_registration_verified",
-                False,
-            )
             for server in mcp_servers:
                 name = server.name
                 if name in config_map:
@@ -1618,6 +1611,48 @@ class HermesACPAgent(acp.Agent):
                     config,
                     is_stdio=isinstance(server, McpServerStdio),
                 )
+        except Exception:
+            logger.warning(
+                "Session %s: failed to register ACP MCP servers",
+                state.session_id,
+                exc_info=True,
+            )
+            return False
+
+        if not await self._activate_session_mcp_server_configs(state, config_map):
+            return False
+
+        # Keep only the post-policy configuration, never the caller-provided
+        # ACP objects.  A model switch constructs a replacement agent, so it
+        # must replay this exact, already-sanitized session contract before it
+        # can become live.
+        setattr(state, "_acp_session_mcp_server_configs", deepcopy(config_map))
+        return True
+
+    async def _activate_session_mcp_server_configs(
+        self,
+        state: SessionState,
+        config_map: dict[str, dict],
+    ) -> bool:
+        """Register sanitized MCP config and rebuild ``state.agent``'s tools.
+
+        This is intentionally separate from ACP schema conversion so model
+        replacement can reuse only the enforced configuration held by the
+        session, rather than reprocessing untrusted client input.
+        """
+        if not config_map:
+            return True
+
+        setattr(
+            state.agent,
+            "_switchboard_orchestration_mcp_registration_verified",
+            False,
+        )
+        try:
+            from tools.mcp_tool import (
+                register_mcp_servers,
+                registered_mcp_server_matches_config,
+            )
 
             await asyncio.to_thread(register_mcp_servers, config_map)
             if "switchboard_orch" in config_map:
@@ -1638,11 +1673,11 @@ class HermesACPAgent(acp.Agent):
                 )
         except Exception:
             logger.warning(
-                "Session %s: failed to register ACP MCP servers",
+                "Session %s: failed to activate ACP MCP servers",
                 state.session_id,
                 exc_info=True,
             )
-            return
+            return False
 
         try:
             from model_tools import get_tool_definitions
@@ -1650,7 +1685,7 @@ class HermesACPAgent(acp.Agent):
 
             enabled_toolsets = _expand_acp_enabled_toolsets(
                 getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"],
-                mcp_server_names=[server.name for server in mcp_servers],
+                mcp_server_names=list(config_map),
             )
             state.agent.enabled_toolsets = enabled_toolsets
             disabled_toolsets = getattr(state.agent, "disabled_toolsets", None)
@@ -1686,6 +1721,77 @@ class HermesACPAgent(acp.Agent):
                 state.session_id,
                 exc_info=True,
             )
+            return False
+        return True
+
+    async def _restore_model_switch_mcp_servers(
+        self,
+        state: SessionState,
+        new_agent: Any,
+    ) -> bool:
+        """Hydrate a replacement agent with the prior session MCP contract."""
+        config_map = getattr(state, "_acp_session_mcp_server_configs", None)
+        previous_was_verified = bool(
+            getattr(
+                state.agent,
+                "_switchboard_orchestration_mcp_registration_verified",
+                False,
+            )
+        )
+        if config_map is None:
+            if previous_was_verified:
+                logger.error(
+                    "Session %s: refusing model switch without the verified "
+                    "Switchboard MCP configuration",
+                    state.session_id,
+                )
+                return False
+            return True
+        if not isinstance(config_map, dict) or any(
+            not isinstance(name, str) or not isinstance(config, dict)
+            for name, config in config_map.items()
+        ):
+            logger.error(
+                "Session %s: refusing model switch with invalid saved MCP configuration",
+                state.session_id,
+            )
+            return False
+
+        candidate = SimpleNamespace(session_id=state.session_id, agent=new_agent)
+        if not await self._activate_session_mcp_server_configs(
+            candidate,
+            deepcopy(config_map),
+        ):
+            return False
+        if previous_was_verified and not getattr(
+            new_agent,
+            "_switchboard_orchestration_mcp_registration_verified",
+            False,
+        ):
+            logger.error(
+                "Session %s: replacement agent lost verified Switchboard MCP registration",
+                state.session_id,
+            )
+            return False
+        if previous_was_verified:
+            try:
+                from acp_adapter.orchestration import orchestration_meta
+
+                contract = orchestration_meta(new_agent)
+            except Exception:
+                logger.exception(
+                    "Session %s: could not verify replacement Switchboard MCP surface",
+                    state.session_id,
+                )
+                return False
+            if not isinstance(contract, dict) or not contract.get("verified"):
+                logger.error(
+                    "Session %s: replacement agent does not expose the exact "
+                    "verified Switchboard MCP surface",
+                    state.session_id,
+                )
+                return False
+        return True
 
     def _schedule_mcp_late_refresh(self, state: SessionState) -> None:
         """Refresh the agent's tool snapshot when background MCP discovery lands late.
@@ -3891,6 +3997,9 @@ class HermesACPAgent(acp.Agent):
                 base_url=current_base_url,
                 api_mode=current_api_mode,
             )
+            if not await self._restore_model_switch_mcp_servers(state, new_agent):
+                _dispose_replaced_agent(new_agent)
+                raise RuntimeError("Failed to restore ACP MCP servers for model switch")
             self._commit_model_switch(state, model=resolved_model, new_agent=new_agent)
             logger.info(
                 "Session %s: model switched to %s via provider %s",
@@ -3898,7 +4007,11 @@ class HermesACPAgent(acp.Agent):
                 resolved_model,
                 requested_provider,
             )
-            return SetSessionModelResponse()
+            # The caller's model-switch acknowledgement must describe the
+            # replacement agent, not the pre-switch snapshot.  In managed
+            # Switchboard mode this is the evidence that the trusted MCP
+            # surface survived the mandatory rebuild.
+            return SetSessionModelResponse(_meta=self._session_meta(state))
         logger.warning("Session %s: model switch requested for missing session", session_id)
         return None
 

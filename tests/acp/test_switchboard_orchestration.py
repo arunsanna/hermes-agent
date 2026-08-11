@@ -17,6 +17,8 @@ from acp_adapter.orchestration import (
     without_reserved_switchboard_mcp,
 )
 from acp_adapter.server import HermesACPAgent
+from acp_adapter.session import SessionManager
+from hermes_state import SessionDB
 
 
 def _tool(name: str) -> dict:
@@ -697,6 +699,162 @@ async def test_acp_registration_keeps_switchboard_tools_in_model_schema(monkeypa
         assert orchestration_meta(state.agent)["verified"] is True
     finally:
         model_tools._clear_tool_defs_cache()
+
+
+@pytest.mark.asyncio
+async def test_session_model_switch_restores_verified_switchboard_mcp_surface(
+    tmp_path, monkeypatch
+):
+    """A replacement agent must receive the exact safe ACP MCP contract."""
+    monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
+    monkeypatch.setenv("HERMES_ACP_DISABLED_TOOLSETS", "delegation")
+    monkeypatch.setenv(
+        "HERMES_ACP_SWITCHBOARD_MCP_COMMAND", "/private/tmp/orch-launcher"
+    )
+    monkeypatch.setenv("HERMES_ACP_SWITCHBOARD_MCP_TOOL_TIMEOUT_SECONDS", "600")
+
+    def _agent_factory():
+        return SimpleNamespace(
+            model="initial-model",
+            provider="openrouter",
+            base_url="https://openrouter.example/v1",
+            api_mode="chat_completions",
+            enabled_toolsets=["hermes-acp"],
+            disabled_toolsets=["delegation"],
+            tools=[],
+            valid_tool_names=set(),
+        )
+
+    manager = SessionManager(
+        agent_factory=_agent_factory,
+        db=SessionDB(tmp_path / "state.db"),
+    )
+    server = HermesACPAgent(session_manager=manager)
+    server._schedule_mcp_late_refresh = lambda _state: None
+    registered = []
+
+    def _register(config_map):
+        registered.append(config_map)
+        return sorted(
+            tool["function"]["name"] for tool in _switchboard_tools()
+        )
+
+    with (
+        patch("tools.mcp_tool.register_mcp_servers", side_effect=_register),
+        patch(
+            "tools.mcp_tool.registered_mcp_server_matches_config",
+            return_value=True,
+        ),
+        patch(
+            "model_tools.get_tool_definitions",
+            return_value=[*_switchboard_tools(), *_tool_search_bridges(), _tool("terminal")],
+        ),
+        patch("agent.memory_manager.inject_memory_provider_tools"),
+    ):
+        response = await server.new_session(
+            cwd="/tmp/project",
+            mcp_servers=[
+                McpServerStdio(
+                    name="switchboard_orch",
+                    command="/private/tmp/orch-launcher",
+                    args=[],
+                    env=[],
+                )
+            ],
+        )
+        state = manager.get_session(response.session_id)
+        result = await server.set_session_model(
+            model_id="openrouter:replacement-model",
+            session_id=response.session_id,
+        )
+
+    assert result is not None
+    expected_config = {
+        "switchboard_orch": {
+            "command": "/private/tmp/orch-launcher",
+            "args": [],
+            "env": {},
+            "timeout": 600.0,
+        }
+    }
+    assert registered == [expected_config, expected_config]
+    assert state._acp_session_mcp_server_configs == expected_config
+    assert state.agent._switchboard_orchestration_mcp_registration_verified is True
+    assert {tool["function"]["name"] for tool in state.agent.tools} == {
+        tool["function"]["name"] for tool in _switchboard_tools()
+    }
+    assert orchestration_meta(state.agent)["effectiveMode"] == "switchboard"
+    assert result.field_meta["switchboardOrchestration"] == orchestration_meta(
+        state.agent
+    )
+    assert result.model_dump(by_alias=True)["_meta"]["switchboardOrchestration"] == (
+        orchestration_meta(state.agent)
+    )
+
+
+@pytest.mark.asyncio
+async def test_session_model_switch_refuses_incomplete_switchboard_surface(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
+    monkeypatch.setenv("HERMES_ACP_DISABLED_TOOLSETS", "delegation")
+    monkeypatch.setenv(
+        "HERMES_ACP_SWITCHBOARD_MCP_COMMAND", "/private/tmp/orch-launcher"
+    )
+    monkeypatch.setenv("HERMES_ACP_SWITCHBOARD_MCP_TOOL_TIMEOUT_SECONDS", "600")
+
+    def _agent_factory():
+        return SimpleNamespace(
+            model="initial-model",
+            provider="openrouter",
+            base_url="https://openrouter.example/v1",
+            api_mode="chat_completions",
+            enabled_toolsets=["hermes-acp"],
+            disabled_toolsets=["delegation"],
+            tools=[],
+            valid_tool_names=set(),
+        )
+
+    manager = SessionManager(
+        agent_factory=_agent_factory,
+        db=SessionDB(tmp_path / "state.db"),
+    )
+    server = HermesACPAgent(session_manager=manager)
+    server._schedule_mcp_late_refresh = lambda _state: None
+
+    with (
+        patch("tools.mcp_tool.register_mcp_servers", return_value=[]),
+        patch(
+            "tools.mcp_tool.registered_mcp_server_matches_config",
+            return_value=True,
+        ),
+        patch(
+            "model_tools.get_tool_definitions",
+            side_effect=[_switchboard_tools(), _switchboard_tools()[:1]],
+        ),
+        patch("agent.memory_manager.inject_memory_provider_tools"),
+    ):
+        response = await server.new_session(
+            cwd="/tmp/project",
+            mcp_servers=[
+                McpServerStdio(
+                    name="switchboard_orch",
+                    command="/private/tmp/orch-launcher",
+                    args=[],
+                    env=[],
+                )
+            ],
+        )
+        state = manager.get_session(response.session_id)
+        original_agent = state.agent
+        with pytest.raises(RuntimeError, match="restore ACP MCP servers"):
+            await server.set_session_model(
+                model_id="openrouter:replacement-model",
+                session_id=response.session_id,
+            )
+
+    assert state.agent is original_agent
+    assert state.model == "initial-model"
 
 
 @pytest.mark.asyncio
