@@ -7176,6 +7176,14 @@ def refresh_agent_mcp_tools(
         )
         or []
     )
+    try:
+        from acp_adapter.orchestration import without_switchboard_tool_search_bridge
+
+        new_defs = without_switchboard_tool_search_bridge(agent, new_defs)
+    except Exception:
+        # MCP refresh is shared with non-ACP surfaces.  An unavailable ACP
+        # adapter must never stop their ordinary registry refresh.
+        logger.debug("Switchboard bridge filtering skipped", exc_info=True)
     new_names = {t["function"]["name"] for t in new_defs}
 
     # Re-append the post-build injected families that get_tool_definitions does

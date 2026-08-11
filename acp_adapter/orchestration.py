@@ -51,6 +51,56 @@ def requested_disabled_toolsets() -> list[str]:
     return result
 
 
+def without_switchboard_tool_search_bridge(
+    agent: Any,
+    tool_defs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Remove generic catalog bridges from a verified managed parent surface.
+
+    The Switchboard controller controls are a four-tool, same-turn protocol,
+    not optional catalog entries.  Leaving ``tool_search``/``tool_describe``/
+    ``tool_call`` beside them invites smaller models to proxy a control through
+    the generic bridge, which cannot safely dispatch a non-deferrable tool.
+
+    This only alters a model-facing schema after all three boundaries hold:
+    Switchboard mode was requested, the session-bound registration was
+    verified, and the effective reserved namespace is exactly the trusted
+    four-tool surface.  Native/single sessions and lookalike plugin tools keep
+    the normal progressive-disclosure behavior.
+    """
+    if requested_orchestration_mode() != "switchboard":
+        return tool_defs
+    if not getattr(agent, "_switchboard_orchestration_mcp_registration_verified", False):
+        return tool_defs
+
+    enabled_toolsets = set(getattr(agent, "enabled_toolsets", None) or [])
+    if f"mcp-{_SWITCHBOARD_MCP_SERVER}" not in enabled_toolsets:
+        return tool_defs
+
+    names = {
+        function.get("name")
+        for tool in tool_defs
+        if isinstance(tool, dict)
+        for function in [tool.get("function")]
+        if isinstance(function, dict) and isinstance(function.get("name"), str)
+    }
+    switchboard_names = {
+        name
+        for name in names
+        if name.startswith(f"mcp__{_SWITCHBOARD_MCP_SERVER}__")
+    }
+    if switchboard_names != _SWITCHBOARD_MCP_TOOL_NAMES:
+        return tool_defs
+
+    from tools.tool_search import BRIDGE_TOOL_NAMES
+
+    return [
+        tool
+        for tool in tool_defs
+        if (tool.get("function") or {}).get("name") not in BRIDGE_TOOL_NAMES
+    ]
+
+
 def without_reserved_switchboard_mcp(
     servers: dict[str, Any] | None,
 ) -> dict[str, Any]:

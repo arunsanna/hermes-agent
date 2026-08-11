@@ -155,6 +155,34 @@ def test_refreshed_tool_is_callable_through_valid_tool_names_guard(monkeypatch):
     assert any(t["function"]["name"] == "mcp_granola_list_meetings" for t in agent.tools)
 
 
+def test_refresh_keeps_managed_switchboard_controls_direct(monkeypatch):
+    """A later registry refresh must not put the generic bridge back."""
+    from acp_adapter.orchestration import _SWITCHBOARD_MCP_TOOL_NAMES
+
+    monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
+    agent = _agent(
+        ["read_file"],
+        enabled=["hermes-acp", "mcp-switchboard_orch"],
+        disabled=["delegation"],
+    )
+    agent._switchboard_orchestration_mcp_registration_verified = True
+
+    import model_tools
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **kw: [
+            *[_tool(name) for name in _SWITCHBOARD_MCP_TOOL_NAMES],
+            *[_tool(name) for name in ("tool_search", "tool_describe", "tool_call")],
+        ],
+    )
+
+    mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert _SWITCHBOARD_MCP_TOOL_NAMES <= agent.valid_tool_names
+    assert not {"tool_search", "tool_describe", "tool_call"} & agent.valid_tool_names
+
+
 def test_refresh_is_thread_safe_under_concurrent_calls(monkeypatch):
     """Concurrent refreshes keep tools / valid_tool_names coherent.
 

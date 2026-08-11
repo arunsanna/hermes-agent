@@ -1659,6 +1659,12 @@ class HermesACPAgent(acp.Agent):
                 disabled_toolsets=disabled_toolsets,
                 quiet_mode=True,
             )
+            from acp_adapter.orchestration import without_switchboard_tool_search_bridge
+
+            state.agent.tools = without_switchboard_tool_search_bridge(
+                state.agent,
+                state.agent.tools,
+            )
             state.agent.valid_tool_names = {
                 tool["function"]["name"] for tool in state.agent.tools or []
             }

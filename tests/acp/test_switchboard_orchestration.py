@@ -10,6 +10,7 @@ from acp_adapter.orchestration import (
     orchestration_meta,
     requested_disabled_toolsets,
     requested_orchestration_mode,
+    without_switchboard_tool_search_bridge,
     without_reserved_switchboard_mcp,
 )
 from acp_adapter.server import HermesACPAgent
@@ -25,6 +26,14 @@ def _switchboard_tools() -> list[dict]:
         _tool("mcp__switchboard_orch__wait_for"),
         _tool("mcp__switchboard_orch__agent_status"),
         _tool("mcp__switchboard_orch__cancel_agent"),
+    ]
+
+
+def _tool_search_bridges() -> list[dict]:
+    return [
+        _tool("tool_search"),
+        _tool("tool_describe"),
+        _tool("tool_call"),
     ]
 
 
@@ -131,6 +140,44 @@ def test_switchboard_metadata_requires_mcp_and_no_native_delegate(monkeypatch):
     assert meta["mcpServers"] == ["switchboard_orch"]
     assert meta["mcpRegistrationVerified"] is True
     assert meta["verified"] is True
+
+
+def test_switchboard_model_schema_keeps_only_direct_controller_tools(monkeypatch):
+    monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
+    agent = SimpleNamespace(
+        enabled_toolsets=["hermes-acp", "mcp-switchboard_orch"],
+        _switchboard_orchestration_mcp_registration_verified=True,
+    )
+    schema = [*_switchboard_tools(), *_tool_search_bridges()]
+
+    visible = without_switchboard_tool_search_bridge(agent, schema)
+
+    assert {tool["function"]["name"] for tool in visible} == {
+        tool["function"]["name"] for tool in _switchboard_tools()
+    }
+
+
+def test_unverified_switchboard_schema_retains_generic_tool_search(monkeypatch):
+    monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
+    agent = SimpleNamespace(
+        enabled_toolsets=["hermes-acp", "mcp-switchboard_orch"],
+        _switchboard_orchestration_mcp_registration_verified=False,
+    )
+    schema = [*_switchboard_tools(), *_tool_search_bridges()]
+
+    assert without_switchboard_tool_search_bridge(agent, schema) == schema
+
+
+@pytest.mark.parametrize("mode", ["single", "native"])
+def test_non_switchboard_schema_retains_generic_tool_search(monkeypatch, mode):
+    monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", mode)
+    agent = SimpleNamespace(
+        enabled_toolsets=["hermes-acp", "mcp-switchboard_orch"],
+        _switchboard_orchestration_mcp_registration_verified=True,
+    )
+    schema = [*_switchboard_tools(), *_tool_search_bridges()]
+
+    assert without_switchboard_tool_search_bridge(agent, schema) == schema
 
 
 @pytest.mark.parametrize(
@@ -279,7 +326,7 @@ async def test_acp_registration_passes_hardened_switchboard_config(monkeypatch):
         ),
         patch(
             "model_tools.get_tool_definitions",
-            return_value=_switchboard_tools(),
+            return_value=[*_switchboard_tools(), *_tool_search_bridges()],
         ),
         patch("agent.memory_manager.inject_memory_provider_tools"),
     ):
@@ -305,6 +352,81 @@ async def test_acp_registration_passes_hardened_switchboard_config(monkeypatch):
     }
     assert "mcp-switchboard_orch" in state.agent.enabled_toolsets
     assert state.agent._switchboard_orchestration_mcp_registration_verified is True
+    assert {tool["function"]["name"] for tool in state.agent.tools} == {
+        tool["function"]["name"] for tool in _switchboard_tools()
+    }
+
+
+@pytest.mark.asyncio
+async def test_acp_registration_keeps_switchboard_tools_in_model_schema(monkeypatch):
+    """The live ACP refresh must expose the trusted controls, not bridges."""
+    import model_tools
+    from acp_adapter.orchestration import _SWITCHBOARD_MCP_TOOL_NAMES
+    from tools.registry import ToolRegistry
+
+    monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
+    monkeypatch.setenv(
+        "HERMES_ACP_SWITCHBOARD_MCP_COMMAND", "/private/tmp/orch-launcher"
+    )
+    monkeypatch.setenv("HERMES_ACP_SWITCHBOARD_MCP_TOOL_TIMEOUT_SECONDS", "600")
+
+    registry = ToolRegistry()
+    monkeypatch.setattr("tools.registry.registry", registry)
+    monkeypatch.setattr(model_tools, "registry", registry)
+    model_tools._clear_tool_defs_cache()
+
+    state = SimpleNamespace(
+        session_id="acp-model-schema",
+        agent=SimpleNamespace(
+            enabled_toolsets=["hermes-acp"],
+            disabled_toolsets=["delegation"],
+            tools=[],
+            valid_tool_names=set(),
+        ),
+    )
+    server = object.__new__(HermesACPAgent)
+
+    def _register(config_map):
+        assert set(config_map) == {"switchboard_orch"}
+        for name in _SWITCHBOARD_MCP_TOOL_NAMES:
+            registry.register(
+                name=name,
+                toolset="mcp-switchboard_orch",
+                schema=_tool(name),
+                handler=lambda *_args, **_kwargs: "{}",
+            )
+        return sorted(_SWITCHBOARD_MCP_TOOL_NAMES)
+
+    try:
+        with (
+            patch("tools.mcp_tool.register_mcp_servers", side_effect=_register),
+            patch(
+                "tools.mcp_tool.registered_mcp_server_matches_config",
+                return_value=True,
+            ),
+            patch("agent.memory_manager.inject_memory_provider_tools"),
+        ):
+            await server._register_session_mcp_servers(
+                state,
+                [
+                    McpServerStdio(
+                        name="switchboard_orch",
+                        command="/private/tmp/orch-launcher",
+                        args=[],
+                        env=[],
+                    )
+                ],
+            )
+
+        model_tool_names = {
+            tool["function"]["name"] for tool in state.agent.tools
+        }
+        assert _SWITCHBOARD_MCP_TOOL_NAMES <= model_tool_names
+        assert not {"tool_search", "tool_describe", "tool_call"} & model_tool_names
+        assert _SWITCHBOARD_MCP_TOOL_NAMES <= state.agent.valid_tool_names
+        assert orchestration_meta(state.agent)["verified"] is True
+    finally:
+        model_tools._clear_tool_defs_cache()
 
 
 @pytest.mark.asyncio
