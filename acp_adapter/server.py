@@ -2358,6 +2358,14 @@ class HermesACPAgent(acp.Agent):
         **kwargs: Any,
     ) -> PromptResponse:
         """Run Hermes on the user's prompt and stream events back to the editor."""
+        # ``session/prompt`` cannot establish ownership: doing so would let an
+        # arbitrary prompt restore a stranger's durable session. Retain the
+        # ACP refusal response for a process that has not bound any session
+        # yet, though. Once this process owns a session, every unowned id is
+        # still rejected by the cross-session guard below.
+        if self.session_manager.owned_sessions.primary_id is None:
+            logger.error("prompt: session %s not found", session_id)
+            return PromptResponse(stop_reason="refusal")
         self._guard_owned_session(session_id, "session/prompt")
         try:
             state = self.session_manager.get_session(session_id)

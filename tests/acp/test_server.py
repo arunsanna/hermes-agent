@@ -591,6 +591,17 @@ class TestPrompt:
         assert resp.stop_reason == "refusal"
 
     @pytest.mark.asyncio
+    async def test_prompt_keeps_cross_session_guard_after_binding(self, agent):
+        """An unknown prompt must not weaken the foreign-session guard."""
+        await agent.new_session(cwd=".")
+
+        with pytest.raises(acp.RequestError, match="not owned by this process"):
+            await agent.prompt(
+                prompt=[TextContentBlock(type="text", text="hello")],
+                session_id="foreign-session",
+            )
+
+    @pytest.mark.asyncio
     async def test_prompt_runs_agent(self, agent):
         """The prompt method should call run_conversation on the agent."""
         new_resp = await agent.new_session(cwd=".")
