@@ -2353,7 +2353,10 @@ def invoke_hook(
 
     Returns a list of non-``None`` return values from plugin callbacks.
     """
-    return get_plugin_manager().invoke_hook(hook_name, _timeout_s=_timeout_s, **kwargs)
+    manager = get_plugin_manager()
+    if _timeout_s is None:
+        return manager.invoke_hook(hook_name, **kwargs)
+    return manager.invoke_hook(hook_name, _timeout_s=_timeout_s, **kwargs)
 
 
 def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
