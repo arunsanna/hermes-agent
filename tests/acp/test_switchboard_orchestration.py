@@ -10,6 +10,7 @@ from acp_adapter.orchestration import (
     orchestration_meta,
     requested_disabled_toolsets,
     requested_orchestration_mode,
+    switchboard_runtime_tool_block,
     without_switchboard_tool_search_bridge,
     without_reserved_switchboard_mcp,
 )
@@ -160,6 +161,98 @@ def test_switchboard_model_schema_keeps_only_direct_controller_tools(monkeypatch
     assert {tool["function"]["name"] for tool in visible} == {
         tool["function"]["name"] for tool in _switchboard_tools()
     }
+
+
+def test_verified_switchboard_runtime_gate_rejects_non_controller_tool(monkeypatch):
+    monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
+    agent = SimpleNamespace(
+        enabled_toolsets=["hermes-acp", "mcp-switchboard_orch"],
+        tools=[_tool("read_file"), *_switchboard_tools()],
+        _switchboard_orchestration_mcp_registration_verified=True,
+    )
+
+    assert switchboard_runtime_tool_block(agent, "read_file") is not None
+    assert (
+        switchboard_runtime_tool_block(
+            agent, "mcp__switchboard_orch__delegate"
+        )
+        is None
+    )
+
+
+def test_unverified_switchboard_runtime_gate_stays_inert(monkeypatch):
+    monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
+    agent = SimpleNamespace(
+        enabled_toolsets=["hermes-acp", "mcp-switchboard_orch"],
+        tools=[_tool("read_file"), *_switchboard_tools()],
+        _switchboard_orchestration_mcp_registration_verified=False,
+    )
+
+    assert switchboard_runtime_tool_block(agent, "read_file") is None
+
+
+def test_direct_registry_dispatch_honors_verified_switchboard_runtime_gate(monkeypatch):
+    """Callers outside AIAgent cannot bypass the execution-time boundary."""
+    import model_tools
+
+    monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
+    agent = SimpleNamespace(
+        enabled_toolsets=["hermes-acp", "mcp-switchboard_orch"],
+        tools=[_tool("read_file"), *_switchboard_tools()],
+        _switchboard_orchestration_mcp_registration_verified=True,
+    )
+    controller = "mcp__switchboard_orch__delegate"
+
+    with (
+        patch("model_tools.registry.dispatch", return_value='{"ok": true}') as dispatch,
+        patch("model_tools._emit_post_tool_call_hook"),
+    ):
+        blocked = model_tools.handle_function_call(
+            "read_file",
+            {"path": "/tmp/nope"},
+            parent_agent=agent,
+            skip_pre_tool_call_hook=True,
+            skip_tool_execution_middleware=True,
+        )
+        allowed = model_tools.handle_function_call(
+            controller,
+            {},
+            parent_agent=agent,
+            skip_pre_tool_call_hook=True,
+            skip_tool_execution_middleware=True,
+        )
+
+    assert "Switchboard orchestration runtime policy permits only" in blocked
+    assert allowed == '{"ok": true}'
+    assert dispatch.call_count == 1
+    assert dispatch.call_args.args[0] == controller
+
+
+def test_direct_dispatch_gate_failure_does_not_narrow_native_mode(monkeypatch):
+    """A broken ACP runtime guard must not affect non-managed callers."""
+    import model_tools
+
+    monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "native")
+    agent = SimpleNamespace()
+
+    with (
+        patch(
+            "acp_adapter.orchestration.switchboard_runtime_tool_block",
+            side_effect=RuntimeError("simulated ACP import failure"),
+        ),
+        patch("model_tools.registry.dispatch", return_value='{"ok": true}') as dispatch,
+        patch("model_tools._emit_post_tool_call_hook"),
+    ):
+        result = model_tools.handle_function_call(
+            "read_file",
+            {"path": "/tmp/normal"},
+            parent_agent=agent,
+            skip_pre_tool_call_hook=True,
+            skip_tool_execution_middleware=True,
+        )
+
+    assert result == '{"ok": true}'
+    dispatch.assert_called_once()
 
 
 def test_unverified_switchboard_schema_retains_generic_tool_search(monkeypatch):

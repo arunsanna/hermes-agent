@@ -1,6 +1,7 @@
 """Runtime tests for tool-call loop guardrails."""
 
 import json
+import os
 import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -420,3 +421,60 @@ def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
     assert halt_text in text_deltas, (
         f"halt message was never streamed; callback only saw {deltas!r}"
     )
+
+
+def test_verified_switchboard_parent_blocks_local_execution_but_allows_controller_calls():
+    """A stale provider schema must not bypass the managed parent boundary."""
+    controller = "mcp__switchboard_orch__delegate"
+    controllers = (
+        controller,
+        "mcp__switchboard_orch__wait_for",
+        "mcp__switchboard_orch__agent_status",
+        "mcp__switchboard_orch__cancel_agent",
+    )
+    agent = _make_agent("read_file", *controllers)
+    agent.enabled_toolsets = ["hermes-acp", "mcp-switchboard_orch"]
+    agent._switchboard_orchestration_mcp_registration_verified = True
+    agent.tools = _make_tool_defs("read_file", *controllers)
+    agent.valid_tool_names = {"read_file", *controllers}
+    local = _mock_tool_call("read_file", json.dumps({"path": "/tmp/nope"}), "c-local")
+    controller_call = _mock_tool_call(controller, "{}", "c-controller")
+    messages = []
+
+    with (
+        patch.dict(os.environ, {"HERMES_ACP_ORCHESTRATION_MODE": "switchboard"}),
+        patch("run_agent.handle_function_call", return_value='{"ok": true}') as dispatch,
+    ):
+        agent._execute_tool_calls_sequential(
+            SimpleNamespace(content="", tool_calls=[local]), messages, "task-1"
+        )
+        agent._execute_tool_calls_sequential(
+            SimpleNamespace(content="", tool_calls=[controller_call]), messages, "task-1"
+        )
+
+    assert dispatch.call_count == 1
+    assert dispatch.call_args.args[0] == controller
+    assert "Switchboard orchestration runtime policy permits only" in messages[0]["content"]
+    assert json.loads(messages[1]["content"]) == {"ok": True}
+
+
+def test_runtime_gate_failure_does_not_narrow_unmanaged_tool_execution():
+    """ACP import/helper failures must not alter ordinary Hermes sessions."""
+    agent = _make_agent("web_search")
+    tc = _mock_tool_call("web_search", json.dumps({"query": "normal"}), "c-normal")
+    messages = []
+
+    with (
+        patch.dict(os.environ, {"HERMES_ACP_ORCHESTRATION_MODE": ""}),
+        patch(
+            "acp_adapter.orchestration.switchboard_runtime_tool_block",
+            side_effect=RuntimeError("simulated ACP import failure"),
+        ),
+        patch("run_agent.handle_function_call", return_value='{"ok": true}') as dispatch,
+    ):
+        agent._execute_tool_calls_sequential(
+            SimpleNamespace(content="", tool_calls=[tc]), messages, "task-1"
+        )
+
+    dispatch.assert_called_once()
+    assert json.loads(messages[0]["content"]) == {"ok": True}

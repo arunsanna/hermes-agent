@@ -1176,6 +1176,40 @@ def handle_function_call(
         function_args = {}
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
 
+    # ``handle_function_call`` also has callers outside the AIAgent executor.
+    # Enforce the verified managed-parent contract here as well, before bridge
+    # unwrapping, special cases, middleware, or registry dispatch.  A stale or
+    # hallucinated local tool name must not regain an execution path merely by
+    # bypassing the normal conversation loop.
+    if parent_agent is not None:
+        try:
+            from acp_adapter.orchestration import switchboard_runtime_tool_block
+
+            runtime_block = switchboard_runtime_tool_block(parent_agent, function_name)
+        except Exception:
+            # The bridge gate is fail-closed only for an explicit managed
+            # Switchboard session.  An unavailable ACP module must never
+            # narrow ordinary native/single/unmanaged direct dispatch.
+            if os.getenv("HERMES_ACP_ORCHESTRATION_MODE", "").strip().lower() == "switchboard":
+                logger.exception(
+                    "Switchboard orchestration runtime gate failed closed for %s",
+                    function_name,
+                )
+                runtime_block = (
+                    "Switchboard orchestration runtime policy could not be verified; "
+                    "the requested tool was not executed."
+                )
+            else:
+                logger.debug(
+                    "Switchboard orchestration runtime gate unavailable for %s; "
+                    "continuing outside managed mode",
+                    function_name,
+                    exc_info=True,
+                )
+                runtime_block = None
+        if runtime_block is not None:
+            return tool_error(runtime_block)
+
     # ── Tool Search bridge dispatch ──────────────────────────────────
     # tool_search and tool_describe are pure catalog reads — handle them
     # inline. tool_call is unwrapped to the underlying tool so that every

@@ -101,6 +101,46 @@ def without_switchboard_tool_search_bridge(
     ]
 
 
+def switchboard_runtime_tool_block(agent: Any, tool_name: str) -> str | None:
+    """Return a denial for a non-controller call in a verified managed parent.
+
+    The model-facing schema is helpful guidance, but it is not an execution
+    boundary: a provider can retain an earlier schema, emit a hallucinated
+    function, or reach a direct registry dispatch path.  Once the session has
+    proved the exact trusted Switchboard MCP surface, the parent may execute
+    only those four controller calls.  The dispatchers consume this helper
+    before local special cases and registry dispatch.
+
+    It deliberately stays inert for native, single, and unverified sessions.
+    Those modes retain Hermes' normal tool policy and are not accidentally
+    narrowed by a bridge-only environment variable.
+    """
+    if requested_orchestration_mode() != "switchboard":
+        return None
+    if not getattr(agent, "_switchboard_orchestration_mcp_registration_verified", False):
+        return None
+
+    enabled_toolsets = set(getattr(agent, "enabled_toolsets", None) or [])
+    if f"mcp-{_SWITCHBOARD_MCP_SERVER}" not in enabled_toolsets:
+        return None
+
+    switchboard_prefix = f"mcp__{_SWITCHBOARD_MCP_SERVER}__"
+    effective_switchboard_tools = {
+        name for name in _tool_names(agent) if name.startswith(switchboard_prefix)
+    }
+    if effective_switchboard_tools != _SWITCHBOARD_MCP_TOOL_NAMES:
+        return None
+
+    if tool_name in _SWITCHBOARD_MCP_TOOL_NAMES:
+        return None
+    return (
+        "Switchboard orchestration runtime policy permits only the verified "
+        "controller tools: "
+        + ", ".join(sorted(_SWITCHBOARD_MCP_TOOL_NAMES))
+        + ". The requested tool was not executed."
+    )
+
+
 def without_reserved_switchboard_mcp(
     servers: dict[str, Any] | None,
 ) -> dict[str, Any]:

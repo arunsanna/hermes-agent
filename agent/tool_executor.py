@@ -540,6 +540,57 @@ def _run_agent_tool_execution_middleware(
     authorization_gate: _ConcurrentToolAuthorizationGate | None = None,
 ) -> _ManagedToolResult:
     """Run Relay rewrites before Hermes policy and dispatch exactly once."""
+    # The advertised tool schema is not a security boundary.  In a verified
+    # Switchboard-managed parent, reject stale/hallucinated local calls before
+    # relay rewrites, plugin hooks, built-in special cases, or registry
+    # dispatch can give them an execution path.
+    try:
+        from acp_adapter.orchestration import switchboard_runtime_tool_block
+
+        runtime_block = switchboard_runtime_tool_block(agent, function_name)
+    except Exception:
+        # An ACP import/configuration failure must not change normal Hermes
+        # semantics.  Only an explicitly requested managed session fails
+        # closed; native, single, and unmanaged callers retain their tools.
+        if os.getenv("HERMES_ACP_ORCHESTRATION_MODE", "").strip().lower() == "switchboard":
+            logger.exception(
+                "Switchboard orchestration runtime gate failed closed for %s",
+                function_name,
+            )
+            runtime_block = (
+                "Switchboard orchestration runtime policy could not be verified; "
+                "the requested tool was not executed."
+            )
+        else:
+            logger.debug(
+                "Switchboard orchestration runtime gate unavailable for %s; "
+                "continuing outside managed mode",
+                function_name,
+                exc_info=True,
+            )
+            runtime_block = None
+    if runtime_block is not None:
+        result = json.dumps({"error": runtime_block}, ensure_ascii=False)
+        _emit_terminal_post_tool_call(
+            agent,
+            function_name=function_name,
+            function_args=function_args,
+            result=result,
+            effective_task_id=effective_task_id,
+            tool_call_id=tool_call_id,
+            status="blocked",
+            error_type="switchboard_orchestration_runtime_policy",
+            error_message=runtime_block,
+            middleware_trace=list(middleware_trace or []),
+        )
+        return _ManagedToolResult(
+            result=result,
+            args=function_args,
+            middleware_trace=list(middleware_trace or []),
+            blocked=True,
+            dispatched=False,
+        )
+
     from agent import relay_tools
     from hermes_cli.middleware import (
         apply_tool_request_middleware,
