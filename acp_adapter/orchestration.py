@@ -34,6 +34,31 @@ _SWITCHBOARD_MCP_TOOL_NAMES = frozenset({
 })
 
 
+def _api_tool_names(api_tools: list[Any]) -> set[str]:
+    """Read function names from Chat Completions and Responses tool shapes."""
+    names: set[str] = set()
+    for tool in api_tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function")
+        if isinstance(function, dict) and isinstance(function.get("name"), str):
+            names.add(function["name"])
+        elif tool.get("type") == "function" and isinstance(tool.get("name"), str):
+            names.add(tool["name"])
+    return names
+
+
+def _uses_responses_tool_shape(api_tools: list[Any]) -> bool:
+    """Whether the request is using OpenAI Responses flattened functions."""
+    return any(
+        isinstance(tool, dict)
+        and tool.get("type") == "function"
+        and isinstance(tool.get("name"), str)
+        and not isinstance(tool.get("function"), dict)
+        for tool in api_tools
+    )
+
+
 def requested_orchestration_mode() -> str | None:
     """Return Switchboard's requested owner, rejecting an invalid contract."""
     raw = (os.environ.get(_MODE_ENV) or "").strip().lower()
@@ -72,16 +97,14 @@ def without_switchboard_tool_search_bridge(
     This only alters a model-facing schema after all three boundaries hold:
     Switchboard mode was requested, the session-bound registration was
     verified, and the effective reserved namespace is exactly the trusted
-    four-tool surface.  Native/single sessions and lookalike plugin tools keep
-    the normal progressive-disclosure behavior.
+    four-tool surface.  The registration evidence is intentionally stronger
+    than mutable toolset bookkeeping: late MCP refreshes can rebuild that list
+    while the trusted server remains connected. Native/single sessions and
+    lookalike plugin tools keep the normal progressive-disclosure behavior.
     """
     if requested_orchestration_mode() != "switchboard":
         return tool_defs
     if not getattr(agent, "_switchboard_orchestration_mcp_registration_verified", False):
-        return tool_defs
-
-    enabled_toolsets = set(getattr(agent, "enabled_toolsets", None) or [])
-    if f"mcp-{_SWITCHBOARD_MCP_SERVER}" not in enabled_toolsets:
         return tool_defs
 
     names = {
@@ -104,6 +127,26 @@ def without_switchboard_tool_search_bridge(
         for tool in tool_defs
         if (tool.get("function") or {}).get("name") in _SWITCHBOARD_MCP_TOOL_NAMES
     ]
+
+
+def _enforce_verified_switchboard_model_surface(agent: Any) -> None:
+    """Publish the exact trusted controller surface before ACP attestation.
+
+    A slow MCP discovery may leave the initial registration snapshot partial.
+    Once the full reserved namespace is present, no later metadata emission may
+    attest it alongside local/bridge tools: that would acknowledge an owner the
+    model can bypass. Partial discovery remains unmodified and therefore fails
+    the normal ACP verification path.
+    """
+    current = list(getattr(agent, "tools", None) or [])
+    restricted = without_switchboard_tool_search_bridge(agent, current)
+    if restricted == current:
+        return
+    agent.tools = restricted
+    agent.valid_tool_names = _tool_names(agent)
+    invalidate = getattr(agent, "_invalidate_system_prompt", None)
+    if callable(invalidate):
+        invalidate()
 
 
 def apply_switchboard_uat_direct_delegate_once(
@@ -132,22 +175,13 @@ def apply_switchboard_uat_direct_delegate_once(
     if not getattr(agent, "_switchboard_orchestration_mcp_registration_verified", False):
         return False
 
-    enabled_toolsets = set(getattr(agent, "enabled_toolsets", None) or [])
-    if f"mcp-{_SWITCHBOARD_MCP_SERVER}" not in enabled_toolsets:
-        return False
     if set(_tool_names(agent)) != _SWITCHBOARD_MCP_TOOL_NAMES:
         return False
 
     api_tools = api_kwargs.get("tools")
     if not isinstance(api_tools, list):
         return False
-    api_tool_names = {
-        function.get("name")
-        for tool in api_tools
-        if isinstance(tool, dict)
-        for function in [tool.get("function")]
-        if isinstance(function, dict) and isinstance(function.get("name"), str)
-    }
+    api_tool_names = _api_tool_names(api_tools)
     if api_tool_names != _SWITCHBOARD_MCP_TOOL_NAMES:
         return False
 
@@ -155,10 +189,16 @@ def apply_switchboard_uat_direct_delegate_once(
     # second logical request forcibly delegate, while a streaming fallback
     # retains these same kwargs for its non-streaming transport retry.
     setattr(agent, "_switchboard_uat_direct_delegate_once_consumed", True)
-    api_kwargs["tool_choice"] = {
-        "type": "function",
-        "function": {"name": "mcp__switchboard_orch__delegate"},
-    }
+    if _uses_responses_tool_shape(api_tools):
+        api_kwargs["tool_choice"] = {
+            "type": "function",
+            "name": "mcp__switchboard_orch__delegate",
+        }
+    else:
+        api_kwargs["tool_choice"] = {
+            "type": "function",
+            "function": {"name": "mcp__switchboard_orch__delegate"},
+        }
     api_kwargs["parallel_tool_calls"] = False
     return True
 
@@ -180,10 +220,6 @@ def switchboard_runtime_tool_block(agent: Any, tool_name: str) -> str | None:
     if requested_orchestration_mode() != "switchboard":
         return None
     if not getattr(agent, "_switchboard_orchestration_mcp_registration_verified", False):
-        return None
-
-    enabled_toolsets = set(getattr(agent, "enabled_toolsets", None) or [])
-    if f"mcp-{_SWITCHBOARD_MCP_SERVER}" not in enabled_toolsets:
         return None
 
     switchboard_prefix = f"mcp__{_SWITCHBOARD_MCP_SERVER}__"
@@ -327,6 +363,7 @@ def orchestration_meta(agent: Any) -> dict[str, Any] | None:
     if requested is None:
         return None
 
+    _enforce_verified_switchboard_model_surface(agent)
     disabled = sorted(set(getattr(agent, "disabled_toolsets", None) or []))
     tools = _tool_names(agent)
     mcp_servers = _mcp_server_names(agent)
@@ -335,7 +372,6 @@ def orchestration_meta(agent: Any) -> dict[str, Any] | None:
     switchboard_tools = {
         name for name in tools if name.startswith(switchboard_tool_prefix)
     }
-    has_switchboard_server = _SWITCHBOARD_MCP_SERVER in mcp_servers
     exact_switchboard_tools = switchboard_tools == _SWITCHBOARD_MCP_TOOL_NAMES
     trusted_switchboard_registration = bool(
         getattr(
@@ -344,6 +380,16 @@ def orchestration_meta(agent: Any) -> dict[str, Any] | None:
             False,
         )
     )
+    if (
+        trusted_switchboard_registration
+        and switchboard_tools == _SWITCHBOARD_MCP_TOOL_NAMES
+        and _SWITCHBOARD_MCP_SERVER not in mcp_servers
+    ):
+        # A late refresh may drop the bookkeeping entry while preserving the
+        # connected, attested session server and its exact live tool surface.
+        mcp_servers.append(_SWITCHBOARD_MCP_SERVER)
+        mcp_servers.sort()
+    has_switchboard_server = _SWITCHBOARD_MCP_SERVER in mcp_servers
     has_switchboard = (
         has_switchboard_server
         and exact_switchboard_tools

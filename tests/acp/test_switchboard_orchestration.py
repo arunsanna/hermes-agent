@@ -31,6 +31,19 @@ def _switchboard_tools() -> list[dict]:
     ]
 
 
+def _responses_tool(name: str) -> dict:
+    return {"type": "function", "name": name, "parameters": {"type": "object"}}
+
+
+def _switchboard_responses_tools() -> list[dict]:
+    return [
+        _responses_tool("mcp__switchboard_orch__delegate"),
+        _responses_tool("mcp__switchboard_orch__wait_for"),
+        _responses_tool("mcp__switchboard_orch__agent_status"),
+        _responses_tool("mcp__switchboard_orch__cancel_agent"),
+    ]
+
+
 def _tool_search_bridges() -> list[dict]:
     return [
         _tool("tool_search"),
@@ -147,6 +160,23 @@ def test_switchboard_metadata_requires_mcp_and_no_native_delegate(monkeypatch):
     assert meta["verified"] is True
 
 
+def test_switchboard_metadata_recovers_late_toolset_bookkeeping_loss(monkeypatch):
+    monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
+    monkeypatch.setenv("HERMES_ACP_DISABLED_TOOLSETS", "delegation")
+    agent = SimpleNamespace(
+        disabled_toolsets=["delegation"],
+        enabled_toolsets=["hermes-acp"],
+        tools=_switchboard_tools(),
+        _switchboard_orchestration_mcp_registration_verified=True,
+    )
+
+    meta = orchestration_meta(agent)
+
+    assert meta["effectiveMode"] == "switchboard"
+    assert meta["mcpServers"] == ["switchboard_orch"]
+    assert meta["verified"] is True
+
+
 def test_switchboard_model_schema_keeps_only_direct_controller_tools(monkeypatch):
     monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
     agent = SimpleNamespace(
@@ -167,11 +197,26 @@ def test_switchboard_model_schema_keeps_only_direct_controller_tools(monkeypatch
     }
 
 
+def test_switchboard_model_schema_survives_late_toolset_bookkeeping_loss(monkeypatch):
+    monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
+    agent = SimpleNamespace(
+        enabled_toolsets=["hermes-acp"],
+        _switchboard_orchestration_mcp_registration_verified=True,
+    )
+    schema = [*_switchboard_tools(), *_tool_search_bridges(), _tool("terminal")]
+
+    visible = without_switchboard_tool_search_bridge(agent, schema)
+
+    assert {tool["function"]["name"] for tool in visible} == {
+        tool["function"]["name"] for tool in _switchboard_tools()
+    }
+
+
 def test_switchboard_uat_canary_forces_only_the_first_verified_request(monkeypatch):
     monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
     monkeypatch.setenv("HERMES_ACP_SWITCHBOARD_FORCE_DIRECT_DELEGATE_ONCE", "1")
     agent = SimpleNamespace(
-        enabled_toolsets=["hermes-acp", "mcp-switchboard_orch"],
+        enabled_toolsets=["hermes-acp"],
         tools=_switchboard_tools(),
         _switchboard_orchestration_mcp_registration_verified=True,
     )
@@ -193,6 +238,49 @@ def test_switchboard_uat_canary_forces_only_the_first_verified_request(monkeypat
         "tools": _switchboard_tools(),
         "tool_choice": "auto",
     }
+
+
+def test_switchboard_uat_canary_forces_responses_tool_shape(monkeypatch):
+    monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
+    monkeypatch.setenv("HERMES_ACP_SWITCHBOARD_FORCE_DIRECT_DELEGATE_ONCE", "1")
+    agent = SimpleNamespace(
+        enabled_toolsets=["hermes-acp", "mcp-switchboard_orch"],
+        tools=_switchboard_tools(),
+        _switchboard_orchestration_mcp_registration_verified=True,
+    )
+    request = {
+        "instructions": "Switchboard canary",
+        "input": [{"role": "user", "content": "delegate"}],
+        "tools": _switchboard_responses_tools(),
+        "tool_choice": "auto",
+        "parallel_tool_calls": True,
+    }
+
+    assert apply_switchboard_uat_direct_delegate_once(agent, request) is True
+    assert request["tool_choice"] == {
+        "type": "function",
+        "name": "mcp__switchboard_orch__delegate",
+    }
+    assert request["parallel_tool_calls"] is False
+
+
+def test_switchboard_metadata_clamps_a_broad_verified_surface(monkeypatch):
+    monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
+    monkeypatch.setenv("HERMES_ACP_DISABLED_TOOLSETS", "delegation")
+    agent = SimpleNamespace(
+        disabled_toolsets=["delegation"],
+        enabled_toolsets=["hermes-acp", "mcp-switchboard_orch"],
+        tools=[*_switchboard_tools(), *_tool_search_bridges(), _tool("terminal")],
+        _switchboard_orchestration_mcp_registration_verified=True,
+    )
+
+    meta = orchestration_meta(agent)
+
+    assert meta["effectiveMode"] == "switchboard"
+    assert set(meta["effectiveTools"]) == {
+        tool["function"]["name"] for tool in _switchboard_tools()
+    }
+    assert set(agent.valid_tool_names) == set(meta["effectiveTools"])
 
 
 @pytest.mark.parametrize(
@@ -222,7 +310,7 @@ def test_switchboard_uat_canary_never_forces_untrusted_or_nonmanaged_schema(
 def test_verified_switchboard_runtime_gate_rejects_non_controller_tool(monkeypatch):
     monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
     agent = SimpleNamespace(
-        enabled_toolsets=["hermes-acp", "mcp-switchboard_orch"],
+        enabled_toolsets=["hermes-acp"],
         tools=[_tool("read_file"), *_switchboard_tools()],
         _switchboard_orchestration_mcp_registration_verified=True,
     )
