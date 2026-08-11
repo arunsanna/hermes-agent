@@ -149,6 +149,46 @@ def _enforce_verified_switchboard_model_surface(agent: Any) -> None:
         invalidate()
 
 
+def restrict_verified_switchboard_request_tools(
+    agent: Any,
+    api_kwargs: dict[str, Any],
+) -> bool | None:
+    """Clamp an attested managed parent to its four provider-visible tools.
+
+    MCP refreshes can race the initial ACP acknowledgement and repopulate an
+    already-verified agent with broad local schemas.  The final provider
+    payload is the last safe boundary: retain the exact trusted controller
+    surface when it is present; otherwise expose no tools rather than an
+    alternate local execution path. ``None`` means the session is not a
+    verified Switchboard parent, and therefore remains untouched.
+    """
+    if requested_orchestration_mode() != "switchboard":
+        return None
+    if not getattr(agent, "_switchboard_orchestration_mcp_registration_verified", False):
+        return None
+
+    _enforce_verified_switchboard_model_surface(agent)
+    api_tools = api_kwargs.get("tools")
+    controller_tools: list[Any] = []
+    if isinstance(api_tools, list):
+        controller_tools = [
+            tool
+            for tool in api_tools
+            if bool(_api_tool_names([tool]) & _SWITCHBOARD_MCP_TOOL_NAMES)
+        ]
+    if (
+        set(_tool_names(agent)) == _SWITCHBOARD_MCP_TOOL_NAMES
+        and _api_tool_names(controller_tools) == _SWITCHBOARD_MCP_TOOL_NAMES
+    ):
+        api_kwargs["tools"] = controller_tools
+        return True
+
+    api_kwargs["tools"] = []
+    api_kwargs["tool_choice"] = "none"
+    api_kwargs["parallel_tool_calls"] = False
+    return False
+
+
 def apply_switchboard_uat_direct_delegate_once(
     agent: Any,
     api_kwargs: dict[str, Any],
@@ -174,16 +214,10 @@ def apply_switchboard_uat_direct_delegate_once(
         return False
     if not getattr(agent, "_switchboard_orchestration_mcp_registration_verified", False):
         return False
-
-    if set(_tool_names(agent)) != _SWITCHBOARD_MCP_TOOL_NAMES:
+    if restrict_verified_switchboard_request_tools(agent, api_kwargs) is not True:
         return False
 
-    api_tools = api_kwargs.get("tools")
-    if not isinstance(api_tools, list):
-        return False
-    api_tool_names = _api_tool_names(api_tools)
-    if api_tool_names != _SWITCHBOARD_MCP_TOOL_NAMES:
-        return False
+    api_tools = api_kwargs["tools"]
 
     # Consume before the provider call: retry rebuilding must never make a
     # second logical request forcibly delegate, while a streaming fallback

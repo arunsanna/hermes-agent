@@ -2959,8 +2959,17 @@ def run_conversation(
                 try:
                     from acp_adapter.orchestration import (
                         apply_switchboard_uat_direct_delegate_once,
+                        restrict_verified_switchboard_request_tools,
                     )
 
+                    restricted_switchboard_tools = (
+                        restrict_verified_switchboard_request_tools(agent, api_kwargs)
+                    )
+                    if restricted_switchboard_tools is False:
+                        logger.error(
+                            "Switchboard ACP tool surface became incomplete; "
+                            "denying all provider tools for this request"
+                        )
                     apply_switchboard_uat_direct_delegate_once(agent, api_kwargs)
                 except Exception:
                     # The ACP adapter is optional for ordinary Hermes callers;

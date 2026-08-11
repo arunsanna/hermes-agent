@@ -9,6 +9,7 @@ from acp_adapter.orchestration import (
     apply_orchestration_tool_policy,
     enforce_session_mcp_registration,
     orchestration_meta,
+    restrict_verified_switchboard_request_tools,
     requested_disabled_toolsets,
     requested_orchestration_mode,
     switchboard_runtime_tool_block,
@@ -245,13 +246,13 @@ def test_switchboard_uat_canary_forces_responses_tool_shape(monkeypatch):
     monkeypatch.setenv("HERMES_ACP_SWITCHBOARD_FORCE_DIRECT_DELEGATE_ONCE", "1")
     agent = SimpleNamespace(
         enabled_toolsets=["hermes-acp", "mcp-switchboard_orch"],
-        tools=_switchboard_tools(),
+        tools=[*_switchboard_tools(), *_tool_search_bridges()],
         _switchboard_orchestration_mcp_registration_verified=True,
     )
     request = {
         "instructions": "Switchboard canary",
         "input": [{"role": "user", "content": "delegate"}],
-        "tools": _switchboard_responses_tools(),
+        "tools": [*_switchboard_responses_tools(), _responses_tool("tool_call")],
         "tool_choice": "auto",
         "parallel_tool_calls": True,
     }
@@ -262,6 +263,22 @@ def test_switchboard_uat_canary_forces_responses_tool_shape(monkeypatch):
         "name": "mcp__switchboard_orch__delegate",
     }
     assert request["parallel_tool_calls"] is False
+    assert {tool["name"] for tool in request["tools"]} == {
+        tool["function"]["name"] for tool in _switchboard_tools()
+    }
+
+
+def test_verified_switchboard_request_surface_fails_closed_when_incomplete(monkeypatch):
+    monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
+    agent = SimpleNamespace(
+        tools=_switchboard_tools()[:-1],
+        _switchboard_orchestration_mcp_registration_verified=True,
+    )
+    request = {"tools": _switchboard_responses_tools(), "tool_choice": "auto"}
+
+    assert restrict_verified_switchboard_request_tools(agent, request) is False
+    assert request["tools"] == []
+    assert request["tool_choice"] == "none"
 
 
 def test_switchboard_metadata_clamps_a_broad_verified_surface(monkeypatch):
@@ -284,15 +301,15 @@ def test_switchboard_metadata_clamps_a_broad_verified_surface(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "mode, verified, api_tools",
+    "mode, verified, api_tools, fail_closed",
     [
-        ("native", True, _switchboard_tools()),
-        ("switchboard", False, _switchboard_tools()),
-        ("switchboard", True, [_tool("mcp__switchboard_orch__delegate")]),
+        ("native", True, _switchboard_tools(), False),
+        ("switchboard", False, _switchboard_tools(), False),
+        ("switchboard", True, [_tool("mcp__switchboard_orch__delegate")], True),
     ],
 )
 def test_switchboard_uat_canary_never_forces_untrusted_or_nonmanaged_schema(
-    monkeypatch, mode, verified, api_tools
+    monkeypatch, mode, verified, api_tools, fail_closed
 ):
     monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", mode)
     monkeypatch.setenv("HERMES_ACP_SWITCHBOARD_FORCE_DIRECT_DELEGATE_ONCE", "1")
@@ -304,7 +321,14 @@ def test_switchboard_uat_canary_never_forces_untrusted_or_nonmanaged_schema(
     request = {"tools": api_tools, "tool_choice": "auto"}
 
     assert apply_switchboard_uat_direct_delegate_once(agent, request) is False
-    assert request == {"tools": api_tools, "tool_choice": "auto"}
+    if fail_closed:
+        assert request == {
+            "tools": [],
+            "tool_choice": "none",
+            "parallel_tool_calls": False,
+        }
+    else:
+        assert request == {"tools": api_tools, "tool_choice": "auto"}
 
 
 def test_verified_switchboard_runtime_gate_rejects_non_controller_tool(monkeypatch):
