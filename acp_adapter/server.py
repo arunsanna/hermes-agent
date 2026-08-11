@@ -1659,8 +1659,12 @@ class HermesACPAgent(acp.Agent):
                 disabled_toolsets=disabled_toolsets,
                 quiet_mode=True,
             )
+            inject_memory_provider_tools(state.agent)
             from acp_adapter.orchestration import without_switchboard_tool_search_bridge
 
+            # Memory providers append directly to agent.tools.  Apply the
+            # managed-parent boundary last so no local tool leaks into the
+            # provider-facing schema after trusted MCP setup.
             state.agent.tools = without_switchboard_tool_search_bridge(
                 state.agent,
                 state.agent.tools,
@@ -1668,7 +1672,6 @@ class HermesACPAgent(acp.Agent):
             state.agent.valid_tool_names = {
                 tool["function"]["name"] for tool in state.agent.tools or []
             }
-            inject_memory_provider_tools(state.agent)
             invalidate = getattr(state.agent, "_invalidate_system_prompt", None)
             if callable(invalidate):
                 invalidate()

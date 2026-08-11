@@ -148,7 +148,12 @@ def test_switchboard_model_schema_keeps_only_direct_controller_tools(monkeypatch
         enabled_toolsets=["hermes-acp", "mcp-switchboard_orch"],
         _switchboard_orchestration_mcp_registration_verified=True,
     )
-    schema = [*_switchboard_tools(), *_tool_search_bridges()]
+    schema = [
+        *_switchboard_tools(),
+        *_tool_search_bridges(),
+        _tool("skill_view"),
+        _tool("terminal"),
+    ]
 
     visible = without_switchboard_tool_search_bridge(agent, schema)
 
@@ -326,7 +331,12 @@ async def test_acp_registration_passes_hardened_switchboard_config(monkeypatch):
         ),
         patch(
             "model_tools.get_tool_definitions",
-            return_value=[*_switchboard_tools(), *_tool_search_bridges()],
+            return_value=[
+                *_switchboard_tools(),
+                *_tool_search_bridges(),
+                _tool("skill_view"),
+                _tool("terminal"),
+            ],
         ),
         patch("agent.memory_manager.inject_memory_provider_tools"),
     ):
@@ -421,9 +431,8 @@ async def test_acp_registration_keeps_switchboard_tools_in_model_schema(monkeypa
         model_tool_names = {
             tool["function"]["name"] for tool in state.agent.tools
         }
-        assert _SWITCHBOARD_MCP_TOOL_NAMES <= model_tool_names
-        assert not {"tool_search", "tool_describe", "tool_call"} & model_tool_names
-        assert _SWITCHBOARD_MCP_TOOL_NAMES <= state.agent.valid_tool_names
+        assert model_tool_names == _SWITCHBOARD_MCP_TOOL_NAMES
+        assert state.agent.valid_tool_names == _SWITCHBOARD_MCP_TOOL_NAMES
         assert orchestration_meta(state.agent)["verified"] is True
     finally:
         model_tools._clear_tool_defs_cache()

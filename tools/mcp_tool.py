@@ -7177,7 +7177,10 @@ def refresh_agent_mcp_tools(
         or []
     )
     try:
-        from acp_adapter.orchestration import without_switchboard_tool_search_bridge
+        from acp_adapter.orchestration import (
+            _SWITCHBOARD_MCP_TOOL_NAMES,
+            without_switchboard_tool_search_bridge,
+        )
 
         new_defs = without_switchboard_tool_search_bridge(agent, new_defs)
     except Exception:
@@ -7195,6 +7198,18 @@ def refresh_agent_mcp_tools(
     # half-swap. ``staged_engine_names`` are the context-engine routing names
     # this rebuild actually appended (matching agent_init's dedup-aware add).
     staged_engine_names = _reinject_post_build_tools(agent, new_defs, new_names)
+    try:
+        from acp_adapter.orchestration import without_switchboard_tool_search_bridge
+
+        # Post-build injectors append directly to the staged list.  Reapply
+        # the verified managed-parent boundary so a refresh cannot restore a
+        # local memory, skill, or context-engine tool.
+        new_defs = without_switchboard_tool_search_bridge(agent, new_defs)
+        new_names = {t["function"]["name"] for t in new_defs}
+        if new_names == _SWITCHBOARD_MCP_TOOL_NAMES:
+            staged_engine_names = set()
+    except Exception:
+        logger.debug("Switchboard final tool filtering skipped", exc_info=True)
 
     # Single atomic read-diff-publish so the returned ``added`` is consistent
     # with what was actually published, even under concurrent callers, and a

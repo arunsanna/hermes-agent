@@ -162,10 +162,15 @@ def test_refresh_keeps_managed_switchboard_controls_direct(monkeypatch):
     monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
     agent = _agent(
         ["read_file"],
-        enabled=["hermes-acp", "mcp-switchboard_orch"],
+        enabled=["hermes-acp", "memory", "mcp-switchboard_orch"],
         disabled=["delegation"],
     )
     agent._switchboard_orchestration_mcp_registration_verified = True
+    agent._memory_manager = types.SimpleNamespace(
+        get_all_tool_schemas=lambda: [
+            {"name": "memory_search", "description": "", "parameters": {}}
+        ]
+    )
 
     import model_tools
     monkeypatch.setattr(
@@ -174,13 +179,14 @@ def test_refresh_keeps_managed_switchboard_controls_direct(monkeypatch):
         lambda **kw: [
             *[_tool(name) for name in _SWITCHBOARD_MCP_TOOL_NAMES],
             *[_tool(name) for name in ("tool_search", "tool_describe", "tool_call")],
+            _tool("skill_view"),
+            _tool("terminal"),
         ],
     )
 
     mcp_tool.refresh_agent_mcp_tools(agent)
 
-    assert _SWITCHBOARD_MCP_TOOL_NAMES <= agent.valid_tool_names
-    assert not {"tool_search", "tool_describe", "tool_call"} & agent.valid_tool_names
+    assert agent.valid_tool_names == _SWITCHBOARD_MCP_TOOL_NAMES
 
 
 def test_refresh_is_thread_safe_under_concurrent_calls(monkeypatch):

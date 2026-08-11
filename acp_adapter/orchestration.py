@@ -55,12 +55,14 @@ def without_switchboard_tool_search_bridge(
     agent: Any,
     tool_defs: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Remove generic catalog bridges from a verified managed parent surface.
+    """Restrict a verified managed parent to Switchboard controller tools.
 
     The Switchboard controller controls are a four-tool, same-turn protocol,
     not optional catalog entries.  Leaving ``tool_search``/``tool_describe``/
     ``tool_call`` beside them invites smaller models to proxy a control through
     the generic bridge, which cannot safely dispatch a non-deferrable tool.
+    Other local tools (including skills) similarly give a managed parent an
+    alternate execution path instead of forcing Switchboard delegation.
 
     This only alters a model-facing schema after all three boundaries hold:
     Switchboard mode was requested, the session-bound registration was
@@ -92,12 +94,10 @@ def without_switchboard_tool_search_bridge(
     if switchboard_names != _SWITCHBOARD_MCP_TOOL_NAMES:
         return tool_defs
 
-    from tools.tool_search import BRIDGE_TOOL_NAMES
-
     return [
         tool
         for tool in tool_defs
-        if (tool.get("function") or {}).get("name") not in BRIDGE_TOOL_NAMES
+        if (tool.get("function") or {}).get("name") in _SWITCHBOARD_MCP_TOOL_NAMES
     ]
 
 
