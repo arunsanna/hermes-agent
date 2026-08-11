@@ -18,6 +18,11 @@ _MODE_ENV = "HERMES_ACP_ORCHESTRATION_MODE"
 _DISABLED_TOOLSETS_ENV = "HERMES_ACP_DISABLED_TOOLSETS"
 _SWITCHBOARD_MCP_COMMAND_ENV = "HERMES_ACP_SWITCHBOARD_MCP_COMMAND"
 _SWITCHBOARD_MCP_TOOL_TIMEOUT_ENV = "HERMES_ACP_SWITCHBOARD_MCP_TOOL_TIMEOUT_SECONDS"
+# A private, disposable canary switch used only by Switchboard's ACP launch
+# contract.  It intentionally accepts exactly ``1`` and is not Hermes config.
+_SWITCHBOARD_FORCE_DIRECT_DELEGATE_ONCE_ENV = (
+    "HERMES_ACP_SWITCHBOARD_FORCE_DIRECT_DELEGATE_ONCE"
+)
 _VALID_MODES = frozenset({"single", "native", "switchboard"})
 _SWITCHBOARD_MCP_SERVER = "switchboard_orch"
 _SWITCHBOARD_MCP_TOOL_TIMEOUT_SECONDS = 600.0
@@ -99,6 +104,63 @@ def without_switchboard_tool_search_bridge(
         for tool in tool_defs
         if (tool.get("function") or {}).get("name") in _SWITCHBOARD_MCP_TOOL_NAMES
     ]
+
+
+def apply_switchboard_uat_direct_delegate_once(
+    agent: Any,
+    api_kwargs: dict[str, Any],
+) -> bool:
+    """Force one verified managed-parent request to the delegate controller.
+
+    This is deliberately a private ACP canary, rather than a configurable
+    model-routing feature: it is active only when Switchboard explicitly
+    launches the parent with the exact value ``1``.  The per-agent marker is
+    consumed before dispatch so a retry rebuilt by the conversation loop, and
+    every later parent response, revert to normal managed-controller choice.
+
+    Both the live agent surface and the outgoing OpenAI tool list must be the
+    exact trusted four-tool Switchboard registration.  A native, single,
+    unverified, partial, or lookalike registration therefore cannot force an
+    arbitrary provider tool choice.
+    """
+    if os.environ.get(_SWITCHBOARD_FORCE_DIRECT_DELEGATE_ONCE_ENV) != "1":
+        return False
+    if getattr(agent, "_switchboard_uat_direct_delegate_once_consumed", False):
+        return False
+    if requested_orchestration_mode() != "switchboard":
+        return False
+    if not getattr(agent, "_switchboard_orchestration_mcp_registration_verified", False):
+        return False
+
+    enabled_toolsets = set(getattr(agent, "enabled_toolsets", None) or [])
+    if f"mcp-{_SWITCHBOARD_MCP_SERVER}" not in enabled_toolsets:
+        return False
+    if set(_tool_names(agent)) != _SWITCHBOARD_MCP_TOOL_NAMES:
+        return False
+
+    api_tools = api_kwargs.get("tools")
+    if not isinstance(api_tools, list):
+        return False
+    api_tool_names = {
+        function.get("name")
+        for tool in api_tools
+        if isinstance(tool, dict)
+        for function in [tool.get("function")]
+        if isinstance(function, dict) and isinstance(function.get("name"), str)
+    }
+    if api_tool_names != _SWITCHBOARD_MCP_TOOL_NAMES:
+        return False
+
+    # Consume before the provider call: retry rebuilding must never make a
+    # second logical request forcibly delegate, while a streaming fallback
+    # retains these same kwargs for its non-streaming transport retry.
+    setattr(agent, "_switchboard_uat_direct_delegate_once_consumed", True)
+    api_kwargs["tool_choice"] = {
+        "type": "function",
+        "function": {"name": "mcp__switchboard_orch__delegate"},
+    }
+    api_kwargs["parallel_tool_calls"] = False
+    return True
 
 
 def switchboard_runtime_tool_block(agent: Any, tool_name: str) -> str | None:

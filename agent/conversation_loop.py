@@ -2952,6 +2952,24 @@ def run_conversation(
                     _original_api_kwargs = dict(api_kwargs)
                     _llm_middleware_trace = []
 
+                # Private Switchboard ACP UAT canary.  This runs after request
+                # middleware has assembled the final provider payload, so the
+                # one-shot override reaches the transport without becoming a
+                # general middleware or user-facing model-control surface.
+                try:
+                    from acp_adapter.orchestration import (
+                        apply_switchboard_uat_direct_delegate_once,
+                    )
+
+                    apply_switchboard_uat_direct_delegate_once(agent, api_kwargs)
+                except Exception:
+                    # The ACP adapter is optional for ordinary Hermes callers;
+                    # a malformed/private UAT bridge must never block them.
+                    logger.debug(
+                        "Switchboard ACP direct-delegate UAT override skipped",
+                        exc_info=True,
+                    )
+
                 try:
                     from hermes_cli.lifecycle import (
                         has_hook,

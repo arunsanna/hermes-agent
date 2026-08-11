@@ -5,6 +5,7 @@ import pytest
 from acp.schema import McpServerStdio
 
 from acp_adapter.orchestration import (
+    apply_switchboard_uat_direct_delegate_once,
     apply_orchestration_tool_policy,
     enforce_session_mcp_registration,
     orchestration_meta,
@@ -44,6 +45,9 @@ def _clean_contract_env(monkeypatch):
     monkeypatch.delenv("HERMES_ACP_DISABLED_TOOLSETS", raising=False)
     monkeypatch.delenv("HERMES_ACP_SWITCHBOARD_MCP_COMMAND", raising=False)
     monkeypatch.delenv("HERMES_ACP_SWITCHBOARD_MCP_TOOL_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv(
+        "HERMES_ACP_SWITCHBOARD_FORCE_DIRECT_DELEGATE_ONCE", raising=False
+    )
 
 
 def test_contract_is_inert_without_switchboard_request():
@@ -161,6 +165,58 @@ def test_switchboard_model_schema_keeps_only_direct_controller_tools(monkeypatch
     assert {tool["function"]["name"] for tool in visible} == {
         tool["function"]["name"] for tool in _switchboard_tools()
     }
+
+
+def test_switchboard_uat_canary_forces_only_the_first_verified_request(monkeypatch):
+    monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
+    monkeypatch.setenv("HERMES_ACP_SWITCHBOARD_FORCE_DIRECT_DELEGATE_ONCE", "1")
+    agent = SimpleNamespace(
+        enabled_toolsets=["hermes-acp", "mcp-switchboard_orch"],
+        tools=_switchboard_tools(),
+        _switchboard_orchestration_mcp_registration_verified=True,
+    )
+    first_request = {"tools": _switchboard_tools(), "tool_choice": "auto"}
+
+    assert apply_switchboard_uat_direct_delegate_once(agent, first_request) is True
+    assert first_request["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "mcp__switchboard_orch__delegate"},
+    }
+    assert first_request["parallel_tool_calls"] is False
+
+    following_parent_request = {"tools": _switchboard_tools(), "tool_choice": "auto"}
+    assert (
+        apply_switchboard_uat_direct_delegate_once(agent, following_parent_request)
+        is False
+    )
+    assert following_parent_request == {
+        "tools": _switchboard_tools(),
+        "tool_choice": "auto",
+    }
+
+
+@pytest.mark.parametrize(
+    "mode, verified, api_tools",
+    [
+        ("native", True, _switchboard_tools()),
+        ("switchboard", False, _switchboard_tools()),
+        ("switchboard", True, [_tool("mcp__switchboard_orch__delegate")]),
+    ],
+)
+def test_switchboard_uat_canary_never_forces_untrusted_or_nonmanaged_schema(
+    monkeypatch, mode, verified, api_tools
+):
+    monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", mode)
+    monkeypatch.setenv("HERMES_ACP_SWITCHBOARD_FORCE_DIRECT_DELEGATE_ONCE", "1")
+    agent = SimpleNamespace(
+        enabled_toolsets=["hermes-acp", "mcp-switchboard_orch"],
+        tools=_switchboard_tools(),
+        _switchboard_orchestration_mcp_registration_verified=verified,
+    )
+    request = {"tools": api_tools, "tool_choice": "auto"}
+
+    assert apply_switchboard_uat_direct_delegate_once(agent, request) is False
+    assert request == {"tools": api_tools, "tool_choice": "auto"}
 
 
 def test_verified_switchboard_runtime_gate_rejects_non_controller_tool(monkeypatch):
