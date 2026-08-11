@@ -4978,6 +4978,13 @@ def _load_mcp_config() -> Dict[str, dict]:
                 safe_servers[name] = dict(cfg)
         except Exception:
             logger.debug("Failed to load portable MCP servers", exc_info=True)
+        try:
+            from acp_adapter.orchestration import without_reserved_switchboard_mcp
+
+            safe_servers = without_reserved_switchboard_mcp(safe_servers)
+        except ImportError:
+            # Hermes can run without the optional ACP adapter package.
+            pass
         return safe_servers
     except Exception as exc:
         logger.debug("Failed to load MCP config: %s", exc)
@@ -6575,6 +6582,23 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+def registered_mcp_server_matches_config(name: str, expected: dict) -> bool:
+    """Return whether a live/lazy server owns exactly ``expected`` config.
+
+    Registration is intentionally idempotent by server name. ACP uses this
+    postcondition for its reserved session-bound MCP server so an earlier
+    process-global connection cannot be mistaken for the trusted launcher.
+    """
+    with _lock:
+        server = _servers.get(name)
+        if server is not None:
+            actual = dict(getattr(server, "_config", {}) or {})
+        elif name in _lazy_server_configs:
+            actual = dict(_lazy_server_configs[name])
+        else:
+            return False
+    return actual == dict(expected)
 
 def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     """Connect to explicit MCP servers and register their tools.

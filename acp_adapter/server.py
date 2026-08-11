@@ -1477,6 +1477,42 @@ class HermesACPAgent(acp.Agent):
             )
             return None
 
+    def _session_meta(
+        self,
+        state: SessionState,
+        *,
+        current_hermes_session_id: Optional[str] = None,
+        previous_hermes_session_id: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Merge standard provenance with verified orchestration evidence."""
+        current_id = (
+            current_hermes_session_id
+            or getattr(state.agent, "session_id", state.session_id)
+        )
+        meta = self._provenance_meta(
+            state.session_id,
+            current_id,
+            previous_hermes_session_id,
+        ) or {}
+        try:
+            from acp_adapter.orchestration import orchestration_meta
+
+            contract = orchestration_meta(state.agent)
+            if contract is not None:
+                meta["switchboardOrchestration"] = contract
+        except Exception as exc:
+            meta["switchboardOrchestration"] = {
+                "requestedMode": os.environ.get("HERMES_ACP_ORCHESTRATION_MODE"),
+                "effectiveMode": "single",
+                "disabledToolsets": [],
+                "effectiveTools": [],
+                "mcpServers": [],
+                "mcpRegistrationVerified": False,
+                "verified": False,
+                "mismatchReason": f"could not verify effective tool policy: {exc}",
+            }
+        return meta or None
+
     async def _send_session_info_update(
         self,
         session_id: str,
@@ -1506,11 +1542,19 @@ class HermesACPAgent(acp.Agent):
         # the updated_at since we're emitting this notification precisely
         # because the title was just refreshed.
         updated_at = datetime.now(timezone.utc).isoformat()
-        meta = self._provenance_meta(
-            session_id,
-            current_hermes_session_id or session_id,
-            previous_hermes_session_id,
-        )
+        state = self.session_manager.peek_session(session_id)
+        if state is not None:
+            meta = self._session_meta(
+                state,
+                current_hermes_session_id=current_hermes_session_id,
+                previous_hermes_session_id=previous_hermes_session_id,
+            )
+        else:
+            meta = self._provenance_meta(
+                session_id,
+                current_hermes_session_id or session_id,
+                previous_hermes_session_id,
+            )
         update = SessionInfoUpdate(
             session_update="session_info_update",
             title=title if isinstance(title, str) and title.strip() else None,
@@ -1542,11 +1586,22 @@ class HermesACPAgent(acp.Agent):
             return
 
         try:
-            from tools.mcp_tool import register_mcp_servers
+            from acp_adapter.orchestration import enforce_session_mcp_registration
+            from tools.mcp_tool import (
+                register_mcp_servers,
+                registered_mcp_server_matches_config,
+            )
 
             config_map: dict[str, dict] = {}
+            setattr(
+                state.agent,
+                "_switchboard_orchestration_mcp_registration_verified",
+                False,
+            )
             for server in mcp_servers:
                 name = server.name
+                if name in config_map:
+                    raise RuntimeError(f"duplicate ACP MCP server name: {name}")
                 if isinstance(server, McpServerStdio):
                     config = {
                         "command": server.command,
@@ -1558,9 +1613,29 @@ class HermesACPAgent(acp.Agent):
                         "url": server.url,
                         "headers": {item.name: item.value for item in server.headers},
                     }
-                config_map[name] = config
+                config_map[name] = enforce_session_mcp_registration(
+                    name,
+                    config,
+                    is_stdio=isinstance(server, McpServerStdio),
+                )
 
             await asyncio.to_thread(register_mcp_servers, config_map)
+            if "switchboard_orch" in config_map:
+                trusted = await asyncio.to_thread(
+                    registered_mcp_server_matches_config,
+                    "switchboard_orch",
+                    config_map["switchboard_orch"],
+                )
+                if not trusted:
+                    raise RuntimeError(
+                        "switchboard_orch is not connected with the trusted "
+                        "session launcher configuration"
+                    )
+                setattr(
+                    state.agent,
+                    "_switchboard_orchestration_mcp_registration_verified",
+                    True,
+                )
         except Exception:
             logger.warning(
                 "Session %s: failed to register ACP MCP servers",
@@ -2067,9 +2142,7 @@ class HermesACPAgent(acp.Agent):
             session_id=state.session_id,
             models=self._build_model_state(state),
             modes=self._session_modes(state),
-            field_meta=self._provenance_meta(
-                state.session_id, getattr(state.agent, "session_id", state.session_id)
-            ),
+            field_meta=self._session_meta(state),
         )
 
     async def load_session(
@@ -2116,9 +2189,7 @@ class HermesACPAgent(acp.Agent):
         return LoadSessionResponse(
             models=self._build_model_state(state),
             modes=self._session_modes(state),
-            field_meta=self._provenance_meta(
-                session_id, getattr(state.agent, "session_id", session_id)
-            ),
+            field_meta=self._session_meta(state),
         )
 
     async def resume_session(
@@ -2153,9 +2224,7 @@ class HermesACPAgent(acp.Agent):
         return ResumeSessionResponse(
             models=self._build_model_state(state),
             modes=self._session_modes(state),
-            field_meta=self._provenance_meta(
-                state.session_id, getattr(state.agent, "session_id", state.session_id)
-            ),
+            field_meta=self._session_meta(state),
         )
 
     async def cancel(self, session_id: str, **kwargs: Any) -> None:
@@ -2207,6 +2276,13 @@ class HermesACPAgent(acp.Agent):
         mcp_servers: list | None = None,
         **kwargs: Any,
     ) -> ForkSessionResponse:
+        from acp_adapter.orchestration import requested_orchestration_mode
+
+        if requested_orchestration_mode() is not None:
+            raise RuntimeError(
+                "ACP session/fork is unavailable for a Switchboard-managed "
+                "orchestration session"
+            )
         self._guard_owned_session(session_id, "session/fork")
         state = self.session_manager.fork_session(session_id, cwd=cwd)
         new_id = state.session_id if state else ""
@@ -2219,6 +2295,7 @@ class HermesACPAgent(acp.Agent):
             session_id=new_id,
             models=self._build_model_state(state) if state is not None else None,
             modes=self._session_modes(state) if state is not None else None,
+            field_meta=self._session_meta(state) if state is not None else None,
         )
 
     async def list_sessions(

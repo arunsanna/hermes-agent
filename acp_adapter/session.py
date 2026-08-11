@@ -383,6 +383,15 @@ class SessionManager:
         """Deep-copy a session's history into a new session."""
         import threading
 
+        from acp_adapter.orchestration import requested_orchestration_mode
+
+        if requested_orchestration_mode() is not None:
+            raise RuntimeError(
+                "ACP session/fork is unavailable for a Switchboard-managed "
+                "orchestration session; a fork requires a distinct gateway "
+                "record and credential"
+            )
+
         cwd = _translate_acp_cwd(cwd)
         original = self.get_session(session_id)  # checks DB too
         if original is None:
@@ -886,9 +895,13 @@ class SessionManager:
         elif isinstance(model_cfg, str) and model_cfg.strip():
             default_model = model_cfg.strip()
 
+        from acp_adapter.orchestration import without_reserved_switchboard_mcp
+
         configured_mcp_servers = [
             name
-            for name, cfg in (config.get("mcp_servers") or {}).items()
+            for name, cfg in without_reserved_switchboard_mcp(
+                config.get("mcp_servers")
+            ).items()
             if not isinstance(cfg, dict) or cfg.get("enabled", True) is not False
         ]
         agent_cfg = config.get("agent")
@@ -926,6 +939,14 @@ class SessionManager:
             "model": model or default_model,
             "reasoning_config": reasoning_config,
         }
+
+        # Internal Switchboard bridge contract: apply the session-scoped
+        # orchestration owner before AIAgent snapshots its tools. Invalid or
+        # incomplete enforcement fails construction rather than silently
+        # exposing Hermes native delegation in Single/Switchboard mode.
+        from acp_adapter.orchestration import apply_orchestration_tool_policy
+
+        apply_orchestration_tool_policy(kwargs)
 
         try:
             runtime = resolve_runtime_provider(requested=requested_provider or config_provider)
