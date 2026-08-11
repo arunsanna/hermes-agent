@@ -90,6 +90,67 @@ class TestClassification:
                 f"ACP controller tool '{name}' must NEVER be deferrable"
             )
 
+    def test_switchboard_mcp_tools_never_defer_after_registration(self, monkeypatch):
+        """The exact trusted Switchboard surface survives tool search."""
+        from acp_adapter.orchestration import _SWITCHBOARD_MCP_TOOL_NAMES
+        from tools.registry import ToolRegistry
+        from tools.tool_search import classify_tools, is_deferrable_tool_name
+        import model_tools
+
+        def _handler(*_args, **_kwargs):
+            return "{}"
+
+        registry = ToolRegistry()
+        monkeypatch.setattr("tools.registry.registry", registry)
+        monkeypatch.setattr(model_tools, "registry", registry)
+        for name in _SWITCHBOARD_MCP_TOOL_NAMES:
+            registry.register(
+                name=name,
+                handler=_handler,
+                schema=_td(name, f"Switchboard protocol tool {name}"),
+                toolset="mcp-switchboard_orch",
+            )
+            assert not is_deferrable_tool_name(name), (
+                f"Switchboard MCP tool '{name}' must NEVER be deferrable"
+            )
+
+        definitions = registry.get_definitions(
+            sorted(_SWITCHBOARD_MCP_TOOL_NAMES), quiet=True
+        )
+        visible, deferred = classify_tools(definitions)
+        assert {
+            item["function"]["name"] for item in visible
+        } == _SWITCHBOARD_MCP_TOOL_NAMES
+        assert deferred == []
+
+        model_tools._clear_tool_defs_cache()
+        assembled = model_tools.get_tool_definitions(
+            enabled_toolsets=["hermes-acp", "mcp-switchboard_orch"],
+            quiet_mode=True,
+        )
+        assembled_names = {item["function"]["name"] for item in assembled}
+        assert _SWITCHBOARD_MCP_TOOL_NAMES <= assembled_names
+        assert not {"tool_search", "tool_describe", "tool_call"} & assembled_names
+        model_tools._clear_tool_defs_cache()
+
+    def test_same_named_non_switchboard_tool_remains_deferrable(self, monkeypatch):
+        """Only the registered trusted ACP server gets eager treatment."""
+        from acp_adapter.orchestration import _SWITCHBOARD_MCP_TOOL_NAMES
+        from tools.registry import ToolRegistry
+        from tools.tool_search import is_deferrable_tool_name
+
+        name = next(iter(_SWITCHBOARD_MCP_TOOL_NAMES))
+        registry = ToolRegistry()
+        registry.register(
+            name=name,
+            handler=lambda *_args, **_kwargs: "{}",
+            schema=_td(name, "Untrusted same-name plugin tool"),
+            toolset="plugin-untrusted",
+        )
+        monkeypatch.setattr("tools.registry.registry", registry)
+
+        assert is_deferrable_tool_name(name)
+
     def test_bridge_tools_never_defer(self):
         from tools.tool_search import is_deferrable_tool_name, BRIDGE_TOOL_NAMES
         for name in BRIDGE_TOOL_NAMES:

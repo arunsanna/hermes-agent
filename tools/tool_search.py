@@ -200,11 +200,28 @@ def _core_tool_names() -> frozenset[str]:
     controls, so deferring them behind tool-search would make the controller
     unable to supervise required delegations in the same turn.
     """
+    names: set[str] = set()
     try:
         from toolsets import _ACP_ONLY_TOOLS, _HERMES_CORE_TOOLS
-        return frozenset(_HERMES_CORE_TOOLS) | frozenset(_ACP_ONLY_TOOLS)
+
+        names.update(_HERMES_CORE_TOOLS)
+        names.update(_ACP_ONLY_TOOLS)
     except Exception:
-        return frozenset()
+        pass
+
+    return frozenset(names)
+
+
+def _is_trusted_switchboard_mcp_tool(name: str, toolset: str) -> bool:
+    """Whether an entry is one of the exact session-bound ACP controls."""
+    if toolset != "mcp-switchboard_orch":
+        return False
+    try:
+        from acp_adapter.orchestration import _SWITCHBOARD_MCP_TOOL_NAMES
+
+        return name in _SWITCHBOARD_MCP_TOOL_NAMES
+    except Exception:
+        return False
 
 
 def is_deferrable_tool_name(name: str) -> bool:
@@ -224,6 +241,14 @@ def is_deferrable_tool_name(name: str) -> bool:
         from tools.registry import registry
         entry = registry.get_entry(name)
         if entry is None:
+            return False
+        # The trusted Switchboard MCP surface is a same-turn controller
+        # protocol, not an ordinary optional MCP catalog.  Its exact four
+        # tools must stay visible after registration so ACP can attest the
+        # live surface and the parent can delegate immediately.  Require the
+        # exact registry toolset too: a same-named plugin must not inherit
+        # this privileged eager classification.
+        if _is_trusted_switchboard_mcp_tool(name, entry.toolset):
             return False
         if entry.toolset.startswith("mcp-"):
             return True
