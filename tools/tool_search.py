@@ -193,10 +193,16 @@ def _core_tool_names() -> frozenset[str]:
 
     Imported lazily because ``toolsets`` imports from ``tools.registry``
     and we don't want a hard cycle.
+
+    ACP delegation controls are intentionally not part of the ordinary core
+    bundle: they must appear only for the direct ``hermes-acp`` controller,
+    never for child or default toolsets.  They are nevertheless protocol
+    controls, so deferring them behind tool-search would make the controller
+    unable to supervise required delegations in the same turn.
     """
     try:
-        from toolsets import _HERMES_CORE_TOOLS
-        return frozenset(_HERMES_CORE_TOOLS)
+        from toolsets import _ACP_ONLY_TOOLS, _HERMES_CORE_TOOLS
+        return frozenset(_HERMES_CORE_TOOLS) | frozenset(_ACP_ONLY_TOOLS)
     except Exception:
         return frozenset()
 

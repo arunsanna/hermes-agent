@@ -80,6 +80,16 @@ class TestClassification:
                 f"Core tool '{core_name}' must NEVER be deferrable"
             )
 
+    def test_acp_controller_tools_never_defer(self):
+        """Direct ACP needs these same-turn protocol controls eagerly."""
+        from toolsets import _ACP_ONLY_TOOLS
+        from tools.tool_search import is_deferrable_tool_name
+
+        for name in _ACP_ONLY_TOOLS:
+            assert not is_deferrable_tool_name(name), (
+                f"ACP controller tool '{name}' must NEVER be deferrable"
+            )
+
     def test_bridge_tools_never_defer(self):
         from tools.tool_search import is_deferrable_tool_name, BRIDGE_TOOL_NAMES
         for name in BRIDGE_TOOL_NAMES:
