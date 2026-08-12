@@ -24,6 +24,7 @@ call is synchronous and behaves like AIAgent's existing chat_completions loop.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
@@ -350,6 +351,26 @@ class CodexAppServerSession:
                 extra_args.extend(
                     ["-c", f"model_reasoning_effort={self._reasoning_effort}"]
                 )
+            # In Switchboard mode Hermes has already attested this
+            # session-private launcher. Codex app-server owns its own agentic
+            # tool catalog, so forward the controller MCP explicitly.
+            if os.environ.get("HERMES_ACP_ORCHESTRATION_MODE") == "switchboard":
+                launcher = os.environ.get(
+                    "HERMES_ACP_SWITCHBOARD_MCP_COMMAND", ""
+                ).strip()
+                gateway_url = os.environ.get("SWITCHBOARD_GATEWAY_URL", "").strip()
+                session_id = os.environ.get("SWITCHBOARD_SESSION_ID", "").strip()
+                if launcher and gateway_url and session_id:
+                    mcp_config = (
+                        "mcp_servers.switchboard_orch={"
+                        f"command={json.dumps(launcher)},"
+                        "args=[],"
+                        "env={"
+                        f"SWITCHBOARD_GATEWAY_URL={json.dumps(gateway_url)},"
+                        f"SWITCHBOARD_SESSION_ID={json.dumps(session_id)}"
+                        "}}"
+                    )
+                    extra_args.extend(["-c", mcp_config])
             self._client = self._client_factory(
                 codex_bin=self._codex_bin,
                 codex_home=self._codex_home,

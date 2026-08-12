@@ -206,6 +206,27 @@ class TestLifecycle:
             "model_reasoning_effort=ultra",
         ]
 
+    def test_switchboard_controller_is_forwarded_to_nested_codex(self, monkeypatch):
+        captured = {}
+        client = FakeClient()
+        monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
+        monkeypatch.setenv(
+            "HERMES_ACP_SWITCHBOARD_MCP_COMMAND", "/tmp/private-orch-launcher"
+        )
+        monkeypatch.setenv("SWITCHBOARD_GATEWAY_URL", "https://127.0.0.1:3030")
+        monkeypatch.setenv("SWITCHBOARD_SESSION_ID", "sess-parent")
+
+        session = CodexAppServerSession(
+            cwd="/tmp",
+            client_factory=lambda **kwargs: captured.update(kwargs) or client,
+        )
+        session.ensure_started()
+
+        assert captured["extra_args"] == [
+            "-c",
+            'mcp_servers.switchboard_orch={command="/tmp/private-orch-launcher",args=[],env={SWITCHBOARD_GATEWAY_URL="https://127.0.0.1:3030",SWITCHBOARD_SESSION_ID="sess-parent"}}',
+        ]
+
     def test_close_idempotent(self):
         client = FakeClient()
         s = make_session(client)
