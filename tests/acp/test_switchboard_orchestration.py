@@ -55,6 +55,13 @@ def _tool_search_bridges() -> list[dict]:
     ]
 
 
+def _trusted_child_env() -> dict[str, str]:
+    return {
+        "SWITCHBOARD_GATEWAY_URL": "https://127.0.0.1:3030",
+        "SWITCHBOARD_SESSION_ID": "sess-test-parent",
+    }
+
+
 @pytest.fixture(autouse=True)
 def _clean_contract_env(monkeypatch):
     monkeypatch.delenv("HERMES_ACP_ORCHESTRATION_MODE", raising=False)
@@ -64,6 +71,8 @@ def _clean_contract_env(monkeypatch):
     monkeypatch.delenv(
         "HERMES_ACP_SWITCHBOARD_FORCE_DIRECT_DELEGATE_ONCE", raising=False
     )
+    for name, value in _trusted_child_env().items():
+        monkeypatch.setenv(name, value)
 
 
 def test_contract_is_inert_without_switchboard_request():
@@ -558,9 +567,35 @@ def test_switchboard_reserved_mcp_uses_trusted_launcher_and_600_second_timeout(
     assert config == {
         "command": "/private/tmp/orch-launcher",
         "args": [],
-        "env": {},
+        "env": _trusted_child_env(),
         "timeout": 600.0,
     }
+
+
+@pytest.mark.parametrize(
+    "missing_env",
+    ["SWITCHBOARD_GATEWAY_URL", "SWITCHBOARD_SESSION_ID"],
+)
+def test_switchboard_reserved_mcp_requires_trusted_parent_environment(
+    monkeypatch, missing_env
+):
+    monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
+    monkeypatch.setenv(
+        "HERMES_ACP_SWITCHBOARD_MCP_COMMAND", "/private/tmp/orch-launcher"
+    )
+    monkeypatch.setenv("HERMES_ACP_SWITCHBOARD_MCP_TOOL_TIMEOUT_SECONDS", "600")
+    monkeypatch.delenv(missing_env)
+
+    with pytest.raises(RuntimeError, match=missing_env):
+        enforce_session_mcp_registration(
+            "switchboard_orch",
+            {
+                "command": "/private/tmp/orch-launcher",
+                "args": [],
+                "env": {},
+            },
+            is_stdio=True,
+        )
 
 
 @pytest.mark.asyncio
@@ -619,7 +654,7 @@ async def test_acp_registration_passes_hardened_switchboard_config(monkeypatch):
         "switchboard_orch": {
             "command": "/private/tmp/orch-launcher",
             "args": [],
-            "env": {},
+            "env": _trusted_child_env(),
             "timeout": 600.0,
         }
     }
@@ -773,7 +808,7 @@ async def test_session_model_switch_restores_verified_switchboard_mcp_surface(
         "switchboard_orch": {
             "command": "/private/tmp/orch-launcher",
             "args": [],
-            "env": {},
+            "env": _trusted_child_env(),
             "timeout": 600.0,
         }
     }

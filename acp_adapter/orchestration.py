@@ -18,6 +18,8 @@ _MODE_ENV = "HERMES_ACP_ORCHESTRATION_MODE"
 _DISABLED_TOOLSETS_ENV = "HERMES_ACP_DISABLED_TOOLSETS"
 _SWITCHBOARD_MCP_COMMAND_ENV = "HERMES_ACP_SWITCHBOARD_MCP_COMMAND"
 _SWITCHBOARD_MCP_TOOL_TIMEOUT_ENV = "HERMES_ACP_SWITCHBOARD_MCP_TOOL_TIMEOUT_SECONDS"
+_SWITCHBOARD_GATEWAY_URL_ENV = "SWITCHBOARD_GATEWAY_URL"
+_SWITCHBOARD_SESSION_ID_ENV = "SWITCHBOARD_SESSION_ID"
 # A private, disposable canary switch used only by Switchboard's ACP launch
 # contract.  It intentionally accepts exactly ``1`` and is not Hermes config.
 _SWITCHBOARD_FORCE_DIRECT_DELEGATE_ONCE_ENV = (
@@ -358,10 +360,24 @@ def enforce_session_mcp_registration(
             f"{_SWITCHBOARD_MCP_TOOL_TIMEOUT_SECONDS:g}"
         )
 
+    trusted_child_env: dict[str, str] = {}
+    for env_name in (_SWITCHBOARD_GATEWAY_URL_ENV, _SWITCHBOARD_SESSION_ID_ENV):
+        value = (os.environ.get(env_name) or "").strip()
+        if not value:
+            raise RuntimeError(f"{env_name} is required")
+        trusted_child_env[env_name] = value
+
     hardened = dict(config)
     hardened["command"] = expected_command
     hardened["args"] = []
-    hardened["env"] = {}
+    # The ACP request is forbidden from supplying environment variables, but
+    # Hermes' stdio launcher uses a scrubbed environment rather than inheriting
+    # the ACP process wholesale. Forward only the two session-scoped values
+    # that Switchboard placed on the trusted parent process. Without this
+    # explicit allowlist the shim receives an empty base URL and every native
+    # provider reports reqwest's opaque "builder error" before reaching the
+    # gateway.
+    hardened["env"] = trusted_child_env
     hardened["timeout"] = timeout
     return hardened
 
