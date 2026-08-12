@@ -2424,8 +2424,20 @@ class MCPServerTask:
                 # in that case fall back to the pre-ping ``list_tools`` probe
                 # for the rest of this connection rather than reconnect-looping.
                 if self.session:
+                    # A user-visible tool call may legitimately hold the
+                    # per-server RPC lock longer than a keepalive interval
+                    # (for example, an orchestration completion barrier).
+                    # Probing concurrently can make the server serialize the
+                    # ping behind that call, hit the probe timeout, and tear
+                    # down a healthy transport underneath the active call.
+                    # Keepalives are for idle connections, so skip this cycle
+                    # while an RPC is in flight. Acquire the lock around the
+                    # probe as well to close the check-to-call race.
+                    if self._rpc_lock.locked():
+                        continue
                     try:
-                        await self._keepalive_probe()
+                        async with self._rpc_lock:
+                            await self._keepalive_probe()
                     except Exception as exc:
                         root = _unwrap_exception_group(exc)
                         logger.warning(

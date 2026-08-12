@@ -138,6 +138,23 @@ class TestKeepaliveProbe:
         task.session.send_ping.assert_awaited_once()
         task.session.list_tools.assert_not_called()
 
+    async def test_keepalive_skips_probe_during_long_running_tool_call(self):
+        """An active completion barrier must not be killed as stale."""
+        task = MCPServerTask("test")
+        task.session = SimpleNamespace(
+            list_tools=AsyncMock(),
+            send_ping=AsyncMock(),
+        )
+        await task._rpc_lock.acquire()
+        try:
+            reason = await self._run_one_keepalive_cycle(task)
+        finally:
+            task._rpc_lock.release()
+
+        assert reason == "shutdown"
+        task.session.send_ping.assert_not_awaited()
+        task.session.list_tools.assert_not_called()
+
 
 class TestKeepaliveInterval:
     """The keepalive cadence is configurable so servers with short session
@@ -289,5 +306,4 @@ class TestKeepaliveProbeFallback:
         await task._discover_tools()
 
         assert task._ping_unsupported is False
-
 
