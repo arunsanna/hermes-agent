@@ -209,6 +209,65 @@ def test_switchboard_model_schema_keeps_only_direct_controller_tools(monkeypatch
     }
 
 
+def test_switchboard_model_schema_keeps_explicit_discovery_backed_read_only_mcp(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
+    read_tool = "mcp__webull__get_watchlists"
+    write_tool = "mcp__webull__add_watchlist"
+    agent = SimpleNamespace(
+        enabled_toolsets=["hermes-acp", "mcp-switchboard_orch", "mcp-webull"],
+        tools=[*_switchboard_tools(), _tool(read_tool), _tool(write_tool)],
+        _switchboard_orchestration_mcp_registration_verified=True,
+    )
+    schema = [*agent.tools, *_tool_search_bridges(), _tool("terminal")]
+
+    with patch(
+        "tools.mcp_tool.get_switchboard_parent_read_only_tool_names",
+        return_value={read_tool},
+    ):
+        visible = without_switchboard_tool_search_bridge(agent, schema)
+
+    assert {tool["function"]["name"] for tool in visible} == {
+        *{tool["function"]["name"] for tool in _switchboard_tools()},
+        read_tool,
+    }
+
+
+def test_switchboard_model_schema_promotes_selected_read_only_mcp_from_registry(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
+    read_tool = "mcp__webull__get_watchlists"
+    agent = SimpleNamespace(
+        _switchboard_orchestration_mcp_registration_verified=True,
+    )
+
+    with (
+        patch(
+            "tools.mcp_tool.get_switchboard_parent_read_only_tool_names",
+            return_value={read_tool},
+        ),
+        patch(
+            "tools.registry.registry.get_schema",
+            return_value={
+                "name": read_tool,
+                "description": "List watchlists",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        ),
+    ):
+        visible = without_switchboard_tool_search_bridge(
+            agent,
+            [*_switchboard_tools(), *_tool_search_bridges()],
+        )
+
+    assert {tool["function"]["name"] for tool in visible} == {
+        *{tool["function"]["name"] for tool in _switchboard_tools()},
+        read_tool,
+    }
+
+
 def test_switchboard_model_schema_survives_late_toolset_bookkeeping_loss(monkeypatch):
     monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
     agent = SimpleNamespace(
@@ -357,6 +416,25 @@ def test_verified_switchboard_runtime_gate_rejects_non_controller_tool(monkeypat
         )
         is None
     )
+
+
+def test_verified_switchboard_runtime_gate_allows_only_selected_read_only_mcp(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
+    read_tool = "mcp__webull__get_watchlists"
+    write_tool = "mcp__webull__add_watchlist"
+    agent = SimpleNamespace(
+        tools=[*_switchboard_tools(), _tool(read_tool), _tool(write_tool)],
+        _switchboard_orchestration_mcp_registration_verified=True,
+    )
+
+    with patch(
+        "tools.mcp_tool.get_switchboard_parent_read_only_tool_names",
+        return_value={read_tool},
+    ):
+        assert switchboard_runtime_tool_block(agent, read_tool) is None
+        assert switchboard_runtime_tool_block(agent, write_tool) is not None
 
 
 def test_unverified_switchboard_runtime_gate_stays_inert(monkeypatch):

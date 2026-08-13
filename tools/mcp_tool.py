@@ -3805,6 +3805,12 @@ _CIRCUIT_BREAKER_COOLDOWN_SEC = 60.0
 # byte-stable and prompt caching is preserved.
 _server_trust_levels: Dict[str, str] = {}
 _tool_read_only_hints: Dict[str, Dict[str, bool]] = {}
+# Registry names that an operator explicitly selected for direct use by a
+# Switchboard-managed parent *and* whose live/cache discovery metadata marks
+# them read-only.  Selection alone is insufficient: missing or false
+# readOnlyHint always fails closed.
+_switchboard_parent_read_only_tools: set[str] = set()
+_switchboard_parent_raw_tools: Dict[str, set[str]] = {}
 
 _TRUST_FULL = "full"
 _TRUST_UNTRUSTED = "untrusted"
@@ -3857,6 +3863,15 @@ def _record_tool_trust_metadata(
         _server_trust_levels[server_name] = _normalize_server_trust(
             (config or {}).get("trust")
         )
+        selected = (config or {}).get("switchboard_parent_read_only_tools")
+        if isinstance(selected, list):
+            _switchboard_parent_raw_tools[server_name] = {
+                value.strip()
+                for value in selected
+                if isinstance(value, str) and value.strip()
+            }
+        else:
+            _switchboard_parent_raw_tools.pop(server_name, None)
         hints = _tool_read_only_hints.setdefault(server_name, {})
         for tool in tools:
             name = getattr(tool, "name", None)
@@ -6064,16 +6079,29 @@ _UTILITY_CAPABILITY_ATTRS = {
 }
 
 
-def _track_mcp_tool_server(tool_name: str, server_name: str) -> None:
+def _track_mcp_tool_server(
+    tool_name: str,
+    server_name: str,
+    raw_tool_name: str | None = None,
+) -> None:
     """Remember the exact raw MCP server that registered *tool_name*."""
     with _lock:
         _mcp_tool_server_names[tool_name] = server_name
+        if (
+            raw_tool_name is not None
+            and raw_tool_name in _switchboard_parent_raw_tools.get(server_name, set())
+            and _tool_read_only_hints.get(server_name, {}).get(raw_tool_name) is True
+        ):
+            _switchboard_parent_read_only_tools.add(tool_name)
+        else:
+            _switchboard_parent_read_only_tools.discard(tool_name)
 
 
 def _forget_mcp_tool_server(tool_name: str) -> None:
     """Forget MCP server provenance for a deregistered tool."""
     with _lock:
         _mcp_tool_server_names.pop(tool_name, None)
+        _switchboard_parent_read_only_tools.discard(tool_name)
 
 
 def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dict) -> List[dict]:
@@ -6223,6 +6251,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
         candidates.append(
             {
                 "registry_name": schema["name"],
+                "raw_tool_name": mcp_tool.name,
                 "origin": f"tool {mcp_tool.name!r}",
                 "schema": schema,
                 "handler": _make_tool_handler(
@@ -6246,6 +6275,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
         candidates.append(
             {
                 "registry_name": schema["name"],
+                "raw_tool_name": None,
                 "origin": f"generated utility {handler_key!r}",
                 "schema": schema,
                 "handler": handler_factories[handler_key](
@@ -6341,7 +6371,11 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             )
             continue
 
-        _track_mcp_tool_server(registry_name, name)
+        _track_mcp_tool_server(
+            registry_name,
+            name,
+            candidate["raw_tool_name"],
+        )
         registered_names.append(registry_name)
 
     if registered_names:
@@ -6481,7 +6515,7 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
         )
         if registry.get_toolset_for_tool(registry_name) != toolset_name:
             continue
-        _track_mcp_tool_server(registry_name, name)
+        _track_mcp_tool_server(registry_name, name, raw_name)
         registered_names.append(registry_name)
 
     handler_factories = {
@@ -7108,6 +7142,17 @@ def get_registered_mcp_server_names() -> set:
     """
     with _lock:
         return set(_mcp_tool_server_names.values())
+
+
+def get_switchboard_parent_read_only_tool_names() -> set[str]:
+    """Return operator-selected MCP tools proven read-only at discovery.
+
+    This is intentionally a registry-name snapshot.  Switchboard's ACP policy
+    intersects it with the current agent schema, so stale or unavailable tools
+    cannot be synthesized into a provider request.
+    """
+    with _lock:
+        return set(_switchboard_parent_read_only_tools)
 
 
 

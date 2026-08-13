@@ -87,7 +87,7 @@ def without_switchboard_tool_search_bridge(
     agent: Any,
     tool_defs: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Restrict a verified managed parent to Switchboard controller tools.
+    """Restrict a verified managed parent to controllers and approved reads.
 
     The Switchboard controller controls are a four-tool, same-turn protocol,
     not optional catalog entries.  Leaving ``tool_search``/``tool_describe``/
@@ -109,6 +109,8 @@ def without_switchboard_tool_search_bridge(
     if not getattr(agent, "_switchboard_orchestration_mcp_registration_verified", False):
         return tool_defs
 
+    tool_defs = _with_switchboard_parent_read_only_schemas(tool_defs)
+
     names = {
         function.get("name")
         for tool in tool_defs
@@ -124,11 +126,59 @@ def without_switchboard_tool_search_bridge(
     if switchboard_names != _SWITCHBOARD_MCP_TOOL_NAMES:
         return tool_defs
 
+    allowed = set(_SWITCHBOARD_MCP_TOOL_NAMES) | (
+        names & _switchboard_parent_read_only_tool_names()
+    )
     return [
         tool
         for tool in tool_defs
-        if (tool.get("function") or {}).get("name") in _SWITCHBOARD_MCP_TOOL_NAMES
+        if (tool.get("function") or {}).get("name") in allowed
     ]
+
+
+def _switchboard_parent_read_only_tool_names() -> set[str]:
+    """Read the discovery-backed MCP allowlist without coupling ACP startup."""
+    try:
+        from tools.mcp_tool import get_switchboard_parent_read_only_tool_names
+
+        return get_switchboard_parent_read_only_tool_names()
+    except ImportError:
+        return set()
+
+
+def _with_switchboard_parent_read_only_schemas(
+    tool_defs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Promote selected MCP schemas that progressive disclosure deferred."""
+    selected = _switchboard_parent_read_only_tool_names()
+    if not selected:
+        return tool_defs
+    existing = {
+        (tool.get("function") or {}).get("name")
+        for tool in tool_defs
+        if isinstance(tool, dict) and isinstance(tool.get("function"), dict)
+    }
+    missing = selected - existing
+    if not missing:
+        return tool_defs
+    try:
+        from tools.registry import registry
+    except ImportError:
+        return tool_defs
+
+    promoted = list(tool_defs)
+    for name in sorted(missing):
+        schema = registry.get_schema(name)
+        if isinstance(schema, dict) and schema.get("name") == name:
+            promoted.append({"type": "function", "function": dict(schema)})
+    return promoted
+
+
+def _switchboard_visible_tool_names(agent: Any) -> set[str]:
+    current = set(_tool_names(agent))
+    return set(_SWITCHBOARD_MCP_TOOL_NAMES) | (
+        current & _switchboard_parent_read_only_tool_names()
+    )
 
 
 def _enforce_verified_switchboard_model_surface(agent: Any) -> None:
@@ -155,7 +205,7 @@ def restrict_verified_switchboard_request_tools(
     agent: Any,
     api_kwargs: dict[str, Any],
 ) -> bool | None:
-    """Clamp an attested managed parent to its four provider-visible tools.
+    """Clamp a managed parent to controllers plus approved read-only MCP.
 
     MCP refreshes can race the initial ACP acknowledgement and repopulate an
     already-verified agent with broad local schemas.  The final provider
@@ -171,18 +221,20 @@ def restrict_verified_switchboard_request_tools(
 
     _enforce_verified_switchboard_model_surface(agent)
     api_tools = api_kwargs.get("tools")
-    controller_tools: list[Any] = []
+    allowed_names = _switchboard_visible_tool_names(agent)
+    allowed_tools: list[Any] = []
     if isinstance(api_tools, list):
-        controller_tools = [
+        allowed_tools = [
             tool
             for tool in api_tools
-            if bool(_api_tool_names([tool]) & _SWITCHBOARD_MCP_TOOL_NAMES)
+            if bool(_api_tool_names([tool]) & allowed_names)
         ]
     if (
-        set(_tool_names(agent)) == _SWITCHBOARD_MCP_TOOL_NAMES
-        and _api_tool_names(controller_tools) == _SWITCHBOARD_MCP_TOOL_NAMES
+        set(_tool_names(agent)) == allowed_names
+        and _api_tool_names(allowed_tools) == allowed_names
+        and _SWITCHBOARD_MCP_TOOL_NAMES <= allowed_names
     ):
-        api_kwargs["tools"] = controller_tools
+        api_kwargs["tools"] = allowed_tools
         return True
 
     api_kwargs["tools"] = []
@@ -203,10 +255,10 @@ def apply_switchboard_uat_direct_delegate_once(
     consumed before dispatch so a retry rebuilt by the conversation loop, and
     every later parent response, revert to normal managed-controller choice.
 
-    Both the live agent surface and the outgoing OpenAI tool list must be the
-    exact trusted four-tool Switchboard registration.  A native, single,
-    unverified, partial, or lookalike registration therefore cannot force an
-    arbitrary provider tool choice.
+    Both the live agent surface and outgoing list must include the trusted
+    four-tool Switchboard registration; explicitly approved read-only MCP
+    tools may coexist. A native, single, unverified, partial, or lookalike
+    registration therefore cannot force an arbitrary provider tool choice.
     """
     if os.environ.get(_SWITCHBOARD_FORCE_DIRECT_DELEGATE_ONCE_ENV) != "1":
         return False
@@ -246,8 +298,9 @@ def switchboard_runtime_tool_block(agent: Any, tool_name: str) -> str | None:
     boundary: a provider can retain an earlier schema, emit a hallucinated
     function, or reach a direct registry dispatch path.  Once the session has
     proved the exact trusted Switchboard MCP surface, the parent may execute
-    only those four controller calls.  The dispatchers consume this helper
-    before local special cases and registry dispatch.
+    only those controller calls plus discovery-backed, operator-selected
+    read-only MCP calls. The dispatchers consume this helper before local
+    special cases and registry dispatch.
 
     It deliberately stays inert for native, single, and unverified sessions.
     Those modes retain Hermes' normal tool policy and are not accidentally
@@ -265,12 +318,12 @@ def switchboard_runtime_tool_block(agent: Any, tool_name: str) -> str | None:
     if effective_switchboard_tools != _SWITCHBOARD_MCP_TOOL_NAMES:
         return None
 
-    if tool_name in _SWITCHBOARD_MCP_TOOL_NAMES:
+    if tool_name in _switchboard_visible_tool_names(agent):
         return None
     return (
         "Switchboard orchestration runtime policy permits only the verified "
-        "controller tools: "
-        + ", ".join(sorted(_SWITCHBOARD_MCP_TOOL_NAMES))
+        "controller tools and explicitly selected read-only MCP tools: "
+        + ", ".join(sorted(_switchboard_visible_tool_names(agent)))
         + ". The requested tool was not executed."
     )
 

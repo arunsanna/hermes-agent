@@ -94,6 +94,53 @@ class TestFilterMCPChildren:
 # Config loading
 # ---------------------------------------------------------------------------
 
+
+def test_switchboard_parent_selection_requires_explicit_config_and_read_only_hint():
+    import tools.mcp_tool as mcp_tool
+
+    read_registry = "mcp__webull__get_watchlists"
+    write_registry = "mcp__webull__add_watchlist"
+    unselected_registry = "mcp__webull__get_orders"
+    tools = [
+        SimpleNamespace(
+            name="get_watchlists",
+            annotations={"readOnlyHint": True},
+        ),
+        SimpleNamespace(
+            name="add_watchlist",
+            annotations={"readOnlyHint": False},
+        ),
+        SimpleNamespace(
+            name="get_orders",
+            annotations={"readOnlyHint": True},
+        ),
+    ]
+    config = {
+        "switchboard_parent_read_only_tools": [
+            "get_watchlists",
+            "add_watchlist",
+        ]
+    }
+
+    try:
+        mcp_tool._record_tool_trust_metadata("webull", config, tools)
+        mcp_tool._track_mcp_tool_server(
+            read_registry, "webull", "get_watchlists"
+        )
+        mcp_tool._track_mcp_tool_server(
+            write_registry, "webull", "add_watchlist"
+        )
+        mcp_tool._track_mcp_tool_server(
+            unselected_registry, "webull", "get_orders"
+        )
+
+        assert mcp_tool.get_switchboard_parent_read_only_tool_names() == {
+            read_registry
+        }
+    finally:
+        for name in (read_registry, write_registry, unselected_registry):
+            mcp_tool._forget_mcp_tool_server(name)
+
 class TestLoadMCPConfig:
 
     def test_valid_config_parsed(self):
