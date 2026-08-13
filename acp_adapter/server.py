@@ -1036,10 +1036,35 @@ class HermesACPAgent(acp.Agent):
                     session_id,
                     acp.update_user_message_text(next_prompt),
                 )
-            await self.prompt(
-                prompt=[TextContentBlock(type="text", text=next_prompt)],
-                session_id=session_id,
-            )
+            try:
+                await self.prompt(
+                    prompt=[TextContentBlock(type="text", text=next_prompt)],
+                    session_id=session_id,
+                )
+            except acp.RequestError as exc:
+                # A drained follow-up is a synthesized turn with no live
+                # incoming JSON-RPC request of its own — there is nothing to
+                # attach an error response to, and letting it propagate would
+                # misattribute the failure to the (possibly already
+                # successful) outer request whose finally-block ran this
+                # drain. Surface the failure text in-band instead.
+                logger.error(
+                    "Queued follow-up prompt failed for session %s: %s",
+                    session_id,
+                    exc,
+                )
+                if conn:
+                    try:
+                        await conn.session_update(
+                            session_id,
+                            acp.update_agent_message_text(str(exc)),
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Could not deliver queued-prompt failure notice "
+                            "for session %s",
+                            session_id,
+                        )
 
     @staticmethod
     def _drain_session_delegation_completions(pr, formatter, session_id, state):
@@ -2356,6 +2381,7 @@ class HermesACPAgent(acp.Agent):
                     if state.turn_terminal_winner in {
                         "final",
                         "refusal",
+                        "provider_error",
                     }:
                         logger.info(
                             "Ignored late cancel for finalized session %s",
@@ -3289,6 +3315,18 @@ class HermesACPAgent(acp.Agent):
                 "required_delegation_observation_failed",
                 "required_delegation_observation_persistence_failed",
             }
+            # Every "give up" exit in conversation_loop.py's retry/fallback
+            # ladder (max API retries, billing wall, thinking timeout, ...)
+            # sets failed=True and stuffs a human-readable explanation into
+            # final_response. Delivering that as ordinary assistant prose
+            # makes a provider outage indistinguishable from a real answer;
+            # route it through a genuine JSON-RPC error instead (raised at
+            # the end of this try body) so the gateway's existing error feed
+            # path renders it distinctly. required_observation_failed keeps
+            # its own dedicated async-delegation handling.
+            provider_call_failed = (
+                bool(result.get("failed")) and not required_observation_failed
+            )
             history_rewrite_failed = (
                 required_failure_code
                 == "required_delegation_observation_persistence_failed"
@@ -3457,6 +3495,36 @@ class HermesACPAgent(acp.Agent):
                         )
                 elif required_observation_failed:
                     state.turn_terminal_winner = "refusal"
+                elif provider_call_failed:
+                    state.turn_terminal_winner = "provider_error"
+                    # Same failed-turn history semantics as a cancelled turn:
+                    # strip the fabricated failure-text assistant candidate so
+                    # it neither reaches the model as genuine prior context on
+                    # the next turn nor replays as an ordinary answer after a
+                    # session reload. final_response is intentionally kept —
+                    # it becomes the JSON-RPC error message below.
+                    state.history = _sanitize_failed_turn_history(
+                        result.get("messages") or state.history,
+                        baseline_count=turn_history_baseline_count,
+                    )
+                    result["messages"] = state.history
+                    history_rewrite_succeeded = await asyncio.to_thread(
+                        _rewrite_agent_active_history,
+                        state.agent,
+                        state.history,
+                        state,
+                        self.session_manager,
+                    )
+                    history_rewrite_failed = not history_rewrite_succeeded
+                    try:
+                        state.agent._finish_acp_provisional_stream(
+                            discard=True
+                        )
+                    except Exception:
+                        logger.debug(
+                            "provider_error provisional cleanup failed",
+                            exc_info=True,
+                        )
                 else:
                     state.turn_terminal_winner = "final"
 
@@ -3585,6 +3653,30 @@ class HermesACPAgent(acp.Agent):
                     )
                 except Exception:
                     logger.debug("Failed to auto-title ACP session %s", session_id, exc_info=True)
+
+            if terminal_winner == "provider_error":
+                # End this session/prompt request with a JSON-RPC error so
+                # clients render the failure distinctly instead of as chat.
+                # The acp dispatcher converts this into an error response for
+                # this request id without crashing the process or connection,
+                # and the finally: below still resets is_running and drains
+                # queued prompts, so the session is never left wedged.
+                # Raised even when partial text already streamed (mirrors
+                # cancelled-turn semantics: visible partial text + a terminal
+                # marker); gating on streamed_message would resurrect the
+                # silent-failure bug for every mid-stream provider drop.
+                # The usage gauge is refreshed first because the normal
+                # post-try update is skipped when this raise unwinds.
+                await self._send_usage_update(state)
+                raise acp.RequestError(
+                    -32001,
+                    final_response
+                    or "Hermes turn failed: the provider call did not succeed.",
+                    {
+                        "failureReason": result.get("failure_reason"),
+                        "billingBlock": result.get("billing_block"),
+                    },
+                )
         finally:
             # Mark this turn idle before draining queued work so recursive prompt()
             # calls can acquire the session. Queued turns are intentionally run as
