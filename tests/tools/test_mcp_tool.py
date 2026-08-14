@@ -141,6 +141,58 @@ def test_switchboard_parent_selection_requires_explicit_config_and_read_only_hin
         for name in (read_registry, write_registry, unselected_registry):
             mcp_tool._forget_mcp_tool_server(name)
 
+
+def test_switchboard_parent_all_selection_includes_write_capable_tools():
+    import tools.mcp_tool as mcp_tool
+
+    read_registry = "mcp__webull__get_watchlists"
+    write_registry = "mcp__webull__place_order"
+    tools = [
+        SimpleNamespace(name="get_watchlists", annotations={"readOnlyHint": True}),
+        SimpleNamespace(name="place_order", annotations={"readOnlyHint": False}),
+    ]
+
+    try:
+        mcp_tool._record_tool_trust_metadata(
+            "webull", {"switchboard_parent_tools": "all"}, tools
+        )
+        mcp_tool._track_mcp_tool_server(read_registry, "webull", "get_watchlists")
+        mcp_tool._track_mcp_tool_server(write_registry, "webull", "place_order")
+
+        assert mcp_tool.get_switchboard_parent_read_only_tool_names() == set()
+        assert mcp_tool.get_switchboard_parent_tool_names() == {
+            read_registry,
+            write_registry,
+        }
+    finally:
+        for name in (read_registry, write_registry):
+            mcp_tool._forget_mcp_tool_server(name)
+        mcp_tool._record_tool_trust_metadata("webull", {}, [])
+
+
+def test_mcp_schema_normalization_keeps_properties_map_as_property_schemas():
+    from tools.mcp_tool import _normalize_mcp_input_schema
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "metadata": {
+                "type": "object",
+                "additionalProperties": True,
+            },
+            "label": {"type": "string"},
+        },
+    }
+
+    normalized = _normalize_mcp_input_schema(schema)
+
+    assert set(normalized["properties"]) == {"metadata", "label"}
+    assert normalized["properties"]["metadata"] == {
+        "type": "object",
+        "additionalProperties": True,
+        "properties": {},
+    }
+
 class TestLoadMCPConfig:
 
     def test_valid_config_parsed(self):

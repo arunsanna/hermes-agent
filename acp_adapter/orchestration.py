@@ -109,7 +109,7 @@ def without_switchboard_tool_search_bridge(
     if not getattr(agent, "_switchboard_orchestration_mcp_registration_verified", False):
         return tool_defs
 
-    tool_defs = _with_switchboard_parent_read_only_schemas(tool_defs)
+    tool_defs = _with_switchboard_parent_schemas(tool_defs)
 
     names = {
         function.get("name")
@@ -127,7 +127,7 @@ def without_switchboard_tool_search_bridge(
         return tool_defs
 
     allowed = set(_SWITCHBOARD_MCP_TOOL_NAMES) | (
-        names & _switchboard_parent_read_only_tool_names()
+        names & _switchboard_parent_tool_names()
     )
     return [
         tool
@@ -136,21 +136,29 @@ def without_switchboard_tool_search_bridge(
     ]
 
 
-def _switchboard_parent_read_only_tool_names() -> set[str]:
-    """Read the discovery-backed MCP allowlist without coupling ACP startup."""
+def _switchboard_parent_tool_names() -> set[str]:
+    """Read the discovery-backed approved MCP allowlist without startup coupling."""
     try:
-        from tools.mcp_tool import get_switchboard_parent_read_only_tool_names
+        from tools.mcp_tool import (
+            get_switchboard_parent_read_only_tool_names,
+            get_switchboard_parent_tool_names,
+        )
 
-        return get_switchboard_parent_read_only_tool_names()
+        # Keep the legacy getter in the union so older plugins and tests that
+        # patch it retain their safe, read-only behavior.
+        return (
+            get_switchboard_parent_read_only_tool_names()
+            | get_switchboard_parent_tool_names()
+        )
     except ImportError:
         return set()
 
 
-def _with_switchboard_parent_read_only_schemas(
+def _with_switchboard_parent_schemas(
     tool_defs: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Promote selected MCP schemas that progressive disclosure deferred."""
-    selected = _switchboard_parent_read_only_tool_names()
+    """Promote explicitly approved MCP schemas deferred by disclosure."""
+    selected = _switchboard_parent_tool_names()
     if not selected:
         return tool_defs
     existing = {
@@ -177,7 +185,7 @@ def _with_switchboard_parent_read_only_schemas(
 def _switchboard_visible_tool_names(agent: Any) -> set[str]:
     current = set(_tool_names(agent))
     return set(_SWITCHBOARD_MCP_TOOL_NAMES) | (
-        current & _switchboard_parent_read_only_tool_names()
+        current & _switchboard_parent_tool_names()
     )
 
 
@@ -205,7 +213,7 @@ def restrict_verified_switchboard_request_tools(
     agent: Any,
     api_kwargs: dict[str, Any],
 ) -> bool | None:
-    """Clamp a managed parent to controllers plus approved read-only MCP.
+    """Clamp a managed parent to controllers plus approved MCP tools.
 
     MCP refreshes can race the initial ACP acknowledgement and repopulate an
     already-verified agent with broad local schemas.  The final provider
@@ -256,8 +264,8 @@ def apply_switchboard_uat_direct_delegate_once(
     every later parent response, revert to normal managed-controller choice.
 
     Both the live agent surface and outgoing list must include the trusted
-    four-tool Switchboard registration; explicitly approved read-only MCP
-    tools may coexist. A native, single, unverified, partial, or lookalike
+    four-tool Switchboard registration; explicitly approved MCP tools may
+    coexist. A native, single, unverified, partial, or lookalike
     registration therefore cannot force an arbitrary provider tool choice.
     """
     if os.environ.get(_SWITCHBOARD_FORCE_DIRECT_DELEGATE_ONCE_ENV) != "1":
@@ -298,8 +306,8 @@ def switchboard_runtime_tool_block(agent: Any, tool_name: str) -> str | None:
     boundary: a provider can retain an earlier schema, emit a hallucinated
     function, or reach a direct registry dispatch path.  Once the session has
     proved the exact trusted Switchboard MCP surface, the parent may execute
-    only those controller calls plus discovery-backed, operator-selected
-    read-only MCP calls. The dispatchers consume this helper before local
+    only those controller calls plus discovery-backed, operator-approved MCP
+    calls. The dispatchers consume this helper before local
     special cases and registry dispatch.
 
     It deliberately stays inert for native, single, and unverified sessions.
@@ -322,7 +330,7 @@ def switchboard_runtime_tool_block(agent: Any, tool_name: str) -> str | None:
         return None
     return (
         "Switchboard orchestration runtime policy permits only the verified "
-        "controller tools and explicitly selected read-only MCP tools: "
+        "controller tools and explicitly approved MCP tools: "
         + ", ".join(sorted(_switchboard_visible_tool_names(agent)))
         + ". The requested tool was not executed."
     )

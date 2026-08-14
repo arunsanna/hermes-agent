@@ -3811,6 +3811,12 @@ _tool_read_only_hints: Dict[str, Dict[str, bool]] = {}
 # readOnlyHint always fails closed.
 _switchboard_parent_read_only_tools: set[str] = set()
 _switchboard_parent_raw_tools: Dict[str, set[str]] = {}
+# Servers for which the operator deliberately approved every discovered tool
+# for a Switchboard-managed parent.  This is opt-in only via
+# ``switchboard_parent_tools: all`` in the individual MCP server config; it
+# does not change the existing safe default or the legacy read-only allowlist.
+_switchboard_parent_full_servers: set[str] = set()
+_switchboard_parent_full_tools: set[str] = set()
 
 _TRUST_FULL = "full"
 _TRUST_UNTRUSTED = "untrusted"
@@ -3872,6 +3878,11 @@ def _record_tool_trust_metadata(
             }
         else:
             _switchboard_parent_raw_tools.pop(server_name, None)
+        parent_scope = (config or {}).get("switchboard_parent_tools")
+        if isinstance(parent_scope, str) and parent_scope.strip().lower() == "all":
+            _switchboard_parent_full_servers.add(server_name)
+        else:
+            _switchboard_parent_full_servers.discard(server_name)
         hints = _tool_read_only_hints.setdefault(server_name, {})
         for tool in tools:
             name = getattr(tool, "name", None)
@@ -5813,7 +5824,21 @@ def _normalize_mcp_input_schema(schema: dict | None) -> dict:
         if not isinstance(node, dict):
             return node
 
-        repaired = {k: _repair_object_shape(v) for k, v in node.items()}
+        # ``properties`` and ``patternProperties`` are maps of user-facing
+        # names to schemas, not schemas themselves. Recursing over the map as
+        # one schema inserts a synthetic ``type: object`` entry *inside* the
+        # map, turning it into an invalid property definition (`"object"` is
+        # neither an object nor boolean schema). Recurse through each value
+        # while preserving the names verbatim.
+        repaired = {}
+        for key, value in node.items():
+            if key in ("properties", "patternProperties") and isinstance(value, dict):
+                repaired[key] = {
+                    prop_name: _repair_object_shape(prop_schema)
+                    for prop_name, prop_schema in value.items()
+                }
+            else:
+                repaired[key] = _repair_object_shape(value)
 
         # Coerce missing / null type when the shape is clearly an object
         # (has properties or required but no type).
@@ -6087,14 +6112,19 @@ def _track_mcp_tool_server(
     """Remember the exact raw MCP server that registered *tool_name*."""
     with _lock:
         _mcp_tool_server_names[tool_name] = server_name
-        if (
+        if raw_tool_name is not None and server_name in _switchboard_parent_full_servers:
+            _switchboard_parent_full_tools.add(tool_name)
+            _switchboard_parent_read_only_tools.discard(tool_name)
+        elif (
             raw_tool_name is not None
             and raw_tool_name in _switchboard_parent_raw_tools.get(server_name, set())
             and _tool_read_only_hints.get(server_name, {}).get(raw_tool_name) is True
         ):
             _switchboard_parent_read_only_tools.add(tool_name)
+            _switchboard_parent_full_tools.discard(tool_name)
         else:
             _switchboard_parent_read_only_tools.discard(tool_name)
+            _switchboard_parent_full_tools.discard(tool_name)
 
 
 def _forget_mcp_tool_server(tool_name: str) -> None:
@@ -6102,6 +6132,7 @@ def _forget_mcp_tool_server(tool_name: str) -> None:
     with _lock:
         _mcp_tool_server_names.pop(tool_name, None)
         _switchboard_parent_read_only_tools.discard(tool_name)
+        _switchboard_parent_full_tools.discard(tool_name)
 
 
 def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dict) -> List[dict]:
@@ -7153,6 +7184,19 @@ def get_switchboard_parent_read_only_tool_names() -> set[str]:
     """
     with _lock:
         return set(_switchboard_parent_read_only_tools)
+
+
+def get_switchboard_parent_tool_names() -> set[str]:
+    """Return all MCP tools explicitly approved for managed parents.
+
+    The legacy read-only allowlist remains supported.  A server can instead
+    opt in every discovered tool with ``switchboard_parent_tools: all``; this
+    function deliberately returns only those two explicit approval paths.
+    """
+    with _lock:
+        return set(_switchboard_parent_read_only_tools) | set(
+            _switchboard_parent_full_tools
+        )
 
 
 
