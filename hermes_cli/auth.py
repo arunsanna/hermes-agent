@@ -252,6 +252,17 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         api_key_env_vars=("LM_API_KEY",),
         base_url_env_var="LM_BASE_URL",
     ),
+    "synapse": ProviderConfig(
+        id="synapse",
+        name="ArunLabs Synapse",
+        auth_type="api_key",
+        # Self-hosted OpenAI-compatible gateway on forge k3s
+        # (llama-router: qwen3.8-uncensored/vanilla, whisper, embeddings).
+        # Internal cluster — key is a placeholder unless auth is added.
+        inference_base_url="https://synapse.arunlabs.com/v1",
+        api_key_env_vars=("SYNAPSE_API_KEY",),
+        base_url_env_var="SYNAPSE_BASE_URL",
+    ),
     "copilot": ProviderConfig(
         id="copilot",
         name="GitHub Copilot",
@@ -7159,10 +7170,11 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
     key_source = ""
     api_key, key_source = _resolve_api_key_provider_secret(provider_id, pconfig)
 
-    # No-auth LM Studio: substitute a placeholder so runtime / auxiliary_client
-    # see the local server as configured. doctor still reports unconfigured
-    # because get_api_key_provider_status uses the raw secret resolver.
-    if not api_key and provider_id == "lmstudio":
+    # No-auth LM Studio / Synapse: substitute a placeholder so runtime /
+    # auxiliary_client see the local server as configured. doctor still reports
+    # unconfigured because get_api_key_provider_status uses the raw secret
+    # resolver. Synapse is an internal forge-k3s gateway with no auth today.
+    if not api_key and provider_id in {"lmstudio", "synapse"}:
         api_key = LMSTUDIO_NOAUTH_PLACEHOLDER
         key_source = key_source or "default"
 
