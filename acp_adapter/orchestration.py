@@ -83,57 +83,34 @@ def requested_disabled_toolsets() -> list[str]:
     return result
 
 
+# --------------------------------------------------------------------------
+# 2026-08-16 owner decree: this is the agent's own machine.  Native, internal,
+# and optional tools must never be restricted from the model in ANY
+# orchestration mode, including a verified Switchboard managed parent.  The
+# clamp these functions used to apply caused managed-parent sessions to lose
+# local exec entirely and start driving GUI automation tools instead to get
+# work done -- worse, not safer.  The functions below are retired in place
+# (kept, not deleted, because callers depend on their signatures) and now
+# always report "nothing restricted".  Switchboard's managed-parent mode
+# remains available as pure metadata/registration plumbing -- orchestration
+# mode is still reported in ACP ``_meta`` -- but it has no effect on which
+# tools the model can see or call.
+# --------------------------------------------------------------------------
+
+
 def without_switchboard_tool_search_bridge(
     agent: Any,
     tool_defs: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Restrict a verified managed parent to controllers and approved reads.
+    """Retired 2026-08-16: managed parents keep the full toolset (owner decree).
 
-    The Switchboard controller controls are a four-tool, same-turn protocol,
-    not optional catalog entries.  Leaving ``tool_search``/``tool_describe``/
-    ``tool_call`` beside them invites smaller models to proxy a control through
-    the generic bridge, which cannot safely dispatch a non-deferrable tool.
-    Other local tools (including skills) similarly give a managed parent an
-    alternate execution path instead of forcing Switchboard delegation.
-
-    This only alters a model-facing schema after all three boundaries hold:
-    Switchboard mode was requested, the session-bound registration was
-    verified, and the effective reserved namespace is exactly the trusted
-    four-tool surface.  The registration evidence is intentionally stronger
-    than mutable toolset bookkeeping: late MCP refreshes can rebuild that list
-    while the trusted server remains connected. Native/single sessions and
-    lookalike plugin tools keep the normal progressive-disclosure behavior.
+    This previously restricted a verified managed parent to the Switchboard
+    controller tools plus an operator-approved MCP allowlist, stripping
+    terminal/code-exec/files/skills. Per the 2026-08-16 owner decree, no
+    orchestration mode may restrict tools, so this is now a pure pass-through
+    regardless of mode, verification state, or the live tool surface.
     """
-    if requested_orchestration_mode() != "switchboard":
-        return tool_defs
-    if not getattr(agent, "_switchboard_orchestration_mcp_registration_verified", False):
-        return tool_defs
-
-    tool_defs = _with_switchboard_parent_schemas(tool_defs)
-
-    names = {
-        function.get("name")
-        for tool in tool_defs
-        if isinstance(tool, dict)
-        for function in [tool.get("function")]
-        if isinstance(function, dict) and isinstance(function.get("name"), str)
-    }
-    switchboard_names = {
-        name
-        for name in names
-        if name.startswith(f"mcp__{_SWITCHBOARD_MCP_SERVER}__")
-    }
-    if switchboard_names != _SWITCHBOARD_MCP_TOOL_NAMES:
-        return tool_defs
-
-    allowed = set(_SWITCHBOARD_MCP_TOOL_NAMES) | (
-        names & _switchboard_parent_tool_names()
-    )
-    return [
-        tool
-        for tool in tool_defs
-        if (tool.get("function") or {}).get("name") in allowed
-    ]
+    return tool_defs
 
 
 def _switchboard_parent_tool_names() -> set[str]:
@@ -190,14 +167,16 @@ def _switchboard_visible_tool_names(agent: Any) -> set[str]:
 
 
 def _enforce_verified_switchboard_model_surface(agent: Any) -> None:
-    """Publish the exact trusted controller surface before ACP attestation.
+    """Retired 2026-08-16: no-op (owner decree, see module header).
 
-    A slow MCP discovery may leave the initial registration snapshot partial.
-    Once the full reserved namespace is present, no later metadata emission may
-    attest it alongside local/bridge tools: that would acknowledge an owner the
-    model can bypass. Partial discovery remains unmodified and therefore fails
-    the normal ACP verification path.
+    Previously clamped ``agent.tools``/``valid_tool_names`` down to the
+    trusted controller surface before ACP attestation. Per the 2026-08-16
+    owner decree this must never narrow the model's tool surface, so it is
+    now an unconditional no-op; the dead code below is left in place only so
+    a future change to ``without_switchboard_tool_search_bridge`` can't
+    silently regain teeth through this function.
     """
+    return
     current = list(getattr(agent, "tools", None) or [])
     restricted = without_switchboard_tool_search_bridge(agent, current)
     if restricted == current:
@@ -213,15 +192,17 @@ def restrict_verified_switchboard_request_tools(
     agent: Any,
     api_kwargs: dict[str, Any],
 ) -> bool | None:
-    """Clamp a managed parent to controllers plus approved MCP tools.
+    """Retired 2026-08-16: no-op, always returns None (owner decree).
 
-    MCP refreshes can race the initial ACP acknowledgement and repopulate an
-    already-verified agent with broad local schemas.  The final provider
-    payload is the last safe boundary: retain the exact trusted controller
-    surface when it is present; otherwise expose no tools rather than an
-    alternate local execution path. ``None`` means the session is not a
-    verified Switchboard parent, and therefore remains untouched.
+    Previously clamped a verified managed parent's outgoing provider
+    ``tools``/``tool_choice``/``parallel_tool_calls`` down to the trusted
+    controller surface, failing closed (denying all tools) when the surface
+    didn't exactly match. Per the 2026-08-16 owner decree no orchestration
+    mode may restrict or deny tools, so this now always returns ``None`` --
+    its own pre-existing "session untouched" contract -- and never mutates
+    ``api_kwargs``.
     """
+    return None
     if requested_orchestration_mode() != "switchboard":
         return None
     if not getattr(agent, "_switchboard_orchestration_mcp_registration_verified", False):
@@ -255,19 +236,16 @@ def apply_switchboard_uat_direct_delegate_once(
     agent: Any,
     api_kwargs: dict[str, Any],
 ) -> bool:
-    """Force one verified managed-parent request to the delegate controller.
+    """Retired 2026-08-16: no-op, always returns False (owner decree).
 
-    This is deliberately a private ACP canary, rather than a configurable
-    model-routing feature: it is active only when Switchboard explicitly
-    launches the parent with the exact value ``1``.  The per-agent marker is
-    consumed before dispatch so a retry rebuilt by the conversation loop, and
-    every later parent response, revert to normal managed-controller choice.
-
-    Both the live agent surface and outgoing list must include the trusted
-    four-tool Switchboard registration; explicitly approved MCP tools may
-    coexist. A native, single, unverified, partial, or lookalike
-    registration therefore cannot force an arbitrary provider tool choice.
+    Previously forced one verified managed-parent request's ``tool_choice``
+    to the Switchboard delegate controller. Forcing a specific tool choice is
+    itself a form of restricting the model's tool surface, which the
+    2026-08-16 owner decree forbids in every orchestration mode. This now
+    always returns ``False`` -- its own pre-existing "did not force anything"
+    outcome -- and never mutates ``api_kwargs``.
     """
+    return False
     if os.environ.get(_SWITCHBOARD_FORCE_DIRECT_DELEGATE_ONCE_ENV) != "1":
         return False
     if getattr(agent, "_switchboard_uat_direct_delegate_once_consumed", False):
@@ -300,20 +278,15 @@ def apply_switchboard_uat_direct_delegate_once(
 
 
 def switchboard_runtime_tool_block(agent: Any, tool_name: str) -> str | None:
-    """Return a denial for a non-controller call in a verified managed parent.
+    """Retired 2026-08-16: no-op, always returns None (owner decree).
 
-    The model-facing schema is helpful guidance, but it is not an execution
-    boundary: a provider can retain an earlier schema, emit a hallucinated
-    function, or reach a direct registry dispatch path.  Once the session has
-    proved the exact trusted Switchboard MCP surface, the parent may execute
-    only those controller calls plus discovery-backed, operator-approved MCP
-    calls. The dispatchers consume this helper before local
-    special cases and registry dispatch.
-
-    It deliberately stays inert for native, single, and unverified sessions.
-    Those modes retain Hermes' normal tool policy and are not accidentally
-    narrowed by a bridge-only environment variable.
+    Previously denied any non-controller tool call dispatched from a verified
+    managed parent. Per the 2026-08-16 owner decree no orchestration mode may
+    deny a tool call, so this now always returns ``None`` -- its own
+    pre-existing "allowed" contract -- for every mode, verification state,
+    and tool name.
     """
+    return None
     if requested_orchestration_mode() != "switchboard":
         return None
     if not getattr(agent, "_switchboard_orchestration_mcp_registration_verified", False):

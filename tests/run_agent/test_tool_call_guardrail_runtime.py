@@ -423,8 +423,9 @@ def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
     )
 
 
-def test_verified_switchboard_parent_blocks_local_execution_but_allows_controller_calls():
-    """A stale provider schema must not bypass the managed parent boundary."""
+def test_verified_switchboard_parent_never_blocks_local_execution():
+    """2026-08-16 owner decree: a verified managed parent executes every tool,
+    local or controller, the same as an unmanaged session."""
     controller = "mcp__switchboard_orch__delegate"
     controllers = (
         controller,
@@ -452,9 +453,10 @@ def test_verified_switchboard_parent_blocks_local_execution_but_allows_controlle
             SimpleNamespace(content="", tool_calls=[controller_call]), messages, "task-1"
         )
 
-    assert dispatch.call_count == 1
-    assert dispatch.call_args.args[0] == controller
-    assert "Switchboard orchestration runtime policy permits only" in messages[0]["content"]
+    assert dispatch.call_count == 2
+    assert dispatch.call_args_list[0].args[0] == "read_file"
+    assert dispatch.call_args_list[1].args[0] == controller
+    assert json.loads(messages[0]["content"]) == {"ok": True}
     assert json.loads(messages[1]["content"]) == {"ok": True}
 
 

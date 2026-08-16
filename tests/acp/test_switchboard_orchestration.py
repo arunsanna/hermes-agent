@@ -189,7 +189,8 @@ def test_switchboard_metadata_recovers_late_toolset_bookkeeping_loss(monkeypatch
     assert meta["verified"] is True
 
 
-def test_switchboard_model_schema_keeps_only_direct_controller_tools(monkeypatch):
+def test_switchboard_model_schema_keeps_full_toolset(monkeypatch):
+    """2026-08-16 owner decree: verified switchboard mode restricts nothing."""
     monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
     agent = SimpleNamespace(
         enabled_toolsets=["hermes-acp", "mcp-switchboard_orch"],
@@ -204,92 +205,11 @@ def test_switchboard_model_schema_keeps_only_direct_controller_tools(monkeypatch
 
     visible = without_switchboard_tool_search_bridge(agent, schema)
 
-    assert {tool["function"]["name"] for tool in visible} == {
-        tool["function"]["name"] for tool in _switchboard_tools()
-    }
-
-
-def test_switchboard_model_schema_keeps_explicit_discovery_backed_read_only_mcp(
-    monkeypatch,
-):
-    monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
-    read_tool = "mcp__webull__get_watchlists"
-    write_tool = "mcp__webull__add_watchlist"
-    agent = SimpleNamespace(
-        enabled_toolsets=["hermes-acp", "mcp-switchboard_orch", "mcp-webull"],
-        tools=[*_switchboard_tools(), _tool(read_tool), _tool(write_tool)],
-        _switchboard_orchestration_mcp_registration_verified=True,
-    )
-    schema = [*agent.tools, *_tool_search_bridges(), _tool("terminal")]
-
-    with patch(
-        "tools.mcp_tool.get_switchboard_parent_read_only_tool_names",
-        return_value={read_tool},
-    ):
-        visible = without_switchboard_tool_search_bridge(agent, schema)
-
-    assert {tool["function"]["name"] for tool in visible} == {
-        *{tool["function"]["name"] for tool in _switchboard_tools()},
-        read_tool,
-    }
-
-
-def test_switchboard_model_schema_keeps_explicitly_approved_write_mcp(monkeypatch):
-    monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
-    write_tool = "mcp__webull__place_order"
-    agent = SimpleNamespace(
-        enabled_toolsets=["hermes-acp", "mcp-switchboard_orch", "mcp-webull"],
-        tools=[*_switchboard_tools(), _tool(write_tool)],
-        _switchboard_orchestration_mcp_registration_verified=True,
-    )
-
-    with patch(
-        "tools.mcp_tool.get_switchboard_parent_tool_names",
-        return_value={write_tool},
-    ):
-        visible = without_switchboard_tool_search_bridge(agent, agent.tools)
-
-    assert {tool["function"]["name"] for tool in visible} == {
-        *{tool["function"]["name"] for tool in _switchboard_tools()},
-        write_tool,
-    }
-
-
-def test_switchboard_model_schema_promotes_selected_read_only_mcp_from_registry(
-    monkeypatch,
-):
-    monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
-    read_tool = "mcp__webull__get_watchlists"
-    agent = SimpleNamespace(
-        _switchboard_orchestration_mcp_registration_verified=True,
-    )
-
-    with (
-        patch(
-            "tools.mcp_tool.get_switchboard_parent_read_only_tool_names",
-            return_value={read_tool},
-        ),
-        patch(
-            "tools.registry.registry.get_schema",
-            return_value={
-                "name": read_tool,
-                "description": "List watchlists",
-                "parameters": {"type": "object", "properties": {}},
-            },
-        ),
-    ):
-        visible = without_switchboard_tool_search_bridge(
-            agent,
-            [*_switchboard_tools(), *_tool_search_bridges()],
-        )
-
-    assert {tool["function"]["name"] for tool in visible} == {
-        *{tool["function"]["name"] for tool in _switchboard_tools()},
-        read_tool,
-    }
+    assert visible == schema
 
 
 def test_switchboard_model_schema_survives_late_toolset_bookkeeping_loss(monkeypatch):
+    """2026-08-16 owner decree: nothing is stripped even with bookkeeping loss."""
     monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
     agent = SimpleNamespace(
         enabled_toolsets=["hermes-acp"],
@@ -299,12 +219,11 @@ def test_switchboard_model_schema_survives_late_toolset_bookkeeping_loss(monkeyp
 
     visible = without_switchboard_tool_search_bridge(agent, schema)
 
-    assert {tool["function"]["name"] for tool in visible} == {
-        tool["function"]["name"] for tool in _switchboard_tools()
-    }
+    assert visible == schema
 
 
-def test_switchboard_uat_canary_forces_only_the_first_verified_request(monkeypatch):
+def test_switchboard_uat_canary_never_forces_a_verified_request(monkeypatch):
+    """2026-08-16 owner decree: forcing a tool choice is also forbidden."""
     monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
     monkeypatch.setenv("HERMES_ACP_SWITCHBOARD_FORCE_DIRECT_DELEGATE_ONCE", "1")
     agent = SimpleNamespace(
@@ -314,12 +233,8 @@ def test_switchboard_uat_canary_forces_only_the_first_verified_request(monkeypat
     )
     first_request = {"tools": _switchboard_tools(), "tool_choice": "auto"}
 
-    assert apply_switchboard_uat_direct_delegate_once(agent, first_request) is True
-    assert first_request["tool_choice"] == {
-        "type": "function",
-        "function": {"name": "mcp__switchboard_orch__delegate"},
-    }
-    assert first_request["parallel_tool_calls"] is False
+    assert apply_switchboard_uat_direct_delegate_once(agent, first_request) is False
+    assert first_request == {"tools": _switchboard_tools(), "tool_choice": "auto"}
 
     following_parent_request = {"tools": _switchboard_tools(), "tool_choice": "auto"}
     assert (
@@ -332,7 +247,8 @@ def test_switchboard_uat_canary_forces_only_the_first_verified_request(monkeypat
     }
 
 
-def test_switchboard_uat_canary_forces_responses_tool_shape(monkeypatch):
+def test_switchboard_uat_canary_never_forces_responses_tool_shape(monkeypatch):
+    """2026-08-16 owner decree: the Responses-shape request stays untouched too."""
     monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
     monkeypatch.setenv("HERMES_ACP_SWITCHBOARD_FORCE_DIRECT_DELEGATE_ONCE", "1")
     agent = SimpleNamespace(
@@ -347,32 +263,28 @@ def test_switchboard_uat_canary_forces_responses_tool_shape(monkeypatch):
         "tool_choice": "auto",
         "parallel_tool_calls": True,
     }
+    original_request = dict(request)
 
-    assert apply_switchboard_uat_direct_delegate_once(agent, request) is True
-    assert request["tool_choice"] == {
-        "type": "function",
-        "name": "mcp__switchboard_orch__delegate",
-    }
-    assert request["parallel_tool_calls"] is False
-    assert {tool["name"] for tool in request["tools"]} == {
-        tool["function"]["name"] for tool in _switchboard_tools()
-    }
+    assert apply_switchboard_uat_direct_delegate_once(agent, request) is False
+    assert request == original_request
 
 
-def test_verified_switchboard_request_surface_fails_closed_when_incomplete(monkeypatch):
+def test_verified_switchboard_request_surface_never_clamps(monkeypatch):
+    """2026-08-16 owner decree: no fail-closed clamp, even on an incomplete surface."""
     monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
     agent = SimpleNamespace(
         tools=_switchboard_tools()[:-1],
         _switchboard_orchestration_mcp_registration_verified=True,
     )
     request = {"tools": _switchboard_responses_tools(), "tool_choice": "auto"}
+    original_request = dict(request)
 
-    assert restrict_verified_switchboard_request_tools(agent, request) is False
-    assert request["tools"] == []
-    assert request["tool_choice"] == "none"
+    assert restrict_verified_switchboard_request_tools(agent, request) is None
+    assert request == original_request
 
 
-def test_switchboard_metadata_clamps_a_broad_verified_surface(monkeypatch):
+def test_switchboard_metadata_reports_a_broad_verified_surface_unclamped(monkeypatch):
+    """2026-08-16 owner decree: metadata reports the full live surface, unclamped."""
     monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
     monkeypatch.setenv("HERMES_ACP_DISABLED_TOOLSETS", "delegation")
     agent = SimpleNamespace(
@@ -381,27 +293,32 @@ def test_switchboard_metadata_clamps_a_broad_verified_surface(monkeypatch):
         tools=[*_switchboard_tools(), *_tool_search_bridges(), _tool("terminal")],
         _switchboard_orchestration_mcp_registration_verified=True,
     )
+    original_tools = list(agent.tools)
 
     meta = orchestration_meta(agent)
 
     assert meta["effectiveMode"] == "switchboard"
     assert set(meta["effectiveTools"]) == {
-        tool["function"]["name"] for tool in _switchboard_tools()
+        tool["function"]["name"] for tool in original_tools
     }
-    assert set(agent.valid_tool_names) == set(meta["effectiveTools"])
+    # The agent's tool surface must not have been narrowed in place.
+    assert agent.tools == original_tools
+    assert not hasattr(agent, "valid_tool_names")
 
 
 @pytest.mark.parametrize(
-    "mode, verified, api_tools, fail_closed",
+    "mode, verified, api_tools",
     [
-        ("native", True, _switchboard_tools(), False),
-        ("switchboard", False, _switchboard_tools(), False),
-        ("switchboard", True, [_tool("mcp__switchboard_orch__delegate")], True),
+        ("native", True, _switchboard_tools()),
+        ("switchboard", False, _switchboard_tools()),
+        ("switchboard", True, [_tool("mcp__switchboard_orch__delegate")]),
     ],
 )
-def test_switchboard_uat_canary_never_forces_untrusted_or_nonmanaged_schema(
-    monkeypatch, mode, verified, api_tools, fail_closed
+def test_switchboard_uat_canary_never_forces_or_clamps_any_schema(
+    monkeypatch, mode, verified, api_tools
 ):
+    """2026-08-16 owner decree: no case (including an incomplete verified
+    surface) may force a tool choice or fail-closed clamp the request."""
     monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", mode)
     monkeypatch.setenv("HERMES_ACP_SWITCHBOARD_FORCE_DIRECT_DELEGATE_ONCE", "1")
     agent = SimpleNamespace(
@@ -412,17 +329,11 @@ def test_switchboard_uat_canary_never_forces_untrusted_or_nonmanaged_schema(
     request = {"tools": api_tools, "tool_choice": "auto"}
 
     assert apply_switchboard_uat_direct_delegate_once(agent, request) is False
-    if fail_closed:
-        assert request == {
-            "tools": [],
-            "tool_choice": "none",
-            "parallel_tool_calls": False,
-        }
-    else:
-        assert request == {"tools": api_tools, "tool_choice": "auto"}
+    assert request == {"tools": api_tools, "tool_choice": "auto"}
 
 
-def test_verified_switchboard_runtime_gate_rejects_non_controller_tool(monkeypatch):
+def test_verified_switchboard_runtime_gate_blocks_nothing(monkeypatch):
+    """2026-08-16 owner decree: the runtime gate never denies any tool."""
     monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
     agent = SimpleNamespace(
         enabled_toolsets=["hermes-acp"],
@@ -430,49 +341,13 @@ def test_verified_switchboard_runtime_gate_rejects_non_controller_tool(monkeypat
         _switchboard_orchestration_mcp_registration_verified=True,
     )
 
-    assert switchboard_runtime_tool_block(agent, "read_file") is not None
+    assert switchboard_runtime_tool_block(agent, "read_file") is None
     assert (
         switchboard_runtime_tool_block(
             agent, "mcp__switchboard_orch__delegate"
         )
         is None
     )
-
-
-def test_verified_switchboard_runtime_gate_allows_only_selected_read_only_mcp(
-    monkeypatch,
-):
-    monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
-    read_tool = "mcp__webull__get_watchlists"
-    write_tool = "mcp__webull__add_watchlist"
-    agent = SimpleNamespace(
-        tools=[*_switchboard_tools(), _tool(read_tool), _tool(write_tool)],
-        _switchboard_orchestration_mcp_registration_verified=True,
-    )
-
-    with patch(
-        "tools.mcp_tool.get_switchboard_parent_read_only_tool_names",
-        return_value={read_tool},
-    ):
-        assert switchboard_runtime_tool_block(agent, read_tool) is None
-        assert switchboard_runtime_tool_block(agent, write_tool) is not None
-
-
-def test_verified_switchboard_runtime_gate_allows_explicitly_approved_write_mcp(
-    monkeypatch,
-):
-    monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
-    write_tool = "mcp__webull__place_order"
-    agent = SimpleNamespace(
-        tools=[*_switchboard_tools(), _tool(write_tool)],
-        _switchboard_orchestration_mcp_registration_verified=True,
-    )
-
-    with patch(
-        "tools.mcp_tool.get_switchboard_parent_tool_names",
-        return_value={write_tool},
-    ):
-        assert switchboard_runtime_tool_block(agent, write_tool) is None
 
 
 def test_unverified_switchboard_runtime_gate_stays_inert(monkeypatch):
@@ -486,8 +361,10 @@ def test_unverified_switchboard_runtime_gate_stays_inert(monkeypatch):
     assert switchboard_runtime_tool_block(agent, "read_file") is None
 
 
-def test_direct_registry_dispatch_honors_verified_switchboard_runtime_gate(monkeypatch):
-    """Callers outside AIAgent cannot bypass the execution-time boundary."""
+def test_direct_registry_dispatch_never_blocked_by_switchboard_runtime_gate(
+    monkeypatch,
+):
+    """2026-08-16 owner decree: direct dispatch is never denied in any mode."""
     import model_tools
 
     monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
@@ -502,14 +379,14 @@ def test_direct_registry_dispatch_honors_verified_switchboard_runtime_gate(monke
         patch("model_tools.registry.dispatch", return_value='{"ok": true}') as dispatch,
         patch("model_tools._emit_post_tool_call_hook"),
     ):
-        blocked = model_tools.handle_function_call(
+        first = model_tools.handle_function_call(
             "read_file",
             {"path": "/tmp/nope"},
             parent_agent=agent,
             skip_pre_tool_call_hook=True,
             skip_tool_execution_middleware=True,
         )
-        allowed = model_tools.handle_function_call(
+        second = model_tools.handle_function_call(
             controller,
             {},
             parent_agent=agent,
@@ -517,10 +394,11 @@ def test_direct_registry_dispatch_honors_verified_switchboard_runtime_gate(monke
             skip_tool_execution_middleware=True,
         )
 
-    assert "Switchboard orchestration runtime policy permits only" in blocked
-    assert allowed == '{"ok": true}'
-    assert dispatch.call_count == 1
-    assert dispatch.call_args.args[0] == controller
+    assert first == '{"ok": true}'
+    assert second == '{"ok": true}'
+    assert dispatch.call_count == 2
+    assert dispatch.call_args_list[0].args[0] == "read_file"
+    assert dispatch.call_args_list[1].args[0] == controller
 
 
 def test_direct_dispatch_gate_failure_does_not_narrow_native_mode(monkeypatch):
@@ -776,14 +654,22 @@ async def test_acp_registration_passes_hardened_switchboard_config(monkeypatch):
     }
     assert "mcp-switchboard_orch" in state.agent.enabled_toolsets
     assert state.agent._switchboard_orchestration_mcp_registration_verified is True
+    # 2026-08-16 owner decree: registration must not narrow the model-facing
+    # tool surface -- the full mocked catalog (controllers, bridges, skills,
+    # terminal) survives unchanged.
     assert {tool["function"]["name"] for tool in state.agent.tools} == {
-        tool["function"]["name"] for tool in _switchboard_tools()
+        *{tool["function"]["name"] for tool in _switchboard_tools()},
+        *{tool["function"]["name"] for tool in _tool_search_bridges()},
+        "skill_view",
+        "terminal",
     }
 
 
 @pytest.mark.asyncio
 async def test_acp_registration_keeps_switchboard_tools_in_model_schema(monkeypatch):
-    """The live ACP refresh must expose the trusted controls, not bridges."""
+    """The registry here only ever contains the 4 switchboard tools, so this
+    passes regardless of restriction logic; kept as coverage of the live ACP
+    registration path itself."""
     import model_tools
     from acp_adapter.orchestration import _SWITCHBOARD_MCP_TOOL_NAMES
     from tools.registry import ToolRegistry
@@ -931,8 +817,12 @@ async def test_session_model_switch_restores_verified_switchboard_mcp_surface(
     assert registered == [expected_config, expected_config]
     assert state._acp_session_mcp_server_configs == expected_config
     assert state.agent._switchboard_orchestration_mcp_registration_verified is True
+    # 2026-08-16 owner decree: the replacement agent's tool surface must not
+    # be narrowed by the model switch -- the full mocked catalog survives.
     assert {tool["function"]["name"] for tool in state.agent.tools} == {
-        tool["function"]["name"] for tool in _switchboard_tools()
+        *{tool["function"]["name"] for tool in _switchboard_tools()},
+        *{tool["function"]["name"] for tool in _tool_search_bridges()},
+        "terminal",
     }
     assert orchestration_meta(state.agent)["effectiveMode"] == "switchboard"
     assert result.field_meta["switchboardOrchestration"] == orchestration_meta(

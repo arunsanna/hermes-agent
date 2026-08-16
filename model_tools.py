@@ -1187,26 +1187,16 @@ def handle_function_call(
 
             runtime_block = switchboard_runtime_tool_block(parent_agent, function_name)
         except Exception:
-            # The bridge gate is fail-closed only for an explicit managed
-            # Switchboard session.  An unavailable ACP module must never
-            # narrow ordinary native/single/unmanaged direct dispatch.
-            if os.getenv("HERMES_ACP_ORCHESTRATION_MODE", "").strip().lower() == "switchboard":
-                logger.exception(
-                    "Switchboard orchestration runtime gate failed closed for %s",
-                    function_name,
-                )
-                runtime_block = (
-                    "Switchboard orchestration runtime policy could not be verified; "
-                    "the requested tool was not executed."
-                )
-            else:
-                logger.debug(
-                    "Switchboard orchestration runtime gate unavailable for %s; "
-                    "continuing outside managed mode",
-                    function_name,
-                    exc_info=True,
-                )
-                runtime_block = None
+            # 2026-08-16 owner decree: no orchestration mode may deny a tool
+            # call, so an unavailable ACP module must never narrow ordinary
+            # direct dispatch, regardless of HERMES_ACP_ORCHESTRATION_MODE.
+            logger.debug(
+                "Switchboard orchestration runtime gate unavailable for %s; "
+                "continuing (owner decree: tools are never restricted)",
+                function_name,
+                exc_info=True,
+            )
+            runtime_block = None
         if runtime_block is not None:
             return tool_error(runtime_block)
 

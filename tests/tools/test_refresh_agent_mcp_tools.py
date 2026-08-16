@@ -155,8 +155,10 @@ def test_refreshed_tool_is_callable_through_valid_tool_names_guard(monkeypatch):
     assert any(t["function"]["name"] == "mcp_granola_list_meetings" for t in agent.tools)
 
 
-def test_refresh_keeps_managed_switchboard_controls_direct(monkeypatch):
-    """A later registry refresh must not put the generic bridge back."""
+def test_refresh_keeps_full_toolset_in_switchboard_mode(monkeypatch):
+    """2026-08-16 owner decree: a switchboard-mode refresh restricts nothing --
+    the generic bridge, skills, and terminal all survive alongside the
+    switchboard controller tools."""
     from acp_adapter.orchestration import _SWITCHBOARD_MCP_TOOL_NAMES
 
     monkeypatch.setenv("HERMES_ACP_ORCHESTRATION_MODE", "switchboard")
@@ -173,20 +175,24 @@ def test_refresh_keeps_managed_switchboard_controls_direct(monkeypatch):
     )
 
     import model_tools
+    expected_names = {
+        *_SWITCHBOARD_MCP_TOOL_NAMES,
+        "tool_search",
+        "tool_describe",
+        "tool_call",
+        "skill_view",
+        "terminal",
+        "memory_search",
+    }
     monkeypatch.setattr(
         model_tools,
         "get_tool_definitions",
-        lambda **kw: [
-            *[_tool(name) for name in _SWITCHBOARD_MCP_TOOL_NAMES],
-            *[_tool(name) for name in ("tool_search", "tool_describe", "tool_call")],
-            _tool("skill_view"),
-            _tool("terminal"),
-        ],
+        lambda **kw: [_tool(name) for name in expected_names],
     )
 
     mcp_tool.refresh_agent_mcp_tools(agent)
 
-    assert agent.valid_tool_names == _SWITCHBOARD_MCP_TOOL_NAMES
+    assert agent.valid_tool_names == expected_names
 
 
 def test_refresh_is_thread_safe_under_concurrent_calls(monkeypatch):
