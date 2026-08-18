@@ -515,6 +515,29 @@ class TestBuildContextFilesPrompt:
 
         assert _load_agents_md(sub) == ""
 
+    # --- AGENTS.override.md personal override (port of pi#7681) ---
+
+    def test_agents_override_md_wins_over_agents_md(self, tmp_path):
+        (tmp_path / "AGENTS.md").write_text("Use Ruff for linting.")
+        (tmp_path / "AGENTS.override.md").write_text("Use Black instead.")
+        result = build_context_files_prompt(cwd=str(tmp_path))
+        assert "Use Black instead" in result
+        assert "Ruff for linting" not in result
+        assert "AGENTS.override.md" in result
+
+    def test_agents_override_md_loads_alone(self, tmp_path):
+        (tmp_path / "AGENTS.override.md").write_text("Override-only context.")
+        result = build_context_files_prompt(cwd=str(tmp_path))
+        assert "Override-only context" in result
+        assert "Project Context" in result
+
+    def test_hermes_md_still_wins_over_agents_override(self, tmp_path):
+        (tmp_path / ".hermes.md").write_text("Hermes-first context.")
+        (tmp_path / "AGENTS.override.md").write_text("Override context.")
+        result = build_context_files_prompt(cwd=str(tmp_path))
+        assert "Hermes-first context" in result
+        assert "Override context" not in result
+
     def test_skips_agents_md_in_install_tree_on_fallback(self, monkeypatch, tmp_path):
         # A backend that FALLS BACK into the install tree (cwd=None → getcwd,
         # the desktop default) must not load that tree's contributor AGENTS.md
@@ -749,11 +772,14 @@ class TestEnvironmentHints:
 
 
     def test_build_environment_hints_suppresses_host_on_docker_backend(self, monkeypatch):
-        """Docker/remote backends must hide host info — the agent can only touch the backend."""
+        """Docker/remote backends must hide host info — the agent can only touch the backend.
+
+        Host-independent: suppression is a property of the remote-backend
+        branch, so instead of faking a Windows host we assert no host line of
+        any kind is emitted.
+        """
         import agent.prompt_builder as _pb
-        import sys
         monkeypatch.setattr(_pb, "is_wsl", lambda: False)
-        monkeypatch.setattr(sys, "platform", "win32")
         monkeypatch.setenv("TERMINAL_ENV", "docker")
         # Force the probe to fail so we exercise the static fallback path
         # deterministically (the live probe would try to spin up docker).
@@ -761,7 +787,7 @@ class TestEnvironmentHints:
         _pb._clear_backend_probe_cache()
         result = _pb.build_environment_hints()
         # Host suppression: none of the local-backend lines should appear.
-        assert "Host: Windows" not in result
+        assert "Host:" not in result
         assert "User home directory:" not in result
         assert "PowerShell" not in result
         # Backend info must appear instead.
