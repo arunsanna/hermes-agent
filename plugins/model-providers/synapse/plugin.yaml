@@ -1,0 +1,5 @@
+name: synapse-provider
+kind: model-provider
+version: 1.0.0
+description: ArunLabs Synapse (self-hosted forge k3s OpenAI-compatible gateway)
+author: ArunLabs
