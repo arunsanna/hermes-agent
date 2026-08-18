@@ -631,6 +631,59 @@ def format_banner_version_label() -> str:
     return f"{base} · upstream {upstream} · local {local} (+{ahead} carried {carried_word})"
 
 
+def _git_current_branch(repo_dir: Path) -> Optional[str]:
+    """Return the checked-out branch name; ``None`` for detached HEAD."""
+    return _git_stdout(["branch", "--show-current"], cwd=repo_dir) or None
+
+
+def _git_worktree_dirty(repo_dir: Path) -> bool:
+    """True when tracked files have uncommitted changes.
+
+    ``diff-index`` skips the untracked scan so this stays fast enough for a
+    version probe; untracked files are deliberately not flagged.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "diff-index", "--quiet", "HEAD", "--"],
+            capture_output=True,
+            timeout=5,
+            cwd=str(repo_dir),
+        )
+    except Exception:
+        return False
+    return result.returncode == 1
+
+
+_git_build_identity_cache: Optional[tuple] = None  # (identity_or_None,) once computed
+
+
+def get_git_build_identity(repo_dir: Optional[Path] = None) -> Optional[str]:
+    """Return ``"<sha>[-dirty] @ <branch>"`` for a live checkout, else ``None``.
+
+    The release version identifies the *upstream base* a checkout was synced
+    from; forks and dev branches carry their own commits on top, so version
+    *displays* (``hermes --version``, ``hermes-acp --version``, the ACP
+    ``/version`` reply) append this live-git identity to make the running
+    source of truth visible. Companion to ``get_git_banner_state``; cached
+    per-process for the same reason. Docker images (no ``.git``) return
+    ``None`` and displays fall back to the bare release version.
+    """
+    global _git_build_identity_cache
+    if repo_dir is None and _git_build_identity_cache is not None:
+        return _git_build_identity_cache[0]
+    repo = repo_dir or _resolve_repo_dir()
+    identity: Optional[str] = None
+    if repo is not None:
+        sha = _git_short_hash(repo, "HEAD")
+        if sha:
+            sha += "-dirty" if _git_worktree_dirty(repo) else ""
+            branch = _git_current_branch(repo)
+            identity = f"{sha} @ {branch}" if branch else sha
+    if repo_dir is None:
+        _git_build_identity_cache = (identity,)
+    return identity
+
+
 # =========================================================================
 # Non-blocking update check
 # =========================================================================

@@ -4062,7 +4062,14 @@ class HermesACPAgent(acp.Agent):
         return f"Queued for the next turn. ({depth} queued)"
 
     def _cmd_version(self, args: str, state: SessionState) -> str:
-        return f"Hermes Agent v{HERMES_VERSION}"
+        try:
+            from hermes_cli.banner import get_git_build_identity
+
+            identity = get_git_build_identity()
+        except Exception:
+            identity = None
+        suffix = f" · {identity}" if identity else ""
+        return f"Hermes Agent v{HERMES_VERSION}{suffix}"
 
     # ---- Model switching (ACP protocol method) -------------------------------
 

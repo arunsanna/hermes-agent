@@ -183,7 +183,16 @@ def read_install_method() -> str | None:
 def print_fast_version_info() -> None:
     from hermes_cli import __release_date__, __version__
 
-    print(f"Hermes Agent v{__version__} ({__release_date__})")
+    # Append the live-checkout identity so a fork/branch install can't be
+    # mistaken for the upstream release its pyproject version was synced from.
+    try:
+        from hermes_cli.banner import get_git_build_identity
+
+        identity = get_git_build_identity()
+    except Exception:
+        identity = None
+    suffix = f" · {identity}" if identity else ""
+    print(f"Hermes Agent v{__version__} ({__release_date__}){suffix}")
     print(f"Install directory: {project_root_str()}")
     install_method = read_install_method()
     if install_method:

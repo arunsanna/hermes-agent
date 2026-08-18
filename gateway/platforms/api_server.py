@@ -147,6 +147,21 @@ def _hermes_version() -> str:
         return "dev"
 
 
+def _hermes_git_identity() -> Optional[str]:
+    """Return the live-checkout identity (``"<sha>[-dirty] @ <branch>"``), or None.
+
+    Additive ``git`` field beside ``version`` on health payloads so a client
+    can tell *which checkout* is serving, not just the upstream release it
+    was synced from. Never raises — same rule as ``_hermes_version``.
+    """
+    try:
+        from hermes_cli.banner import get_git_build_identity
+
+        return get_git_build_identity()
+    except Exception:
+        return None
+
+
 # Default settings
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
@@ -2990,7 +3005,12 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health — simple health check."""
         return web.json_response(
-            {"status": "ok", "platform": "hermes-agent", "version": _hermes_version()}
+            {
+                "status": "ok",
+                "platform": "hermes-agent",
+                "version": _hermes_version(),
+                "git": _hermes_git_identity(),
+            }
         )
 
     async def _handle_health_detailed(self, request: "web.Request") -> "web.Response":
@@ -3033,6 +3053,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "readiness": readiness,
             "platform": "hermes-agent",
             "version": _hermes_version(),
+            "git": _hermes_git_identity(),
             "gateway_state": gw_state,
             "platforms": runtime.get("platforms", {}),
             "active_agents": gw_active,

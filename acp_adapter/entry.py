@@ -150,9 +150,19 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _print_version() -> None:
-    from hermes_cli import __version__ as hermes_version
+    from hermes_cli import __release_date__, __version__ as hermes_version
 
+    # Bare version stays the first line for anything parsing the output; the
+    # second line adds the release date and live-checkout identity.
     print(hermes_version)
+    try:
+        from hermes_cli.banner import get_git_build_identity
+
+        identity = get_git_build_identity()
+    except Exception:
+        identity = None
+    suffix = f" · {identity}" if identity else ""
+    print(f"Hermes Agent v{hermes_version} ({__release_date__}){suffix}")
 
 
 def _run_check() -> None:
