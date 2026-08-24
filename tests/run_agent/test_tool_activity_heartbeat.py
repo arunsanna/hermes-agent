@@ -12,7 +12,6 @@ periodically while a tool call is in flight.
 
 import json
 import threading
-import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -96,12 +95,19 @@ def _make_agent(monkeypatch):
     return stub
 
 
-def _slow_execute(delay: float = 0.25):
-    def _execute(next_args):
-        time.sleep(delay)
-        return json.dumps({"ok": True})
+def _install_deterministic_heartbeat(monkeypatch, tool_executor):
+    """Replace wall-clock scheduling with one known in-flight heartbeat."""
+    started = threading.Event()
+    stopped = threading.Event()
 
-    return _execute
+    def _heartbeat(agent, stop_event, label, interval):
+        agent._touch_activity(label)
+        started.set()
+        if stop_event.wait(timeout=1.0):
+            stopped.set()
+
+    monkeypatch.setattr(tool_executor, "_run_tool_activity_heartbeat", _heartbeat)
+    return started, stopped
 
 
 def test_heartbeat_touches_periodically_and_stops():
@@ -109,47 +115,45 @@ def test_heartbeat_touches_periodically_and_stops():
     import agent.tool_executor as te
 
     touches: list = []
-    stop = threading.Event()
 
     class _Agent:
-        def _touch_activity(self, desc):
+        def _touch_activity(self, desc, **_kwargs):
             touches.append(desc)
 
-    thread = threading.Thread(
-        target=te._run_tool_activity_heartbeat,
-        args=(_Agent(), stop, "tool running: terminal"),
-        kwargs={"interval": 0.05},
-        daemon=True,
-    )
-    thread.start()
-    time.sleep(0.12)
-    stop.set()
-    thread.join(timeout=1.0)
+    class _StopAfterTwoWaits:
+        def __init__(self):
+            self.waits = 0
 
-    assert not thread.is_alive(), "heartbeat thread did not exit on stop"
-    assert len(touches) >= 2, f"expected periodic touches, got {len(touches)}"
+        def wait(self, _interval):
+            self.waits += 1
+            return self.waits > 2
+
+    te._run_tool_activity_heartbeat(
+        _Agent(), _StopAfterTwoWaits(), "tool running: terminal", interval=0.05
+    )
+
+    assert len(touches) == 2, f"expected two periodic touches, got {len(touches)}"
     n = len(touches)
-    time.sleep(0.1)
     assert len(touches) == n, "heartbeat kept touching after stop_event set"
 
 
 def test_slow_tool_call_refreshes_activity_during_execution(monkeypatch):
-    """A tool call running longer than one interval gets activity stamps.
-
-    Before the fix, only the start stamp ("executing tool: X") and the
-    completion stamp existed; a silent 30+ minute call left the clock
-    frozen and the gateway watchdog abandoned the turn.
-    """
+    """The middleware starts its heartbeat before it dispatches a tool call."""
     import agent.tool_executor as te
-
-    monkeypatch.setattr(te, "_TOOL_ACTIVITY_HEARTBEAT_INTERVAL_S", 0.05)
 
     agent = _make_agent(monkeypatch)
     agent._tool_guardrails = MagicMock(
         before_call=lambda name, args: MagicMock(allows_execution=True)
     )
     touches: list = []
-    agent._touch_activity = lambda desc: touches.append(time.time())
+    agent._touch_activity = lambda desc, **_kwargs: touches.append(desc)
+    heartbeat_started, heartbeat_stopped = _install_deterministic_heartbeat(
+        monkeypatch, te
+    )
+
+    def _execute(_args):
+        assert heartbeat_started.wait(timeout=1.0)
+        return json.dumps({"ok": True})
 
     result = te._run_agent_tool_execution_middleware(
         agent,
@@ -157,30 +161,32 @@ def test_slow_tool_call_refreshes_activity_during_execution(monkeypatch):
         function_args={"command": "true"},
         effective_task_id="task",
         tool_call_id="tc1",
-        execute=_slow_execute(delay=0.25),
+        execute=_execute,
         display_index=1,
     )
 
     assert json.loads(result.result) == {"ok": True}
+    assert heartbeat_stopped.is_set(), "heartbeat did not receive the stop signal"
 
-    # Start stamp + at least one heartbeat mid-call (0.25s run, 0.05s cadence).
-    assert len(touches) >= 3, f"expected mid-call heartbeats, got {len(touches)}"
-    spread = touches[-1] - touches[0]
-    assert spread >= 0.15, f"touches not spread across the call: {spread:.3f}s"
+    # The direct middleware path emits the known in-flight heartbeat and the
+    # terminal completion stamp; the outer sequential executor owns its start
+    # stamp.
+    assert len(touches) >= 2, f"expected an in-flight heartbeat, got {len(touches)}"
 
 
 def test_fast_tool_call_does_not_leave_stray_heartbeat(monkeypatch):
     """A quick tool exits the heartbeat thread; no touches after return."""
     import agent.tool_executor as te
 
-    monkeypatch.setattr(te, "_TOOL_ACTIVITY_HEARTBEAT_INTERVAL_S", 0.05)
-
     agent = _make_agent(monkeypatch)
     agent._tool_guardrails = MagicMock(
         before_call=lambda name, args: MagicMock(allows_execution=True)
     )
     touches: list = []
-    agent._touch_activity = lambda desc: touches.append(time.time())
+    agent._touch_activity = lambda desc, **_kwargs: touches.append(desc)
+    _heartbeat_started, heartbeat_stopped = _install_deterministic_heartbeat(
+        monkeypatch, te
+    )
 
     te._run_agent_tool_execution_middleware(
         agent,
@@ -188,12 +194,12 @@ def test_fast_tool_call_does_not_leave_stray_heartbeat(monkeypatch):
         function_args={"command": "true"},
         effective_task_id="task",
         tool_call_id="tc1",
-        execute=_slow_execute(delay=0.02),
+        execute=lambda _args: json.dumps({"ok": True}),
         display_index=1,
     )
 
     n = len(touches)
-    time.sleep(0.12)  # several heartbeat intervals
+    assert heartbeat_stopped.is_set(), "heartbeat did not receive the stop signal"
     assert len(touches) == n, "heartbeat thread kept running after tool returned"
 
 
@@ -202,14 +208,15 @@ def test_heartbeat_stops_when_execute_raises(monkeypatch):
 
     import agent.tool_executor as te
 
-    monkeypatch.setattr(te, "_TOOL_ACTIVITY_HEARTBEAT_INTERVAL_S", 0.05)
-
     agent = _make_agent(monkeypatch)
     agent._tool_guardrails = MagicMock(
         before_call=lambda name, args: MagicMock(allows_execution=True)
     )
     touches: list = []
-    agent._touch_activity = lambda desc: touches.append(time.time())
+    agent._touch_activity = lambda desc, **_kwargs: touches.append(desc)
+    _heartbeat_started, heartbeat_stopped = _install_deterministic_heartbeat(
+        monkeypatch, te
+    )
 
     def _boom(next_args):
         raise RuntimeError("tool exploded")
@@ -226,7 +233,7 @@ def test_heartbeat_stops_when_execute_raises(monkeypatch):
         )
 
     n = len(touches)
-    time.sleep(0.12)  # several heartbeat intervals
+    assert heartbeat_stopped.is_set(), "heartbeat did not receive the stop signal"
     assert len(touches) == n, "heartbeat thread kept running after execute() raised"
 
 
@@ -234,14 +241,15 @@ def test_concurrent_tool_call_heartbeat(monkeypatch):
     """Concurrent execution also stamps activity via the shared chokepoint."""
     import agent.tool_executor as te
 
-    monkeypatch.setattr(te, "_TOOL_ACTIVITY_HEARTBEAT_INTERVAL_S", 0.05)
-
     agent = _make_agent(monkeypatch)
     agent._tool_guardrails = MagicMock(
         before_call=lambda name, args: MagicMock(allows_execution=True)
     )
     touches: list = []
-    agent._touch_activity = lambda desc: touches.append(time.time())
+    agent._touch_activity = lambda desc, **_kwargs: touches.append(desc)
+    heartbeat_started, heartbeat_stopped = _install_deterministic_heartbeat(
+        monkeypatch, te
+    )
 
     agent._execute_tool_calls_concurrent = (
         __import__("run_agent").AIAgent._execute_tool_calls_concurrent.__get__(agent)
@@ -258,7 +266,7 @@ def test_concurrent_tool_call_heartbeat(monkeypatch):
             self.tool_calls = tool_calls
 
     def _invoke(name, *a, **kw):
-        time.sleep(0.25)
+        assert heartbeat_started.wait(timeout=1.0)
         return json.dumps({"ok": name})
 
     agent._invoke_tool = MagicMock(side_effect=_invoke)
@@ -267,4 +275,5 @@ def test_concurrent_tool_call_heartbeat(monkeypatch):
     messages: list = []
     agent._execute_tool_calls_concurrent(msg, messages, "task")
 
+    assert heartbeat_stopped.is_set(), "heartbeat did not receive the stop signal"
     assert len(touches) >= 3, f"expected mid-call heartbeats, got {len(touches)}"

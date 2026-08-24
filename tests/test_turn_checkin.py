@@ -86,6 +86,18 @@ def test_checkin_disabled_when_minutes_zero(monkeypatch):
     assert agent._turn_checkin_fired is False
 
 
+def test_checkin_defers_to_explicit_run_budget(monkeypatch):
+    patch_minutes(monkeypatch)
+    agent = make_agent(started_secs_ago=16 * 60)
+    agent.run_budget_seconds = 900
+    messages = tool_tail_messages()
+
+    _maybe_request_turn_checkin(agent, messages)
+
+    assert agent._turn_checkin_fired is False
+    assert "TURN TIME BUDGET" not in messages[-1]["content"]
+
+
 def test_checkin_waits_for_a_tool_message(monkeypatch):
     patch_minutes(monkeypatch)
     agent = make_agent(started_secs_ago=16 * 60)

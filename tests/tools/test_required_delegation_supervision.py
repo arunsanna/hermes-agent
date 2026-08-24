@@ -806,14 +806,16 @@ def test_real_touch_activity_derives_distinct_in_flight_source_per_descendant():
     release.set()
 
 
-def test_child_meaningful_touch_updates_controller_before_heartbeat_boundary():
+def test_child_meaningful_touch_updates_controller_before_heartbeat_boundary(monkeypatch):
     from run_agent import AIAgent
 
+    clock = [1_000.0]
+    monkeypatch.setattr(ad.time, "time", lambda: clock[0])
     owner, release, dispatch = _dispatch_required(
         no_progress_timeout_seconds=1000.0,
     )
     delegation_id = dispatch["delegation_id"]
-    now = __import__("time").time()
+    now = clock[0]
     child = SimpleNamespace(
         _required_delegation_id=delegation_id,
         _subagent_id="sa-0-test",
@@ -835,7 +837,7 @@ def test_child_meaningful_touch_updates_controller_before_heartbeat_boundary():
     AIAgent._touch_activity(
         child, "receiving assistant reasoning", meaningful=True
     )
-    threading.Event().wait(0.015)
+    clock[0] += 0.015
     still_running = ad.required_status(owner, delegation_id)
     assert still_running["terminal"] is False
 
@@ -844,27 +846,27 @@ def test_child_meaningful_touch_updates_controller_before_heartbeat_boundary():
         supervised = ad._records[delegation_id][
             "child_supervision"
         ]["sa-0-test"]
-        supervised["last_meaningful_at"] = (
-            __import__("time").time() - 0.045
-        )
+        supervised["last_meaningful_at"] = clock[0] - 0.045
     AIAgent._touch_activity(
         child, "concurrent tools still running", meaningful=False
     )
-    threading.Event().wait(0.015)
+    clock[0] += 0.015
     terminal = ad.required_status(owner, delegation_id)
     assert terminal["status"] == "timeout"
     release.set()
 
 
-def test_nested_descendant_touch_updates_direct_child_before_deadline_boundary():
+def test_nested_descendant_touch_updates_direct_child_before_deadline_boundary(monkeypatch):
     from run_agent import AIAgent
 
+    clock = [1_000.0]
+    monkeypatch.setattr(ad.time, "time", lambda: clock[0])
     owner, release, dispatch = _dispatch_required(
         child_ids=["child-a"],
         no_progress_timeout_seconds=1000.0,
     )
     delegation_id = dispatch["delegation_id"]
-    now = __import__("time").time()
+    now = clock[0]
     descendant = SimpleNamespace(
         _required_delegation_ancestor_binding=(
             delegation_id,
@@ -897,7 +899,7 @@ def test_nested_descendant_touch_updates_direct_child_before_deadline_boundary()
     AIAgent._touch_activity(
         descendant, "receiving assistant reasoning", meaningful=True
     )
-    threading.Event().wait(0.015)
+    clock[0] += 0.015
     still_running = ad.required_status(owner, delegation_id)
     assert still_running["terminal"] is False
     assert still_running["children"][0]["child_id"] == "child-a"
@@ -907,11 +909,11 @@ def test_nested_descendant_touch_updates_direct_child_before_deadline_boundary()
     with ad._records_lock:
         ad._records[delegation_id]["child_supervision"]["child-a"][
             "last_meaningful_at"
-        ] = __import__("time").time() - 0.045
+        ] = clock[0] - 0.045
     AIAgent._touch_activity(
         descendant, "provider heartbeat", meaningful=False
     )
-    threading.Event().wait(0.015)
+    clock[0] += 0.015
     terminal = ad.required_status(owner, delegation_id)
     assert terminal["status"] == "timeout"
     release.set()

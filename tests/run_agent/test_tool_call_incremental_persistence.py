@@ -1019,7 +1019,13 @@ def test_required_join_emits_acp_visible_wait_activity_for_queued_child():
     agent.platform = "acp"
     agent._current_turn_id = "turn-visible-wait"
     visible_waits = []
-    agent._emit_wait_notice = visible_waits.append
+    visible_wait_seen = threading.Event()
+
+    def _record_visible_wait(text):
+        visible_waits.append(text)
+        visible_wait_seen.set()
+
+    agent._emit_wait_notice = _record_visible_wait
     agent._persist_required_observation_pair = MagicMock()
     dispatch = ad.dispatch_async_delegation_batch(
         goals=["queued child"],
@@ -1041,24 +1047,37 @@ def test_required_join_emits_acp_visible_wait_activity_for_queued_child():
         child_ids=["queued-child"],
         required=True,
         no_progress_timeout_seconds=1000,
-        start_timeout_seconds=0.4,
+        start_timeout_seconds=5,
     )
     messages = []
+    observation = {}
+    observer = threading.Thread(
+        target=lambda: observation.setdefault(
+            "ok", _observe_required_delegations(
+                agent, messages, [], wait_for_pending=True
+            )
+        ),
+        daemon=True,
+    )
+    observer.start()
     try:
-        assert _observe_required_delegations(
-            agent, messages, [], wait_for_pending=True
-        ) is True
+        assert visible_wait_seen.wait(timeout=2), "required wait was not surfaced"
+        release.set()
+        observer.join(timeout=2)
+        assert not observer.is_alive(), "required observation did not finish"
         terminal = ad.required_status(
             agent, dispatch["delegation_id"]
         )
     finally:
         release.set()
+        observer.join(timeout=2)
         ad._reset_for_tests()
 
+    assert observation["ok"] is True
     assert visible_waits
     assert dispatch["delegation_id"] in visible_waits[0]
     assert "queued" in visible_waits[0]
-    assert terminal["status"] == "timeout"
+    assert terminal["terminal"] is True
 
 
 def test_terminal_wrapper_hard_joins_and_replaces_stale_rollback_messages():

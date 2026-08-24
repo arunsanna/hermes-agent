@@ -2676,6 +2676,10 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         agent.requested_provider = fb_provider
         agent.base_url = fb_base_url
         agent.api_mode = fb_api_mode
+        # Per-provider reasoning_content echo opt-in (see _reasoning_echo_opt_in).
+        # Read from the fallback entry so the flag travels with the active
+        # provider; restore_primary_runtime will revert it from the snapshot.
+        agent._reasoning_echo_flag = bool(fb.get("reasoning_echo", False))
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent._fallback_activated = True
@@ -2868,8 +2872,21 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
 def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     """Request a summary when max iterations are reached. Returns the final response text."""
-    agent._safe_print(
-        f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary..."
+    warning = f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary..."
+    if getattr(agent, "suppress_status_output", False):
+        # Strict machine-readable mode (hermes chat -Q, oneshot, background
+        # review): keep diagnostics out of stdout so wrappers receive only
+        # the final assistant content (#93220 class). Note: plain quiet_mode
+        # is NOT the right gate — the interactive CLI runs quiet_mode=True by
+        # default and should still see this warning.
+        logger.warning(warning)
+    else:
+        agent._safe_print(warning)
+
+    summary_request = (
+        "You've reached the maximum number of tool-calling iterations allowed. "
+        "Please provide a final response summarizing what you've found and accomplished so far, "
+        "without calling any more tools."
     )
 
     summary_api_request_id = f"iteration-summary:{uuid.uuid4()}"
@@ -4141,8 +4158,10 @@ def _interruptible_streaming_api_call_impl(agent, api_kwargs: dict, *, on_first_
                     agent._fire_stream_delta(text)
                     deltas_were_sent["yes"] = True
                 return
-            if agent.stream_delta_callback:
-                for text in pending_parts:
+            for text in pending_parts:
+                if getattr(agent, "_acp_provisional_stream_active", False):
+                    agent._fire_stream_delta(text)
+                elif agent.stream_delta_callback:
                     try:
                         agent.stream_delta_callback(text)
                         agent._record_streamed_assistant_text(text)
@@ -4154,7 +4173,7 @@ def _interruptible_streaming_api_call_impl(agent, api_kwargs: dict, *, on_first_
             response=lambda: attempt_stream_response["value"],
         ):
             last_chunk_time["t"] = time.time()
-            agent._touch_activity("receiving stream response")
+            agent._touch_activity("receiving stream response", meaningful=False)
 
             # Update per-attempt diagnostic counters.  Best-effort —
             # failures are swallowed so the streaming hot path is never
@@ -4254,8 +4273,9 @@ def _interruptible_streaming_api_call_impl(agent, api_kwargs: dict, *, on_first_
                 agent._fire_reasoning_delta(reasoning_text)
 
             # Accumulate text content — fire callback only when no tool calls
-            if delta and delta.content:
-                content_parts.append(delta.content)
+            delta_content = getattr(delta, "content", None)
+            if delta_content:
+                content_parts.append(delta_content)
                 if not tool_calls_acc:
                     if pending_text_parts or _provider_stream_text_may_be_sse(delta.content):
                         pending_text_parts.append(delta.content)
@@ -4265,7 +4285,7 @@ def _interruptible_streaming_api_call_impl(agent, api_kwargs: dict, *, on_first_
                         _flush_pending_stream_text()
                         continue
                     _fire_first_delta()
-                    agent._fire_stream_delta(delta.content)
+                    agent._fire_stream_delta(delta_content)
                     deltas_were_sent["yes"] = True
                 # Tool calls suppress regular content streaming (avoids
                 # displaying chatty "I'll use the tool..." text alongside
@@ -4278,19 +4298,23 @@ def _interruptible_streaming_api_call_impl(agent, api_kwargs: dict, *, on_first_
                 # reasoning display.  Non-reasoning text is harmlessly
                 # suppressed by the CLI's _stream_delta when the stream
                 # box is already closed (tool boundary flush).
+                elif getattr(agent, "_acp_provisional_stream_active", False):
+                    agent._fire_stream_delta(delta_content)
                 elif agent.stream_delta_callback:
                     try:
-                        agent.stream_delta_callback(delta.content)
-                        agent._record_streamed_assistant_text(delta.content)
+                        agent.stream_delta_callback(delta_content)
+                        agent._record_streamed_assistant_text(delta_content)
                     except Exception:
                         pass
 
             # Accumulate tool call deltas — notify display on first name
-            if delta and delta.tool_calls:
+            delta_tool_calls = getattr(delta, "tool_calls", None)
+            if delta_tool_calls:
                 _flush_pending_stream_text()
-                for tc_delta in delta.tool_calls:
-                    raw_idx = tc_delta.index if tc_delta.index is not None else 0
-                    delta_id = tc_delta.id or ""
+                for tc_delta in delta_tool_calls:
+                    raw_index = getattr(tc_delta, "index", None)
+                    raw_idx = raw_index if raw_index is not None else 0
+                    delta_id = getattr(tc_delta, "id", None) or ""
 
                     # Ollama fix: detect a new tool call reusing the same
                     # raw index (different id) and redirect to a fresh slot.
@@ -4309,7 +4333,7 @@ def _interruptible_streaming_api_call_impl(agent, api_kwargs: dict, *, on_first_
 
                     if idx not in tool_calls_acc:
                         # Poolside may send integer id instead of string
-                        _tc_id = tc_delta.id
+                        _tc_id = getattr(tc_delta, "id", None)
                         if isinstance(_tc_id, int):
                             _tc_id = str(_tc_id)
                         tool_calls_acc[idx] = {
@@ -4319,14 +4343,17 @@ def _interruptible_streaming_api_call_impl(agent, api_kwargs: dict, *, on_first_
                             "extra_content": None,
                         }
                     entry = tool_calls_acc[idx]
-                    if tc_delta.id is not None:
-                        _new_id = tc_delta.id
+                    tc_id = getattr(tc_delta, "id", None)
+                    if tc_id is not None:
+                        _new_id = tc_id
                         if isinstance(_new_id, int):
                             _new_id = str(_new_id)
                         if _new_id:
                             entry["id"] = _new_id
-                    if tc_delta.function:
-                        if tc_delta.function.name:
+                    tc_function = getattr(tc_delta, "function", None)
+                    if tc_function:
+                        function_name = getattr(tc_function, "name", None)
+                        if function_name:
                             # Use assignment, not +=.  Function names are
                             # atomic identifiers delivered complete in the
                             # first chunk (OpenAI spec).  Some providers
@@ -4335,9 +4362,13 @@ def _interruptible_streaming_api_call_impl(agent, api_kwargs: dict, *, on_first_
                             # produce "read_fileread_file".  Assignment
                             # (matching the OpenAI Node SDK / LiteLLM /
                             # Vercel AI patterns) is immune to this.
-                            entry["function"]["name"] = tc_delta.function.name
-                        if tc_delta.function.arguments:
-                            entry["function"]["arguments"] += tc_delta.function.arguments
+                            entry["function"]["name"] = function_name
+                        function_arguments = getattr(tc_function, "arguments", None)
+                        if function_arguments:
+                            entry["function"]["arguments"] += function_arguments
+                            agent._touch_activity(
+                                "receiving tool call arguments", meaningful=True
+                            )
                     extra = getattr(tc_delta, "extra_content", None)
                     if extra is None and hasattr(tc_delta, "model_extra"):
                         extra = (tc_delta.model_extra if isinstance(tc_delta.model_extra, dict) else {}).get("extra_content")
@@ -4363,8 +4394,9 @@ def _interruptible_streaming_api_call_impl(agent, api_kwargs: dict, *, on_first_
                         # discarding the attempted action.
                         result["partial_tool_names"].append(name)
 
-            if chunk.choices[0].finish_reason:
-                finish_reason = chunk.choices[0].finish_reason
+            chunk_finish_reason = getattr(chunk.choices[0], "finish_reason", None)
+            if chunk_finish_reason:
+                finish_reason = chunk_finish_reason
 
             # Usage in the final chunk
             if hasattr(chunk, "usage") and chunk.usage:
@@ -4670,7 +4702,7 @@ def _interruptible_streaming_api_call_impl(agent, api_kwargs: dict, *, on_first_
             for event in stream:
                 saw_stream_event = True
                 last_chunk_time["t"] = time.time()
-                agent._touch_activity("receiving stream response")
+                agent._touch_activity("receiving stream response", meaningful=False)
                 try:
                     _diag["chunks"] = int(_diag.get("chunks", 0)) + 1
                     if _diag.get("first_chunk_at") is None:
@@ -4705,6 +4737,11 @@ def _interruptible_streaming_api_call_impl(agent, api_kwargs: dict, *, on_first_
                             if thinking_text:
                                 _fire_first_delta()
                                 agent._fire_reasoning_delta(thinking_text)
+                        elif delta_type == "input_json_delta":
+                            if getattr(delta, "partial_json", ""):
+                                agent._touch_activity(
+                                    "receiving tool call arguments", meaningful=True
+                                )
             if not agent._interrupt_requested:
                 raw_stream = _stream_context["stream"]
                 if raw_stream is not None:

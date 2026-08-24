@@ -52,6 +52,9 @@ export const en: Translations = {
     revealInSidebar: 'Reveal in filetree',
     copyPath: 'Copy Path',
     copyRelativePath: 'Copy Relative Path',
+    download: 'Download',
+    downloadSaved: 'Saved',
+    downloadFailed: 'Download failed',
     rename: 'Rename…',
     delete: 'Delete',
     renameTitle: 'Rename',
@@ -78,6 +81,8 @@ export const en: Translations = {
       backendStopped: 'Backend stopped',
       desktopBootFailed: 'Desktop boot failed',
       gatewayConnectionLost: 'Lost connection to the gateway',
+      gatewayConnectionLostDetail:
+        'Still retrying in the background. You can keep reading and drafting — open Gateway settings if this persists.',
       gatewaySignInRequired: 'Gateway sign-in required',
       ipcBridgeUnavailable: 'Desktop IPC bridge is unavailable.'
     },
@@ -99,6 +104,13 @@ export const en: Translations = {
         `Signs out of the saved remote browser session, then opens ${signInLabel}. Use local gateway to switch to the bundled backend instead.`,
       signOutAndSignIn: 'Sign out & sign in',
       remoteFailureHint: 'Check the gateway URL and sign-in under Gateway settings, or switch to the local gateway.',
+      cloudDownTitle: 'Nous Cloud agent is down',
+      cloudDownDescription:
+        'The Nous-managed cloud agent this gateway connects to is returning a server error. It cannot be restarted from here — check its status, switch to the local gateway, or get support.',
+      cloudDownHint:
+        'The buttons below open the Nous Portal (instance status and controls) and our Discord for support.',
+      cloudDownCheckPortal: 'Check Portal status',
+      cloudDownDiscord: 'Get help on Discord',
       hideRecentLogs: 'Hide recent logs',
       showRecentLogs: 'Show recent logs',
       signedInTitle: 'Signed in',
@@ -200,6 +212,30 @@ export const en: Translations = {
     dismiss: 'Dismiss'
   },
 
+  sendDiagnostics: {
+    title: 'Send diagnostics to Nous',
+    privacyNotice:
+      'This uploads a debug bundle to Nous-internal storage (not a public paste). It includes system info (OS, versions, provider, which API keys are configured — never the keys themselves) and full agent, gateway, and desktop logs (up to 512 KB each), which likely contain conversation content, tool outputs, and file paths. Secrets are redacted before upload. The bundle is viewable only by Nous staff and allowlisted Discord moderators, and auto-deletes after 14 days.',
+    upload: 'Upload',
+    uploading: 'Uploading…',
+    cancel: 'Cancel',
+    close: 'Close',
+    copyLink: 'Copy link',
+    uploadIdFallback: id => `No view link returned — quote upload ID ${id} to support`,
+    doneTitle: 'Diagnostics sent',
+    doneDescription:
+      'Your bundle was uploaded privately. Share the link below in your support thread so the team can see your logs.',
+    failedTitle: 'Upload failed',
+    failedHint:
+      'You can also run `hermes debug share --nous` from a terminal, or `hermes debug share --local` to print the report without uploading.',
+    handoffLead: 'Pick up the discussion in:',
+    links: {
+      github: 'GitHub Issues',
+      portal: 'Nous Portal Support',
+      discord: 'Discord'
+    }
+  },
+
   titlebar: {
     hideSidebar: 'Hide sidebar',
     showSidebar: 'Show sidebar',
@@ -208,12 +244,14 @@ export const en: Translations = {
     swapSidebarSides: 'Swap sidebar sides',
     hideRightSidebar: 'Hide right sidebar',
     showRightSidebar: 'Show right sidebar',
+    unreadSessions: count => (count === 1 ? '1 unread session' : `${count} unread sessions`),
     muteHaptics: 'Mute haptics',
     unmuteHaptics: 'Unmute haptics',
     openSettings: 'Open settings',
     openStarmap: 'Open memory graph',
     enterHud: 'HUD mode',
     exitHud: 'Exit HUD mode',
+    resetHudLayout: 'Reset HUD size and position',
     layoutEditor: 'Layout editor',
     layoutEditorTitle: mod => `Layout editor — ${mod}-click resets the layout`
   },
@@ -272,7 +310,9 @@ export const en: Translations = {
       'view.toggleRightSidebar': 'Toggle file browser',
       'view.toggleReview': 'Toggle review pane',
       'view.toggleStatusbar': 'Toggle status bar',
+      'view.toggleTabStrip': 'Toggle tabs',
       'view.showFiles': 'Show file browser',
+      'view.showBrowser': 'Open browser',
       'view.toggleHud': 'Toggle HUD mode',
       'hud.snapToPointer': 'Move HUD to pointer (global, while HUD is open)',
       'view.showTerminal': 'Toggle terminal',
@@ -391,6 +431,39 @@ export const en: Translations = {
         toggleFailed: (name: string) => `Could not toggle ${name}`,
         updateBackendToManage: 'Update the Hermes backend to manage this plugin from Desktop.',
         sources: { bundled: 'bundled', user: 'user', git: 'git', project: 'project', entrypoint: 'pip' }
+      },
+      installModal: {
+        title: 'Install plugin',
+        description: 'Review what this repository contains before installing anything.',
+        repoLabel: 'Repository',
+        includesHeading: 'This package includes',
+        agentLabel: 'Agent plugin',
+        desktopLabel: 'Desktop UI',
+        agentTargetLocal: profile => `Installs into the ${profile} backend (~/.hermes/plugins/)`,
+        agentTargetRemote: profile => `Installs into the connected ${profile} backend`,
+        desktopTarget: "Installs into this app's local desktop-plugins folder",
+        desktopOnlyNote: 'Desktop-only packages do not install a backend agent plugin.',
+        insecureWarning: 'This URL uses an insecure or local scheme. Prefer https:// or git@ for production installs.',
+        securityHeading: 'Before you install',
+        securityIntro:
+          'Install only from sources you trust — review the repository below if you want to see what will be added.',
+        sourceHeading: 'Source code',
+        viewRepository: 'View repository',
+        viewPluginFiles: 'View plugin files',
+        gitCloneLabel: 'Git clone URL',
+        enableAgent: 'Enable agent plugin after install',
+        forceReinstall: 'Force reinstall (replace if already installed)',
+        install: 'Install',
+        installing: 'Installing…',
+        probing: 'Inspecting repository…',
+        probeUnavailable: 'Plugin inspection is unavailable in this environment.',
+        desktopUnavailable: 'Desktop plugin install is unavailable in this environment.',
+        selectComponent: 'Select at least one component to install.',
+        agentSuccess: name => `Agent plugin ${name} installed`,
+        desktopSuccess: name => `Desktop plugin ${name} installed`,
+        agentFailed: 'Agent plugin install failed',
+        desktopFailed: 'Desktop plugin install failed',
+        missingEnv: vars => `Missing env vars: ${vars}. Add them in Settings → Keys.`
       }
     },
     notifications: {
@@ -478,6 +551,11 @@ export const en: Translations = {
       sessionDensityCompact: 'Compact',
       sessionDensityComfortable: 'Comfortable',
       sessionDensityDetailed: 'Detailed',
+      tabStripTitle: 'Tab Strip',
+      tabStripDesc: 'Show tabs above a zone. Auto hides them when a zone holds a single pane.',
+      tabStripAuto: 'Auto',
+      tabStripAlways: 'Always',
+      tabStripNever: 'Never',
       terminalFontTitle: 'Terminal Font',
       terminalFontDesc:
         'Choose an installed font for Desktop terminals. Nerd Fonts render Powerlevel10k and shell icons; leave blank to use bundled JetBrains Mono.',
@@ -485,9 +563,29 @@ export const en: Translations = {
       terminalFontPreview: 'Glyph preview',
       terminalFontReset: 'Use default',
       translucencyTitle: 'Window Translucency',
-      translucencyDesc: 'See your desktop through the whole window. macOS and Windows only.',
+      translucencyDesc: 'See your desktop through the whole window, text and all. Tuned separately for light and dark.',
+      translucencyGlassDesc:
+        'Matte glass: the desktop shows through as a smooth blur while text stays sharp. Tuned separately for light and dark.',
+      translucencyModeClear: 'Clear',
+      translucencyModeGlass: 'Glass',
+      translucencyTintTitle: 'Tint',
+      translucencyFadeTitle: 'Fade',
+      translucencyFrostTitle: 'Frost',
+      translucencyFrost: {
+        'under-window': 'Deep',
+        popover: 'Soft',
+        titlebar: 'Bright',
+        header: 'Glare'
+      },
+      translucencyScopeTitle: 'Area',
+      translucencyScope: {
+        window: 'Whole window',
+        sidebar: 'Sidebar only'
+      },
       backdropTitle: 'Chat Backdrop',
       backdropDesc: 'The faint statue image behind the conversation.',
+      introSplashTitle: 'Intro Splash',
+      introSplashDesc: 'The wordmark and prompt shown on an empty chat.',
       reactionsTitle: 'Message Reactions',
       reactionsDesc: 'iMessage-style emoji tapbacks — react to messages, and Hermes can react to yours.',
       composerPopoutTitle: 'Floating Composer',
@@ -649,16 +747,20 @@ export const en: Translations = {
       set: 'Set',
       clear: 'Clear'
     },
-    // v2 multi-connection registry: Settings → Connections.
+    // v2 multi-connection registry: Settings → Gateways.
     connections: {
-      title: 'Connections',
-      intro:
-        'Register every place your agents live — this device, remote gateways on your network, and Hermes Cloud instances. All of them are stored here.',
+      title: 'Registered gateways',
+      intro: 'Manage this device and every Hermes gateway it can reach through remote, SSH, or Cloud connections.',
       stagedNote:
-        'Chats and the agent roster follow the source you pick; the app-managed window backend is still chosen in Settings → Gateway.',
+        'Switch gateways from Sessions. Profiles, chats, messaging, and cron jobs stay with their gateway; work on other gateways keeps running.',
+      launchModeTitle: 'At startup, return to Sessions on the last-used gateway',
+      launchModeDesc: 'When off, Sessions opens on the Primary gateway.',
+      searchPlaceholder: 'Search gateways…',
+      noSearchResults: 'No gateways match your search.',
       loadFailed: 'Could not load connections',
+      currentPill: 'Current',
       primaryPill: 'Primary',
-      managedPill: 'This device',
+      managedPill: 'App-managed',
       addConnection: 'Add connection',
       editConnection: 'Edit',
       removeConnection: 'Remove',
@@ -851,6 +953,10 @@ export const en: Translations = {
       failedLoad: 'API keys failed to load',
       empty: 'Nothing configured in this category yet.'
     },
+    search: {
+      placeholder: 'Search all settings…',
+      pill: 'Search'
+    },
     profileScope: {
       appliesTo: 'Applies to',
       editsProfile: profile => `Changes on this page apply to the “${profile}” profile.`
@@ -971,6 +1077,7 @@ export const en: Translations = {
         approval: { label: 'Approval', hint: 'Smart auto-approve' },
         mcp: { label: 'MCP', hint: 'MCP tool routing' },
         title_generation: { label: 'Title gen', hint: 'Session titles' },
+        review: { label: 'Review', hint: '/review reviewer subagent' },
         curator: { label: 'Curator', hint: 'Skill-usage review' }
       }
     },
@@ -1397,8 +1504,10 @@ export const en: Translations = {
     gatewayStopped: 'Messaging gateway stopped',
     hermesActiveSessions: (version, count) => `Hermes ${version} · Active sessions ${count}`,
     restartGateway: 'Restart gateway',
+    openBrowser: 'Open browser',
     gatewayRestartFailed: 'Gateway restart failed.',
     updateHermes: 'Update Hermes',
+    reloadWindow: 'Reload window',
     actionRunning: 'running',
     actionDone: 'done',
     actionFailed: 'failed',
@@ -1706,8 +1815,42 @@ export const en: Translations = {
     allProfiles: 'All profiles',
     showAllProfiles: 'Show all profiles',
     switchToProfile: name => `Switch to ${name}`,
+    switchToConnection: name => `Switch to ${name}`,
+    switchConnectionFailed: name => `Could not connect to ${name}`,
     manageProfiles: 'Manage profiles…',
-    connectGateway: 'Connect another Hermes gateway…',
+    connectGateway: 'Manage gateways…',
+    remoteOverride: {
+      menuItem: 'Connect to a remote host…',
+      badge: (host: string) => `Runs on ${host}`,
+      title: (profile: string) => `Connect ${profile} to a remote host`,
+      description: 'Sessions in this profile will run on the remote Hermes you point it at, instead of this computer.',
+      urlLabel: 'Remote address',
+      urlPlaceholder: 'https://hermes.example.com',
+      urlInvalid: 'Enter a full address starting with http:// or https://',
+      tokenLabel: 'Access token',
+      tokenPlaceholder: 'Paste the remote session token',
+      tokenSavedHint: 'A token is already saved. Leave blank to keep it.',
+      plainTextOptIn:
+        'This computer has no secure key storage, so the token would be saved unencrypted on disk. Save it anyway.',
+      collisionWarning: (label: string) =>
+        `A gateway named “${label}” already exists in Settings. This profile connection is separate and will not change it.`,
+      confirmTitle: 'Connect this profile to a remote host?',
+      confirmNote: (profile: string, host: string) =>
+        `New chats in ${profile} will run on ${host}. That computer will run commands and read files there, not on this one. Only connect to a host you trust.`,
+      confirmBack: 'Back',
+      connect: 'Connect',
+      connecting: 'Connecting…',
+      disconnect: 'Remove remote connection',
+      savedTitle: 'Profile connected',
+      savedMessage: (profile: string, host: string) => `${profile} now runs on ${host}`,
+      removedTitle: 'Remote connection removed',
+      removedMessage: (profile: string) => `${profile} now runs on this computer`,
+      removeFailed: 'Could not remove the remote connection',
+      authFailedTitle: 'Remote host rejected the saved token',
+      authFailedMessage: (profile: string, host: string) =>
+        `${host} refused the token saved for ${profile}. It may have been changed on the remote side.`,
+      updateToken: 'Enter new token…'
+    },
     actions: 'Actions',
     color: 'Color…',
     colorFor: 'Color',
@@ -1758,6 +1901,9 @@ export const en: Translations = {
     renameTitle: 'Rename profile',
     renameDescPrefix: 'Renaming updates the profile directory and any wrapper scripts in ',
     renameDescSuffix: '.',
+    displayNameTitle: 'Name this agent',
+    displayNameDesc: 'Sets a display name shown across the app. The internal profile ID stays "default".',
+    displayNameLabel: 'Display name',
     newNameLabel: 'New name',
     renaming: 'Renaming...',
     created: 'Profile created',
@@ -2182,6 +2328,7 @@ export const en: Translations = {
     endShort: 'End',
     stopDictation: 'Stop dictation',
     transcribingDictation: 'Transcribing dictation',
+    voiceControls: 'Voice',
     voiceDictation: 'Voice dictation',
     speakReplies: 'Read replies aloud',
     stopSpeakingReplies: 'Stop reading replies aloud',
@@ -2365,6 +2512,7 @@ export const en: Translations = {
       openPr: 'Open PR',
       ghMissing: 'Install the GitHub CLI (gh) and sign in to open PRs',
       agentShip: 'Ask Hermes to open PR',
+      agentShipUnavailable: "The chat that owns these changes isn't on screen.",
       agentShipPrompt:
         'Review the current changes, commit them with a clear conventional-commit message, push the branch, and open a pull request.',
       newBranch: 'New branch',
@@ -2438,6 +2586,14 @@ export const en: Translations = {
     pidLabel: pid => `PID ${pid}`,
     technicalDetails: 'Technical details',
     notNow: 'Not now',
+    clientAlsoBehindTitle: 'Desktop app is behind',
+    clientAlsoBehindMessage:
+      'The backend is up to date, but this desktop app is still on an older version. Update it to pick up the latest fixes.',
+    clientAlsoBehindAction: 'Update desktop app',
+    everythingDispatched: 'Update dispatched',
+    everythingSkipped: 'Skipped',
+    everythingRowFailed: 'Update failed',
+    everythingFanoutFailedTitle: 'Couldn’t update other instances',
     applyStatus: {
       preparing: 'Updating backend…',
       pulling: 'Backend updating…',
@@ -2700,6 +2856,7 @@ export const en: Translations = {
       gateway: 'Gateway',
       gatewayReady: 'ready',
       gatewayNeedsSetup: 'needs setup',
+      gatewayUnavailable: 'inference unavailable',
       gatewayChecking: 'checking',
       gatewayConnecting: 'connecting',
       gatewayOffline: 'offline',
@@ -2853,6 +3010,8 @@ export const en: Translations = {
     web: {
       appFailedToBoot: 'Preview app failed to boot',
       serverNotFound: 'Server not found',
+      remoteLoopback:
+        'This address points at the machine running your agent, not this one. The browser pane loads pages locally, so a remote dev server needs a port forward or a reachable hostname.',
       failedToLoad: 'Preview failed to load',
       tryAgain: 'Try again',
       restarting: 'Hermes is restarting...',
@@ -2866,6 +3025,12 @@ export const en: Translations = {
       showConsole: 'Show preview console',
       hideDevTools: 'Hide preview DevTools',
       openDevTools: 'Open preview DevTools',
+      goBack: 'Back',
+      goForward: 'Forward',
+      reload: 'Reload page',
+      address: 'Address',
+      addressPlaceholder: 'Enter address',
+      blankPageBody: 'Type an address above to browse, or ask Hermes to open a page.',
       finishedRestarting: message => `Hermes finished restarting the preview server${message ? `: ${message}` : ''}`,
       failedRestarting: message => `Server restart failed: ${message}`,
       unknownError: 'unknown error',
@@ -2889,8 +3054,13 @@ export const en: Translations = {
   },
 
   zones: {
-    showHeader: 'Show header',
-    hideHeader: 'Hide header',
+    showTabStrip: 'Show tabs',
+    hideTabStrip: 'Hide tabs',
+    showStripTab: title => `Show ${title}`,
+    hideStripTab: title => `Hide ${title}`,
+    lastTabKeptTitle: 'Last tab stays',
+    lastTabKeptBody: 'This zone needs at least one visible tab. Show another tab first, or collapse the whole sidebar.',
+    toggleStripTab: title => `Toggle ${title} tab`,
     minimize: 'Minimize',
     restore: 'Restore',
     closeRunningTitle: 'Close running tab?',
@@ -2931,6 +3101,30 @@ export const en: Translations = {
     tabCount: count => `${count} tabs`
   },
 
+  contextMenu: {
+    link: {
+      openInApp: 'Open in in-app browser',
+      openExternal: 'Open in external browser',
+      copyUrl: 'Copy URL',
+      copyResolvedUrl: 'Copy resolved URL'
+    },
+    image: {
+      copyImage: 'Copy image',
+      copyImageAddress: 'Copy image address',
+      saveImageAs: 'Save image as…'
+    },
+    edit: {
+      cut: 'Cut',
+      paste: 'Paste',
+      selectAll: 'Select all',
+      addToDictionary: 'Add to dictionary'
+    },
+    page: {
+      copyPageUrl: 'Copy page URL',
+      inspectElement: 'Inspect element'
+    }
+  },
+
   assistant: {
     thread: {
       loadingSession: 'Loading session',
@@ -2953,6 +3147,24 @@ export const en: Translations = {
       branchNewChat: 'Branch in new chat',
       react: 'React',
       dismissError: 'Dismiss error',
+      errorLayers: {
+        auth: 'Authentication error',
+        billing: 'Out of credits',
+        disk: 'Disk full',
+        endpoint: 'Custom endpoint error',
+        gateway: 'Gateway error',
+        generic: 'Turn failed',
+        provider: 'Provider error',
+        runtime: 'Local runtime error',
+        streaming: 'Streaming connection error'
+      },
+      errorRetry: 'Retry',
+      errorSwitchProvider: 'Switch provider',
+      errorOpenLogs: 'Open logs',
+      errorOpenLogsFailed: 'Could not open the logs folder',
+      errorOpenDesktopLogs: 'Open Desktop logs',
+      errorCopyDiagnostics: 'Copy error details',
+      errorSendDiagnostics: 'Send diagnostics',
       filesChanged: count => (count === 1 ? '1 file changed' : `${count} files changed`),
       reviewChanges: 'Review',
       readAloudFailed: 'Read aloud failed',
@@ -3000,6 +3212,9 @@ export const en: Translations = {
       skip: 'Skip',
       skipped: 'Skipped',
       continueLabel: 'Continue',
+      confirmAndContinueLabel: 'Confirm and continue',
+      answeredBadge: 'Answered',
+      questionProgress: (answered, total) => `${answered} of ${total} answered`,
       lateAnswer: (question, choice) => `Re: "${question}" — my answer: ${choice}`,
       lateAnswerTip: 'Draft this answer as a follow-up message',
       lateAnswerHint: 'This prompt is no longer waiting. Pick an option to draft it as a follow-up message.'

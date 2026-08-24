@@ -83,6 +83,8 @@ def test_fast_version_parity_off_termux(tmp_path):
     out = result.stdout
     for field in ("Hermes Agent v", "Install directory:", "Python:", "OpenAI SDK:"):
         assert field in out, f"fast --version output missing {field!r}:\n{out}"
+    version_lines = [line for line in out.splitlines() if line.startswith("Hermes Agent v")]
+    assert len(version_lines) == 1, f"fast --version printed duplicate version labels:\n{out}"
 
 
 def test_fast_version_parity_on_termux(tmp_path):
