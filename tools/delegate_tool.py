@@ -4224,7 +4224,22 @@ def delegate_task(
             raw_schema = output_schema
         coerced_schema, schema_err = coerce_output_schema(raw_schema)
         if schema_err:
-            return tool_error(f"Task {i} output_schema invalid: {schema_err}")
+            from tools.async_delegation import new_delegation_id
+
+            return tool_error(
+                f"Task {i} output_schema invalid: {schema_err}",
+                delegationAttempt={
+                    "id": new_delegation_id(),
+                    "state": "preflight_rejected",
+                    "requestedCount": len(task_list),
+                    "spawnedCount": 0,
+                    "failure": {
+                        "phase": "preflight",
+                        "code": "invalid_output_schema",
+                        "retryable": False,
+                    },
+                },
+            )
         task_schemas.append(coerced_schema)
 
     overall_start = time.monotonic()
@@ -5017,6 +5032,26 @@ def delegate_task(
             _sids = [
                 getattr(_c, "_subagent_id", None) for _c in _child_agents
             ]
+            payload["delegationAttempt"] = {
+                "id": dispatch["delegation_id"],
+                "state": "dispatched",
+                "requestedCount": n,
+                "spawnedCount": len(_child_agents),
+            }
+            payload["children"] = [
+                {
+                    "childId": str(getattr(child, "_subagent_id", "") or ""),
+                    "taskIndex": index,
+                    "goal": task["goal"],
+                    "role": getattr(child, "_delegate_role", None) or top_role,
+                    "transcriptPath": str(
+                        getattr(child, "_live_transcript_path", "") or ""
+                    ),
+                }
+                for index, (task, child) in enumerate(
+                    zip(task_list, _child_agents)
+                )
+            ]
             if any(isinstance(s, str) and s for s in _sids):
                 payload["subagent_ids"] = _sids
                 payload["control_hint"] = (
@@ -5049,7 +5084,18 @@ def delegate_task(
             )
             return tool_error(
                 "Required delegation could not be started under supervision: "
-                f"{rejection}"
+                f"{rejection}",
+                delegationAttempt={
+                    "id": controller_deleg_id,
+                    "state": "failed_execution",
+                    "requestedCount": len(_goals),
+                    "spawnedCount": 0,
+                    "failure": {
+                        "phase": "dispatch",
+                        "code": "dispatch_rejected",
+                        "retryable": True,
+                    },
+                },
             )
 
         # Ordinary background work retains the legacy synchronous fallback.
@@ -5685,13 +5731,28 @@ registry.register(
 def _required_control(handler_name: str, args: dict, parent_agent=None) -> str:
     from tools import async_delegation as _required
 
-    if (
-        parent_agent is None
-        or str(getattr(parent_agent, "platform", "") or "").lower() != "acp"
-        or getattr(parent_agent, "_delegate_depth", 0) != 0
-    ):
+    if parent_agent is None:
         return json.dumps({
             "status": "unavailable",
+            "code": "control_context_missing",
+            "error": (
+                "Required delegation controls are available only to the "
+                "top-level ACP parent turn."
+            ),
+        })
+    if str(getattr(parent_agent, "platform", "") or "").lower() != "acp":
+        return json.dumps({
+            "status": "unavailable",
+            "code": "control_not_acp_root",
+            "error": (
+                "Required delegation controls are available only to the "
+                "top-level ACP parent turn."
+            ),
+        })
+    if getattr(parent_agent, "_delegate_depth", 0) != 0:
+        return json.dumps({
+            "status": "unavailable",
+            "code": "control_forbidden_child",
             "error": (
                 "Required delegation controls are available only to the "
                 "top-level ACP parent turn."

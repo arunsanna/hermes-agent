@@ -206,6 +206,35 @@ class TestBuildToolComplete:
         result = build_tool_complete("tc-fail", "execute_code", '{"output": "bad", "returncode": 2}')
         assert result.status == "failed"
 
+    def test_build_tool_complete_preserves_delegation_attempt_raw_output(self):
+        payload = {
+            "error": "Task 0 output_schema invalid: expected object",
+            "delegationAttempt": {
+                "id": "attempt-preflight-1",
+                "state": "preflight_rejected",
+                "requestedCount": 1,
+                "spawnedCount": 0,
+                "failure": {
+                    "phase": "preflight",
+                    "code": "invalid_output_schema",
+                    "retryable": False,
+                },
+            },
+        }
+        result = build_tool_complete(
+            "tc-preflight",
+            "delegate_task",
+            '{"error":"Task 0 output_schema invalid: expected object",'
+            '"delegationAttempt":{"id":"attempt-preflight-1",'
+            '"state":"preflight_rejected","requestedCount":1,'
+            '"spawnedCount":0,"failure":{"phase":"preflight",'
+            '"code":"invalid_output_schema","retryable":false}}}',
+        )
+
+        assert result.status == "failed"
+        assert result.raw_output == payload
+        assert "Delegation failed" in result.content[0].content.text
+
 
 
 

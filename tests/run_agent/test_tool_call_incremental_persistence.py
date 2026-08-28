@@ -724,6 +724,14 @@ def test_required_child_can_be_supervised_iteratively_before_final_join(
     assert "delegation_status" in tool_names
     assert "delegation_wait" in tool_names
     assert tool_names.count("delegation_wait") == 2
+    control_results = [
+        json.loads(message["content"])
+        for message in result["messages"]
+        if message.get("role") == "tool"
+        and message.get("name") in {"delegation_status", "delegation_wait"}
+    ]
+    assert control_results
+    assert all(payload.get("status") != "unavailable" for payload in control_results)
     replay = json.dumps(result["messages"])
     assert "child evidence" in replay
     assert "premature launch prose" not in replay

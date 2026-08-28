@@ -128,6 +128,15 @@ def test_apiserver_session_with_id_dispatches_background(monkeypatch):
     parsed = json.loads(out)
     assert parsed["status"] == "dispatched", parsed
     assert parsed["mode"] == "background"
+    assert parsed["delegationAttempt"] == {
+        "id": parsed["delegation_id"],
+        "state": "dispatched",
+        "requestedCount": 1,
+        "spawnedCount": 1,
+    }
+    assert parsed["children"][0]["childId"] == "s1"
+    assert parsed["children"][0]["taskIndex"] == 0
+    assert parsed["children"][0]["goal"] == "bg on api_server"
 
     evt = _drain_one()
     assert evt is not None
@@ -138,6 +147,31 @@ def test_apiserver_session_with_id_dispatches_background(monkeypatch):
     # id, not the subagent-internal id the child build clobbered
     # HERMES_SESSION_ID with (see clobbering_build_child).
     assert evt["origin_session_id"] == "raw-sid-7"
+
+
+def test_dispatched_child_reports_normalized_role(monkeypatch):
+    dt = _patch_delegate(monkeypatch)
+    monkeypatch.setenv("HERMES_SESSION_ID", "raw-sid-role")
+    set_session_vars(
+        platform="api_server",
+        chat_id="raw-sid-role",
+        session_key="raw-sid-role",
+        session_id="raw-sid-role",
+        async_delivery=False,
+    )
+
+    out = dt.delegate_task(
+        tasks=[
+            {"goal": "Inspect the service health contract", "role": "unsupported-role"},
+            {"goal": "Inspect the service error contract"},
+        ],
+        background=True,
+        parent_agent=_fake_parent(),
+    )
+    parsed = json.loads(out)
+
+    assert parsed["status"] == "dispatched", parsed
+    assert parsed["children"][0]["role"] == "leaf"
 
 
 # ---------------------------------------------------------------------------

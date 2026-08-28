@@ -275,6 +275,7 @@ def _make_mock_parent():
 
 class TestDelegateTaskDispatch:
     def test_non_dict_output_schema_rejected(self):
+        build_child = MagicMock()
         with (
             patch("tools.delegate_tool._load_config", return_value={}),
             patch(
@@ -287,6 +288,10 @@ class TestDelegateTaskDispatch:
                     "api_mode": None,
                 },
             ),
+            patch(
+                "tools.delegate_tool._build_child_preserving_parent_tools",
+                build_child,
+            ),
         ):
             out = delegate_task(
                 tasks=[
@@ -298,6 +303,17 @@ class TestDelegateTaskDispatch:
         payload = json.loads(out)
         assert payload.get("error")
         assert "output_schema" in payload["error"]
+        attempt = payload["delegationAttempt"]
+        assert attempt["state"] == "preflight_rejected"
+        assert attempt["requestedCount"] == 2
+        assert attempt["spawnedCount"] == 0
+        assert attempt["failure"] == {
+            "phase": "preflight",
+            "code": "invalid_output_schema",
+            "retryable": False,
+        }
+        assert isinstance(attempt["id"], str) and attempt["id"]
+        build_child.assert_not_called()
 
     def test_invalid_json_schema_rejected_at_dispatch(self):
         with (
@@ -323,6 +339,8 @@ class TestDelegateTaskDispatch:
         payload = json.loads(out)
         assert payload.get("error")
         assert "output_schema" in payload["error"]
+        assert payload["delegationAttempt"]["state"] == "preflight_rejected"
+        assert payload["delegationAttempt"]["spawnedCount"] == 0
 
     def test_child_receives_contract_and_schema_attr(self):
         """The built child carries the schema attr and its context gains

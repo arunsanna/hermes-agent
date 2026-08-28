@@ -384,7 +384,7 @@ def agent():
     with (
         patch(
             "run_agent.get_tool_definitions",
-            return_value=_make_tool_defs("web_search", "terminal"),
+            return_value=_make_tool_defs("web_search", "terminal", "delegation_status"),
         ),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI"),
@@ -401,6 +401,31 @@ def agent():
 
 
 class TestSegmentedDispatchIntegration:
+    def test_segmented_delegation_control_keeps_root_capability(self, agent):
+        """A sequential control after parallel reads keeps its ACP owner."""
+        calls = [
+            _tc("web_search", '{"query":"a"}', call_id="s1"),
+            _tc("web_search", '{"query":"b"}', call_id="s2"),
+            _tc(
+                "delegation_status",
+                '{"delegation_id":"delegation-test"}',
+                call_id="control-1",
+            ),
+        ]
+        observed = []
+
+        def fake_handle(name, _args, _task_id, **kwargs):
+            if name == "delegation_status":
+                observed.append(kwargs)
+            return json.dumps({"status": "running"})
+
+        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+            agent._execute_tool_calls(
+                SimpleNamespace(content="", tool_calls=calls), [], "task-1"
+            )
+
+        assert observed[0]["parent_agent"] is agent
+
     def test_mixed_batch_runs_safe_prefix_concurrently_and_barrier_after(self, agent):
         """Two web_search calls must overlap in time; terminal must start only
         after both finish; results land in the model's emission order."""

@@ -2200,6 +2200,34 @@ class TestConcurrentToolExecution:
         assert completes == [("c1", "web_search", {"query": "hello"}, '{"success": true}')]
 
     @pytest.mark.parametrize("quiet_mode", [True, False])
+    def test_sequential_delegation_control_forwards_parent_agent(
+        self,
+        agent,
+        quiet_mode,
+    ):
+        """Root-only ACP controls retain their invocation capability in both paths."""
+        agent.quiet_mode = quiet_mode
+        tool_call = _mock_tool_call(
+            name="delegation_status",
+            arguments='{"delegation_id":"delegation-test"}',
+            call_id="control-1",
+        )
+        observed = []
+
+        def handle_function_call(*_args, **kwargs):
+            observed.append(kwargs)
+            return '{"status":"running"}'
+
+        with patch("run_agent.handle_function_call", side_effect=handle_function_call):
+            agent._execute_tool_calls_sequential(
+                _mock_assistant_msg(content="", tool_calls=[tool_call]),
+                [],
+                "task-1",
+            )
+
+        assert observed[0]["parent_agent"] is agent
+
+    @pytest.mark.parametrize("quiet_mode", [True, False])
     def test_sequential_registry_tool_forwards_request_middleware_trace(
         self,
         agent,

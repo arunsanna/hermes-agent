@@ -1422,6 +1422,20 @@ def _is_structured_json_result(result: Optional[str]) -> bool:
     return isinstance(_json_loads_maybe(result), (dict, list))
 
 
+def _delegate_attempt_raw_output(result: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Keep native delegation lifecycle receipts machine-readable over ACP.
+
+    ACP renders delegate failures as concise prose, but the gateway needs the
+    structured attempt receipt to distinguish a preflight rejection from an
+    execution failure. This is intentionally scoped to payloads that carry the
+    canonical receipt; ordinary polished tool JSON remains display-only.
+    """
+    data = _json_loads_maybe(result)
+    if not isinstance(data, dict) or not isinstance(data.get("delegationAttempt"), dict):
+        return None
+    return data
+
+
 def build_tool_complete(
     tool_call_id: str,
     tool_name: str,
@@ -1447,12 +1461,22 @@ def build_tool_complete(
         status = "failed"
     else:
         status = "completed"
+    delegation_attempt = (
+        _delegate_attempt_raw_output(result) if tool_name == "delegate_task" else None
+    )
+    raw_output = (
+        None
+        if tool_name in _POLISHED_TOOLS or _is_structured_json_result(result)
+        else result
+    )
+    if delegation_attempt is not None:
+        raw_output = delegation_attempt
     return acp.update_tool_call(
         tool_call_id,
         kind=kind,
         status=status,
         content=content,
-        raw_output=None if tool_name in _POLISHED_TOOLS or _is_structured_json_result(result) else result,
+        raw_output=raw_output,
     )
 
 

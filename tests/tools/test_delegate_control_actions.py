@@ -12,6 +12,7 @@ import json
 import weakref
 
 from tools.delegate_tool import (
+    _required_control,
     _handle_control_action,
     _is_descendant_of,
     _owns_subagent_record,
@@ -57,6 +58,39 @@ def _register(sid: str, child, **extra) -> None:
     }
     record.update(extra)
     _register_subagent(record)
+
+
+def test_required_control_reports_missing_owner_context():
+    payload = json.loads(
+        _required_control("status", {"delegation_id": "delegation-test"})
+    )
+
+    assert payload["status"] == "unavailable"
+    assert payload["code"] == "control_context_missing"
+
+
+def test_required_control_reports_non_acp_root():
+    parent = type("Parent", (), {"platform": "cli", "_delegate_depth": 0})()
+    payload = json.loads(
+        _required_control(
+            "status", {"delegation_id": "delegation-test"}, parent_agent=parent
+        )
+    )
+
+    assert payload["status"] == "unavailable"
+    assert payload["code"] == "control_not_acp_root"
+
+
+def test_required_control_keeps_child_boundary_distinct():
+    child = type("Child", (), {"platform": "acp", "_delegate_depth": 1})()
+    payload = json.loads(
+        _required_control(
+            "status", {"delegation_id": "delegation-test"}, parent_agent=child
+        )
+    )
+
+    assert payload["status"] == "unavailable"
+    assert payload["code"] == "control_forbidden_child"
 
 
 # ---------------------------------------------------------------------------
