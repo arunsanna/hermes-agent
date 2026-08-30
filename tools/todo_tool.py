@@ -309,6 +309,9 @@ TODO_SCHEMA = {
         "Mark an item completed only after the work is verified done, never "
         "based on intent. If something fails, "
         "cancel it and add a revised item.\n\n"
+        "Keep it current: after each verified status change, call this tool "
+        "again to publish it. Before giving your final answer, update every "
+        "affected item; never leave verified work pending.\n\n"
         "Always returns the full current list."
     ),
     "parameters": {

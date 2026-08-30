@@ -2,7 +2,7 @@
 
 import json
 
-from tools.todo_tool import TodoStore, todo_tool
+from tools.todo_tool import TODO_SCHEMA, TodoStore, todo_tool
 
 
 class TestWriteAndRead:
@@ -135,6 +135,14 @@ class TestTodoToolFunction:
     def test_no_store_returns_error(self):
         result = json.loads(todo_tool())
         assert "error" in result
+
+
+class TestTodoSchema:
+    def test_requires_status_updates_before_reporting_work_complete(self):
+        description = TODO_SCHEMA["description"]
+
+        assert "after each verified status change" in description
+        assert "before giving your final answer" in description.lower()
 
 
 class TestTodoStoreBounds:
