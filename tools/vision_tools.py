@@ -1115,6 +1115,16 @@ def _build_native_vision_tool_result(
         text_part += f"\n\nQuestion: {question.strip()}"
     if scale_note:
         text_part += f"\n\nNote: {scale_note}"
+    # Carry the untruncated source path in the text part itself, not just in
+    # ``meta`` — once history unwraps this envelope into a plain content
+    # list (agent/tool_executor.py), ``meta`` doesn't survive, but the text
+    # part does. That's what lets a later turn-boundary stub (Phase 1 of the
+    # "pixels once" plan) tell the model where to re-load the image from.
+    # A data: URL isn't a re-loadable path, so it's excluded.
+    if isinstance(image_url, str) and not image_url.startswith(
+        ("data:", "http://", "https://")
+    ):
+        text_part += f"\n\nSource file: {image_url}"
 
     summary = (
         f"Image attached natively for the main model "

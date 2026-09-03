@@ -18,6 +18,7 @@ from tools.vision_tools import (
     _image_to_base64_data_url,
     _resize_image_for_vision,
     _image_exceeds_dimension,
+    _build_native_vision_tool_result,
     _EMBED_MAX_DIMENSION,
     _is_image_size_error,
     _MAX_BASE64_BYTES,
@@ -604,6 +605,48 @@ class TestLocalPathForms:
             f"file://{tmp_path}/nonexistent.png", "describe this", "test/model"
         ))
         assert data["success"] is False
+
+
+# ---------------------------------------------------------------------------
+# _build_native_vision_tool_result — the fast-path multimodal envelope
+# ---------------------------------------------------------------------------
+
+
+class TestBuildNativeVisionToolResult:
+    """The text part must carry the source path so a later stub can point
+    the model back at the file once the pixels are gone from history."""
+
+    def test_local_path_appended_as_source_file_line(self):
+        result = _build_native_vision_tool_result(
+            image_url="/Users/arun/Desktop/screenshot.png",
+            question="what does this say?",
+            image_data_url="data:image/png;base64,AAAA",
+            image_size_bytes=1234,
+        )
+        text_part = result["content"][0]["text"]
+        assert "Source file: /Users/arun/Desktop/screenshot.png" in text_part
+
+    def test_data_url_image_url_not_appended_as_source_file(self):
+        # A data: URL is not a re-loadable path — don't tell the model to
+        # vision_analyze a base64 blob back at itself.
+        result = _build_native_vision_tool_result(
+            image_url="data:image/png;base64,AAAA",
+            question="what does this say?",
+            image_data_url="data:image/png;base64,AAAA",
+            image_size_bytes=1234,
+        )
+        text_part = result["content"][0]["text"]
+        assert "Source file:" not in text_part
+
+    def test_meta_image_url_unchanged(self):
+        # meta.image_url keeps its existing [:200] truncation contract.
+        result = _build_native_vision_tool_result(
+            image_url="/Users/arun/Desktop/screenshot.png",
+            question="",
+            image_data_url="data:image/png;base64,AAAA",
+            image_size_bytes=1234,
+        )
+        assert result["meta"]["image_url"] == "/Users/arun/Desktop/screenshot.png"
 
 
 # ---------------------------------------------------------------------------
