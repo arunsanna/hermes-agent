@@ -140,12 +140,20 @@ class TestVisionAnalyzeNative:
             f"{_EMBED_TARGET_BYTES / 1024:.0f} KB — would bloat every later turn"
         )
 
-    def test_embed_caps_are_sized_for_history_reuse(self):
-        """Native embeds ride every later turn, so caps must stay well below
-        the Anthropic 5 MB / 8000px reject limits (#92699)."""
-        from tools.vision_tools import _EMBED_MAX_DIMENSION, _EMBED_TARGET_BYTES
+    def test_embed_caps_are_sized_for_one_turn(self):
+        """"Pixels once, then stub": a turn-boundary pass now collapses the
+        embed to a text stub before the next turn's request goes out, so
+        these caps only ever govern the turn actively looking at the image
+        — they must stay under Anthropic's 5 MB reject-cap (and the 20 MB
+        hard ceiling), not sized for history re-send."""
+        from tools.vision_tools import (
+            _EMBED_MAX_DIMENSION,
+            _EMBED_TARGET_BYTES,
+            _MAX_BASE64_BYTES,
+        )
 
-        assert _EMBED_TARGET_BYTES <= 512 * 1024
+        assert _EMBED_TARGET_BYTES < 5 * 1024 * 1024
+        assert _EMBED_TARGET_BYTES <= _MAX_BASE64_BYTES
         assert _EMBED_MAX_DIMENSION <= 2048
 
 

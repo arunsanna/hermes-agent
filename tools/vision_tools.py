@@ -625,22 +625,27 @@ def _image_to_base64_data_url(image_path: Path, mime_type: Optional[str] = None)
 # provider accepts the image and we reject outright.
 _MAX_BASE64_BYTES = 20 * 1024 * 1024
 
-# Proactive embed cap for conversation-history reuse.  Native vision_analyze
-# bakes the data-URL into the tool result, which is re-sent on every later
-# turn.  The 20 MB hard ceiling / Anthropic 5 MB reject-cap still apply as
-# safety nets; those are one-shot viewing limits, not history-reuse sizes.
-# A 4 MB / 7900px embed was observed at ~400K chars and ~100–260K billed
-# tokens per image (#92699), so we size for model reading instead: 256 KB
-# keeps a 1568px screenshot cheap enough to ride the session (PNGs that
-# exceed it are downscaled further by the byte-budget ladder), well under
-# every provider's per-image limit.
-_EMBED_TARGET_BYTES = 256 * 1024
+# Proactive embed cap for the one turn that uses this image.  Native
+# vision_analyze used to bake the data-URL into the tool result and let it
+# ride every LATER turn too (#92699: ~100-260K billed tokens per image per
+# turn), which is why this was sized down to 256 KB.  The turn-boundary
+# stub pass (agent.context_compressor.stub_prior_turn_tool_images) now
+# collapses the embed to a text stub before the next turn's request goes
+# out, so this budget only ever governs the turn that's actively looking at
+# the image — size it for fidelity instead of re-send cost.  4 MB stays
+# comfortably under Anthropic's 5 MB reject-cap and the 20 MB hard ceiling
+# below (images over budget are downscaled further by the byte-budget
+# ladder, never rejected outright for this alone).
+_EMBED_TARGET_BYTES = 4 * 1024 * 1024
 
-# Proactive embed dimension cap (px, longest side).  Anthropic still rejects
-# above 8000px independently of the byte cap, but its tokenizer downsamples
-# to a 1568px long edge — pixels past that cost wire bytes and never extra
-# model fidelity.  Cap at 1568 so history embeds match what the model sees.
-_EMBED_MAX_DIMENSION = 1568
+# Proactive embed dimension cap (px, longest side), for the same one-turn
+# budget.  2048 matches Codex CLI's own embed cap
+# (codex-rs/utils/image/src/lib.rs), so a screenshot looks the same to
+# either CLI.  Anthropic's tokenizer downsamples to a 1568px long edge on
+# its own, so raising the cap to 2048 costs wire bytes on that provider —
+# never extra fidelity — while providers without server-side downsampling
+# (Synapse, OpenAI) actually see the sharper image.
+_EMBED_MAX_DIMENSION = 2048
 
 # Target size when auto-resizing on API failure (5 MB).  After a provider
 # rejects an image, we downscale to this target and retry once.
