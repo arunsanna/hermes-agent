@@ -768,6 +768,24 @@ class TestResizeImageForVision:
         assert len(result) < _MAX_BASE64_BYTES
 
 
+    def test_dimension_cap_fits_long_side_before_halving(self, tmp_path):
+        """A 1320x2390 phone screenshot over a 2048 px cap must land at
+        1131x2048 (fit the cap), not 660x1195 (a blind halving)."""
+        from PIL import Image
+
+        path = tmp_path / "shot.jpg"
+        Image.new("RGB", (1320, 2390), (200, 200, 200)).save(path, format="JPEG", quality=90)
+        scale_out: dict = {}
+        result = _resize_image_for_vision(
+            path,
+            mime_type="image/jpeg",
+            max_base64_bytes=4 * 1024 * 1024,
+            max_dimension=2048,
+            scale_out=scale_out,
+        )
+        assert result.startswith("data:image/jpeg;base64,")
+        assert (scale_out["new_width"], scale_out["new_height"]) == (1131, 2048)
+
     def test_no_pillow_returns_original(self, tmp_path):
         """Without Pillow, oversized images should be returned as-is."""
         # Create a dummy file

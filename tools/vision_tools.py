@@ -923,9 +923,19 @@ def _resize_image_for_vision(image_path: Path, mime_type: Optional[str] = None,
 
     for attempt in range(5):
         if attempt > 0:
-            # Proportional scaling: halve the longer side and scale the
-            # shorter side to preserve aspect ratio (min dimension 64).
-            scale = 0.5
+            # First shrink: when the dimension cap is what we are over, fit
+            # the longer side to it exactly (Codex-CLI style) instead of
+            # halving — halving a 1320x2390 phone screenshot lands at
+            # 660x1195 even though 1131x2048 satisfies the cap. Later
+            # attempts (still over the byte budget) halve as before.
+            if (
+                attempt == 1
+                and max_dimension is not None
+                and max(img.width, img.height) > max_dimension
+            ):
+                scale = max_dimension / max(img.width, img.height)
+            else:
+                scale = 0.5
             new_w = max(int(img.width * scale), 64)
             new_h = max(int(img.height * scale), 64)
             # Re-derive the scale from whichever dimension hit the floor
