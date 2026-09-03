@@ -10824,6 +10824,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     def rewrite_message_content(
         self, session_id: str, tool_call_id: str, content: Any,
+        *, expected_content: Any,
     ) -> bool:
         """Durably rewrite one tool-result message's content, clearing its
         stale ``api_content`` sidecar in the same statement.
@@ -10833,14 +10834,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         in-memory image stub, so a later resume loads the stub instead of
         re-hydrating the original data URL from disk.
 
-        Keyed by ``(session_id, tool_call_id, role='tool')`` rather than the
-        row's integer primary key: the turn-boundary call site works off
-        ``conversation_history``, which most restore paths (notably
-        ``acp_adapter.session``'s ACP resume) load without
-        ``include_row_ids=True`` — so a stable row id isn't reliably present
-        there. ``tool_call_id`` is always set on a tool-role message and is
-        unique per tool invocation within a session, making it the stable
-        key available at that call site (S1 spike,
+        ``tool_call_id`` is NOT a unique key across a session: the
+        deterministic fallback id used when a provider omits one
+        (agent/message_sanitization.py's ``deterministic_call_id``) hashes
+        only ``(fn_name, arguments, index-in-batch)`` — nothing turn- or
+        time-scoped — so the same tool called with the same arguments in
+        two different turns can collide on the same id. A blind
+        ``(session_id, tool_call_id, role='tool')`` UPDATE would then
+        rewrite whichever active row currently matches, including an
+        unrelated later tool result that happens to share the id.
+
+        ``expected_content`` makes the write a compare-and-swap instead:
+        the caller passes the pre-stub content it captured in memory
+        (:func:`agent.context_compressor.stub_prior_turn_tool_images`), and
+        the UPDATE only touches a row whose *current* stored content still
+        encodes to that exact value. A collision then either matches zero
+        rows (safe no-op — this returns ``False`` and the caller logs it)
+        or the one correct row — never an unrelated one.
+
+        Keyed by ``(session_id, tool_call_id, role='tool')`` plus the
+        content match above, rather than the row's integer primary key:
+        the turn-boundary call site works off ``conversation_history``,
+        which most restore paths (notably ``acp_adapter.session``'s ACP
+        resume) load without ``include_row_ids=True`` — so a stable row id
+        isn't reliably present there (S1 spike,
         docs/plans/2026-09-03-hermes-image-pixels-once.md, switchboard repo).
 
         Returns ``True`` iff a row was found and rewritten.
@@ -10852,8 +10869,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             cur = conn.execute(
                 "UPDATE messages SET content = ?, api_content = NULL "
                 "WHERE session_id = ? AND tool_call_id = ? AND role = 'tool' "
-                "AND active = 1",
-                (self._encode_content(content), session_id, tool_call_id),
+                "AND active = 1 AND content = ?",
+                (
+                    self._encode_content(content),
+                    session_id,
+                    tool_call_id,
+                    self._encode_content(expected_content),
+                ),
             )
             return cur.rowcount > 0
 

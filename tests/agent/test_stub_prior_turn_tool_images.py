@@ -50,6 +50,26 @@ def _multimodal_dict_tool_msg(path: str = "/tmp/screenshot.png") -> dict:
     }
 
 
+def _screenshot_path_meta_tool_msg(path: str = "/tmp/shot123.png") -> dict:
+    # Shape produced by tools/computer_use/tool.py's _capture_response and
+    # tools/browser_use_cli.py's _native_screenshot_result: the identical
+    # `_multimodal` envelope, but meta carries the on-disk path under
+    # `screenshot_path`, not `image_url`.
+    return {
+        "role": "tool",
+        "tool_call_id": "call_5",
+        "content": {
+            "_multimodal": True,
+            "content": [
+                {"type": "text", "text": "capture mode=vision 1280x800"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            ],
+            "text_summary": "capture mode=vision 1280x800",
+            "meta": {"screenshot_path": path, "native_vision": True},
+        },
+    }
+
+
 class TestStubPriorTurnToolImages:
     def test_list_content_image_becomes_single_string_stub(self):
         messages = [_native_vision_tool_msg()]
@@ -69,6 +89,18 @@ class TestStubPriorTurnToolImages:
         assert isinstance(content, str)
         assert "Image attached natively for the main model" in content
         assert "/tmp/screenshot.png" in content
+        assert "Call vision_analyze on this path if you need to look again." in content
+
+    def test_multimodal_dict_with_screenshot_path_meta_keeps_reload_hint(self):
+        # computer_use / browser_use_cli screenshots key their on-disk path
+        # as meta.screenshot_path rather than meta.image_url — the stub
+        # must still recover it and keep the reload hint.
+        messages = [_screenshot_path_meta_tool_msg()]
+        count = stub_prior_turn_tool_images(messages)
+        assert count == 1
+        content = messages[0]["content"]
+        assert isinstance(content, str)
+        assert "/tmp/shot123.png" in content
         assert "Call vision_analyze on this path if you need to look again." in content
 
     def test_tool_message_without_image_untouched(self):

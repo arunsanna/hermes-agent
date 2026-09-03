@@ -1658,7 +1658,15 @@ def _image_stub_for_tool_content(content: Any) -> Optional[str]:
         return None
     if isinstance(content, dict) and content.get("_multimodal"):
         text_part = str(content.get("text_summary") or "")
-        path = (content.get("meta") or {}).get("image_url")
+        meta = content.get("meta") or {}
+        # vision_tools' native envelope carries meta.image_url; the
+        # computer_use and browser_use_cli screenshot envelopes
+        # (tools/computer_use/tool.py's _capture_response,
+        # tools/browser_use_cli.py's _native_screenshot_result) build the
+        # identical `_multimodal` shape but key the same on-disk path as
+        # meta.screenshot_path instead — fall back to it so their stubs
+        # keep the reload path and hint too.
+        path = meta.get("image_url") or meta.get("screenshot_path")
         return _build_image_stub_text(text_part, path)
     text_part, path = _text_and_path_from_image_parts(content)
     return _build_image_stub_text(text_part, path)
@@ -1666,7 +1674,7 @@ def _image_stub_for_tool_content(content: Any) -> Optional[str]:
 
 def stub_prior_turn_tool_images(
     messages: List[Dict[str, Any]],
-    on_stub: Optional[Callable[[Dict[str, Any]], None]] = None,
+    on_stub: Optional[Callable[[Dict[str, Any], Any], None]] = None,
 ) -> int:
     """Collapse every prior-turn tool-result image to a durable text stub.
 
@@ -1689,8 +1697,13 @@ def stub_prior_turn_tool_images(
     and leave the durable in-process history holding the old pixels.
 
     ``on_stub``, when given, is called with each stubbed message dict
-    (after mutation) so the caller can persist it — this module has no
-    reach to a session's ``SessionDB`` handle, so it can't do that itself.
+    (after mutation) and the message's pre-stub content (captured before
+    mutation) so the caller can persist it — this module has no reach to
+    a session's ``SessionDB`` handle, so it can't do that itself. The
+    pre-stub content lets the persistence call use a compare-and-swap
+    (only rewrite the DB row if its content still matches what was just
+    stubbed in memory) instead of a blind ``tool_call_id`` match, which is
+    not a unique key across a session (see rewrite_message_content).
 
     Idempotent: a message already stubbed has plain string content, which
     carries no image parts, so a second pass leaves it untouched and
@@ -1702,14 +1715,15 @@ def stub_prior_turn_tool_images(
     for msg in messages:
         if not isinstance(msg, dict) or msg.get("role") != "tool":
             continue
-        stub = _image_stub_for_tool_content(msg.get("content"))
+        original_content = msg.get("content")
+        stub = _image_stub_for_tool_content(original_content)
         if stub is None:
             continue
         msg["content"] = stub
         drop_stale_api_content(msg)
         count += 1
         if on_stub is not None:
-            on_stub(msg)
+            on_stub(msg, original_content)
     return count
 
 

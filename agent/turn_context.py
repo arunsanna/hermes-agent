@@ -668,20 +668,31 @@ def build_turn_context(
     # importing it back here at module scope would be circular.
     from agent.context_compressor import stub_prior_turn_tool_images
 
-    def _persist_stubbed_tool_image(stubbed_msg: Dict[str, Any]) -> None:
+    def _persist_stubbed_tool_image(stubbed_msg: Dict[str, Any], original_content: Any) -> None:
         # Best-effort: the in-memory stub above already did the thing that
         # matters this turn onward (stop re-sending pixels); a missed write
         # here only means a future resume re-hydrates the old data URL from
         # disk until this fires again on a later turn. Same SessionDB
         # handle _flush_session_db_after_tool_progress reaches through
         # `agent._session_db` (agent/tool_executor.py).
+        #
+        # `original_content` (the pre-stub payload) is passed through as
+        # `expected_content` so the DB write is a compare-and-swap keyed on
+        # the row's actual content, not just `tool_call_id` — that id is
+        # not guaranteed unique within a session (the deterministic
+        # fallback id hashes only fn_name/arguments/index), so a blind
+        # match could clobber an unrelated tool row that happens to share
+        # the same id.
         session_db = getattr(agent, "_session_db", None)
         tool_call_id = stubbed_msg.get("tool_call_id")
         if session_db is None or not tool_call_id:
             return
         try:
             session_db.rewrite_message_content(
-                agent.session_id, tool_call_id, stubbed_msg.get("content")
+                agent.session_id,
+                tool_call_id,
+                stubbed_msg.get("content"),
+                expected_content=original_content,
             )
         except Exception:
             logger.debug("failed to persist stubbed tool image", exc_info=True)

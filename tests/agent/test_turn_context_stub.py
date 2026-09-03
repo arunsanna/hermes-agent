@@ -82,7 +82,10 @@ class TestTurnContextStubsPriorTurnImages:
 
         stubbed = ctx.messages[2]
         agent._session_db.rewrite_message_content.assert_called_once_with(
-            "sess-persist", "call_1", stubbed["content"]
+            "sess-persist",
+            "call_1",
+            stubbed["content"],
+            expected_content=_prior_turn_image_tool_msg()["content"],
         )
 
     def test_no_prior_image_leaves_history_untouched(self):
