@@ -1609,6 +1609,101 @@ def _strip_images_from_tool_msg(msg: Dict[str, Any]) -> Optional[Dict[str, Any]]
     return new_msg
 
 
+#: Told to the model in every image stub so it knows the file is still on
+#: disk and re-loadable, even though the pixels are no longer in context.
+_IMAGE_STUB_RELOAD_HINT = "Call vision_analyze on this path if you need to look again."
+
+#: Matches the "Source file: <path>" line Task 1.1 appends to the native
+#: vision tool-result's text part (tools/vision_tools.py).
+_SOURCE_FILE_LINE_RE = re.compile(r"(?m)^Source file: (.+)$")
+
+
+def _text_and_path_from_image_parts(parts: List[Any]) -> "tuple[str, Optional[str]]":
+    """Collect the text parts of a part list and the source path, if any."""
+    texts: List[str] = []
+    for part in parts:
+        if isinstance(part, str):
+            texts.append(part)
+        elif isinstance(part, dict) and part.get("type") == "text":
+            text = part.get("text")
+            if isinstance(text, str):
+                texts.append(text)
+    combined = "\n\n".join(t for t in texts if t)
+    match = _SOURCE_FILE_LINE_RE.search(combined)
+    path = match.group(1).strip() if match else None
+    return combined, path
+
+
+def _build_image_stub_text(text_part: str, path: Optional[str]) -> str:
+    """Render the durable text stub for one prior-turn tool-result image.
+
+    ``text_part`` may already carry a "Source file: <path>" line (the list
+    shape, post Task 1.1); the dict-envelope shape does not, so it's added
+    here from ``meta.image_url`` instead. Either way the stub always states
+    the path once and the re-load hint, so the model can act on it later
+    without depending on which shape produced it.
+    """
+    body = f"[image no longer in context] {text_part}".rstrip()
+    if path:
+        if f"Source file: {path}" not in body:
+            body += f"\n\nSource file: {path}"
+        body += f"\n\n{_IMAGE_STUB_RELOAD_HINT}"
+    return body
+
+
+def _image_stub_for_tool_content(content: Any) -> Optional[str]:
+    """Return the durable stub string for an image-bearing tool result, or
+    ``None`` when ``content`` carries no image (caller leaves it untouched)."""
+    if not _tool_content_has_images(content):
+        return None
+    if isinstance(content, dict) and content.get("_multimodal"):
+        text_part = str(content.get("text_summary") or "")
+        path = (content.get("meta") or {}).get("image_url")
+        return _build_image_stub_text(text_part, path)
+    text_part, path = _text_and_path_from_image_parts(content)
+    return _build_image_stub_text(text_part, path)
+
+
+def stub_prior_turn_tool_images(messages: List[Dict[str, Any]]) -> int:
+    """Collapse every prior-turn tool-result image to a durable text stub.
+
+    Called once per turn, at the turn boundary (agent/turn_context.py),
+    right after ``conversation_history`` is copied into the turn's working
+    ``messages`` list and before the new user message is appended.
+    Everything already in ``messages`` at that point belongs to a completed
+    prior turn — the in-flight turn hasn't appended its own tool results
+    yet — so every tool-result image found here is safe to stub: later
+    requests stop re-sending its data URL, and the stub's source-path +
+    reload hint lets the model call ``vision_analyze`` again if it needs to
+    look at the image once more.
+
+    Unlike :func:`_strip_images_from_tool_msg` (used by compaction, which
+    replaces list entries with fresh copies), this mutates each stubbed
+    message dict IN PLACE. ``messages`` is built by the caller as
+    ``list(conversation_history)`` — a shallow copy that shares the same
+    dict objects as the caller's own history (e.g. ``state.history``);
+    replacing list entries here would only affect this turn's local copy
+    and leave the durable in-process history holding the old pixels.
+
+    Idempotent: a message already stubbed has plain string content, which
+    carries no image parts, so a second pass leaves it untouched and
+    returns 0 for it.
+
+    Returns the number of messages stubbed.
+    """
+    count = 0
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
+            continue
+        stub = _image_stub_for_tool_content(msg.get("content"))
+        if stub is None:
+            continue
+        msg["content"] = stub
+        drop_stale_api_content(msg)
+        count += 1
+    return count
+
+
 def _retire_stale_tool_result_images(
     result: List[Dict[str, Any]],
     keep_newest: int = _MAX_KEEP_TOOL_IMAGES,

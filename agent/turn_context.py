@@ -654,6 +654,25 @@ def build_turn_context(
     # Initialize conversation (copy to avoid mutating the caller's list).
     messages = list(conversation_history) if conversation_history else []
 
+    # "Pixels once, then stub": everything already in `messages` at this
+    # point belongs to a completed prior turn (this turn's own tool results
+    # haven't been appended yet), so any prior-turn tool-result image found
+    # here is safe to collapse to a durable text stub — later requests stop
+    # re-sending its data URL, and the model can call vision_analyze again
+    # on the stub's source path if it needs to look at the image once more.
+    # Mutates the shared message dicts in place (see the helper's docstring)
+    # so `messages` being a shallow copy of `conversation_history` doesn't
+    # leave the caller's own history (e.g. state.history) holding stale
+    # pixels. Local import: agent.context_compressor imports
+    # drop_stale_api_content from this module at ITS module scope, so
+    # importing it back here at module scope would be circular.
+    from agent.context_compressor import stub_prior_turn_tool_images
+    _stubbed_prior_turn_images = stub_prior_turn_tool_images(messages)
+    if _stubbed_prior_turn_images:
+        logger.info(
+            "stubbed %d prior-turn tool image(s)", _stubbed_prior_turn_images
+        )
+
     # The CLI may already have staged this input outside the history passed to
     # ``run_conversation``. Reuse it only when its clean transcript text matches
     # this turn; a stale handoff from a failed prior turn must not replace a
