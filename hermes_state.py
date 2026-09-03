@@ -10822,6 +10822,43 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return self._execute_write(_do)
 
+    def rewrite_message_content(
+        self, session_id: str, tool_call_id: str, content: Any,
+    ) -> bool:
+        """Durably rewrite one tool-result message's content, clearing its
+        stale ``api_content`` sidecar in the same statement.
+
+        Used by the "pixels once, then stub" turn-boundary pass
+        (agent.context_compressor.stub_prior_turn_tool_images) to persist an
+        in-memory image stub, so a later resume loads the stub instead of
+        re-hydrating the original data URL from disk.
+
+        Keyed by ``(session_id, tool_call_id, role='tool')`` rather than the
+        row's integer primary key: the turn-boundary call site works off
+        ``conversation_history``, which most restore paths (notably
+        ``acp_adapter.session``'s ACP resume) load without
+        ``include_row_ids=True`` — so a stable row id isn't reliably present
+        there. ``tool_call_id`` is always set on a tool-role message and is
+        unique per tool invocation within a session, making it the stable
+        key available at that call site (S1 spike,
+        docs/plans/2026-09-03-hermes-image-pixels-once.md, switchboard repo).
+
+        Returns ``True`` iff a row was found and rewritten.
+        """
+        if not session_id or not tool_call_id:
+            return False
+
+        def _do(conn):
+            cur = conn.execute(
+                "UPDATE messages SET content = ?, api_content = NULL "
+                "WHERE session_id = ? AND tool_call_id = ? AND role = 'tool' "
+                "AND active = 1",
+                (self._encode_content(content), session_id, tool_call_id),
+            )
+            return cur.rowcount > 0
+
+        return bool(self._execute_write(_do))
+
     def get_message_reactions(
         self, session_id: str, message_row_id: int
     ) -> List[Dict[str, Any]]:

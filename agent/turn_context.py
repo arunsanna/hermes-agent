@@ -667,7 +667,28 @@ def build_turn_context(
     # drop_stale_api_content from this module at ITS module scope, so
     # importing it back here at module scope would be circular.
     from agent.context_compressor import stub_prior_turn_tool_images
-    _stubbed_prior_turn_images = stub_prior_turn_tool_images(messages)
+
+    def _persist_stubbed_tool_image(stubbed_msg: Dict[str, Any]) -> None:
+        # Best-effort: the in-memory stub above already did the thing that
+        # matters this turn onward (stop re-sending pixels); a missed write
+        # here only means a future resume re-hydrates the old data URL from
+        # disk until this fires again on a later turn. Same SessionDB
+        # handle _flush_session_db_after_tool_progress reaches through
+        # `agent._session_db` (agent/tool_executor.py).
+        session_db = getattr(agent, "_session_db", None)
+        tool_call_id = stubbed_msg.get("tool_call_id")
+        if session_db is None or not tool_call_id:
+            return
+        try:
+            session_db.rewrite_message_content(
+                agent.session_id, tool_call_id, stubbed_msg.get("content")
+            )
+        except Exception:
+            logger.debug("failed to persist stubbed tool image", exc_info=True)
+
+    _stubbed_prior_turn_images = stub_prior_turn_tool_images(
+        messages, on_stub=_persist_stubbed_tool_image
+    )
     if _stubbed_prior_turn_images:
         logger.info(
             "stubbed %d prior-turn tool image(s)", _stubbed_prior_turn_images

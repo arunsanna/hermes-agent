@@ -13,6 +13,8 @@ rather than re-deriving the minimal agent stand-in.
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 from tests.agent.test_turn_context import _build, _FakeAgent, _stub_runtime_main  # noqa: F401
 
 
@@ -65,6 +67,23 @@ class TestTurnContextStubsPriorTurnImages:
         # too, not just build_turn_context's local `messages` copy.
         assert conversation_history[2] is stubbed
         assert isinstance(conversation_history[2]["content"], str)
+
+    def test_prior_turn_image_stub_persisted_through_agent_session_db(self):
+        agent = _FakeAgent()
+        agent._session_db = MagicMock()
+        agent.session_id = "sess-persist"
+        conversation_history = [
+            {"role": "user", "content": "attach this screenshot"},
+            {"role": "assistant", "content": "let me look", "tool_calls": []},
+            _prior_turn_image_tool_msg(),
+        ]
+
+        ctx = _build(agent, conversation_history=conversation_history)
+
+        stubbed = ctx.messages[2]
+        agent._session_db.rewrite_message_content.assert_called_once_with(
+            "sess-persist", "call_1", stubbed["content"]
+        )
 
     def test_no_prior_image_leaves_history_untouched(self):
         agent = _FakeAgent()

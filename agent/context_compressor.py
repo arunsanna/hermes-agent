@@ -24,7 +24,7 @@ import sqlite3
 import re
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from agent.auxiliary_client import (
     AuxiliaryExplicitCancellation,
@@ -1664,7 +1664,10 @@ def _image_stub_for_tool_content(content: Any) -> Optional[str]:
     return _build_image_stub_text(text_part, path)
 
 
-def stub_prior_turn_tool_images(messages: List[Dict[str, Any]]) -> int:
+def stub_prior_turn_tool_images(
+    messages: List[Dict[str, Any]],
+    on_stub: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> int:
     """Collapse every prior-turn tool-result image to a durable text stub.
 
     Called once per turn, at the turn boundary (agent/turn_context.py),
@@ -1685,6 +1688,10 @@ def stub_prior_turn_tool_images(messages: List[Dict[str, Any]]) -> int:
     replacing list entries here would only affect this turn's local copy
     and leave the durable in-process history holding the old pixels.
 
+    ``on_stub``, when given, is called with each stubbed message dict
+    (after mutation) so the caller can persist it — this module has no
+    reach to a session's ``SessionDB`` handle, so it can't do that itself.
+
     Idempotent: a message already stubbed has plain string content, which
     carries no image parts, so a second pass leaves it untouched and
     returns 0 for it.
@@ -1701,6 +1708,8 @@ def stub_prior_turn_tool_images(messages: List[Dict[str, Any]]) -> int:
         msg["content"] = stub
         drop_stale_api_content(msg)
         count += 1
+        if on_stub is not None:
+            on_stub(msg)
     return count
 
 
