@@ -938,6 +938,15 @@ def _resize_image_for_vision(image_path: Path, mime_type: Optional[str] = None,
                 scale = 0.5
             new_w = max(int(img.width * scale), 64)
             new_h = max(int(img.height * scale), 64)
+            if scale != 0.5:
+                # Pin the longer side to the cap exactly; int() truncation
+                # otherwise yields e.g. 2047 for a 2048 cap.
+                if img.width >= img.height:
+                    new_w = max_dimension
+                    new_h = max(round(img.height * scale), 64)
+                else:
+                    new_h = max_dimension
+                    new_w = max(round(img.width * scale), 64)
             # Re-derive the scale from whichever dimension hit the floor
             # so both axes shrink by the same factor.
             if new_w == 64 and img.width > 0:
