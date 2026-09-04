@@ -44,7 +44,9 @@ def _arm(monkeypatch):
     _SpyThread.started = 0
     calls = []
 
-    def _fake_spawn(agent, messages_snapshot, review_memory=False, review_skills=False):
+    def _fake_spawn(
+        agent, messages_snapshot, review_memory=False, review_skills=False, **kwargs
+    ):
         calls.append((review_memory, review_skills))
         return (lambda: None), "prompt"
 

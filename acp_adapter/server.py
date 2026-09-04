@@ -5,67 +5,31 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 from datetime import datetime, timezone
-import base64
+import contextlib
 import contextvars
-import json
 import logging
 import os
 import time
+import threading
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
+from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Deque, Optional
-from urllib.parse import unquote, urlparse
+from typing import Any, Callable, Deque, Optional
 
 import acp
 from acp.schema import (
-    AgentCapabilities,
-    AgentMessageChunk,
-    AgentThoughtChunk,
-    AuthenticateResponse,
-    AvailableCommand,
-    AvailableCommandsUpdate,
-    BlobResourceContents,
-    ClientCapabilities,
-    EmbeddedResourceContentBlock,
-    ForkSessionResponse,
-    ImageContentBlock,
-    AudioContentBlock,
-    Implementation,
-    InitializeResponse,
-    ListSessionsResponse,
-    LoadSessionResponse,
-    McpServerHttp,
-    McpServerSse,
-    McpServerStdio,
-    ModelInfo,
-    NewSessionResponse,
-    PromptCapabilities,
-    PromptResponse,
-    ResumeSessionResponse,
-    SetSessionConfigOptionResponse,
-    SetSessionModelResponse,
-    SetSessionModeResponse,
-    ResourceContentBlock,
-    SessionCapabilities,
-    SessionForkCapabilities,
-    SessionInfoUpdate,
-    SessionListCapabilities,
-    SessionMode,
-    SessionModeState,
-    SessionModelState,
-    SessionResumeCapabilities,
-    SessionInfo,
-    TextContentBlock,
-    TextResourceContents,
-    UnstructuredCommandInput,
-    Usage,
-    UsageUpdate,
-    UserMessageChunk,
+    AgentCapabilities, AgentMessageChunk, AuthenticateResponse, ClientCapabilities, ForkSessionResponse,
+    Implementation, InitializeResponse, ListSessionsResponse, LoadSessionResponse, McpServerHttp, McpServerSse,
+    McpServerStdio, ModelInfo, NewSessionResponse, PromptCapabilities, PromptResponse, ResumeSessionResponse,
+    SessionCapabilities, SessionForkCapabilities, SessionInfo, SessionInfoUpdate, SessionListCapabilities,
+    SessionMode, SessionModeState, SessionModelState, SessionResumeCapabilities, SetSessionConfigOptionResponse,
+    SetSessionModeResponse, SetSessionModelResponse, TextContentBlock, Usage, UsageUpdate, UserMessageChunk,
 )
 
 from acp_adapter.auth import TERMINAL_SETUP_AUTH_METHOD_ID, build_auth_methods, detect_provider
+from acp_adapter.commands import HERMES_VERSION, SlashCommandsMixin, _estimate_tokens
+from acp_adapter.content import PromptBlock, _content_blocks_to_openai_user_content, _extract_text
 from acp_adapter.events import (
     _build_plan_update_from_todo_result,
     flush_open_tool_calls,
@@ -74,9 +38,11 @@ from acp_adapter.events import (
     make_thinking_cb,
     make_tool_progress_cb,
 )
+from acp_adapter.model_catalog import build_model_state, encode_model_choice
 from acp_adapter.permissions import make_approval_callback
 from acp_adapter.provenance import session_provenance_meta
 from acp_adapter.session import (
+    OwnedSessions,
     SessionManager,
     SessionState,
     UnsafeSessionTranscriptError,
@@ -88,19 +54,38 @@ from acp_adapter.tools import (
     build_tool_complete,
     build_tool_start,
     flush_async_background_dispatches,
+    coerce_tool_args,
 )
-from agent.context_compressor import (
-    COMPRESSED_SUMMARY_METADATA_KEY,
-    ContextCompressor,
-)
+from agent.context_compressor import (COMPRESSED_SUMMARY_METADATA_KEY, ContextCompressor)
 from agent.interrupt_compat import request_hard_interrupt
-from tools.approval import (
-    reset_hermes_interactive_context,
-    set_hermes_interactive_context,
-)
+from tools.approval_context import reset_hermes_interactive_context, set_hermes_interactive_context
 
 logger = logging.getLogger(__name__)
 
+def _dispose_replaced_agent(agent: Any) -> None:
+    """Release replacement-owned clients without touching shared session state."""
+    if agent is None:
+        return
+    try:
+        attrs = getattr(agent, "__dict__", {})
+        codex_session = attrs.get("_codex_session") if isinstance(attrs, dict) else None
+        if codex_session is not None:
+            codex_session.close()
+            agent._codex_session = None
+    except Exception:
+        logger.debug("Failed to close replaced Codex app-server session", exc_info=True)
+    try:
+        release_clients = getattr(agent, "release_clients", None)
+        if callable(release_clients):
+            release_clients()
+    except Exception:
+        logger.debug("Failed to release replaced ACP agent clients", exc_info=True)
+
+# Runs the synchronous AIAgent off the event loop.
+_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="acp-agent")
+
+# ListSessionsRequest has no client-side limit; clients paginate via `cursor`/`next_cursor`.
+_LIST_SESSIONS_PAGE_SIZE = 50
 _TURN_KEEPALIVE_INTERVAL_DEFAULT = 45.0
 _TURN_KEEPALIVE_MAX_SILENT_DEFAULT = 1800.0
 
@@ -139,141 +124,6 @@ def _turn_keepalive_settings() -> tuple[float, float]:
 # guard's own code in that same reserved band.
 _CROSS_SESSION_GUARD_ERROR_CODE = -32001
 
-
-def _named_custom_provider_catalogs() -> list[tuple[str, str, list[tuple[str, str]]]]:
-    """Return ``(slug, label, [(model_id, description), ...])`` for named endpoints.
-
-    Covers both the v12 ``providers:`` mapping and the legacy
-    ``custom_providers:`` list.  These endpoints never appear in canonical
-    provider enumeration, so without this the ACP model selector hides every
-    named endpoint that the TUI ``/model`` picker already renders (#47039
-    implemented named-endpoint rows for the TUI surface only).
-
-    Model lists come from the entry's declared models (``default_model`` +
-    ``models``), refreshed from the endpoint's live ``/models`` listing when a
-    credential is available and ``discover_models`` is not disabled.  Declared
-    models are kept even when live discovery fails — some OpenAI-compatible
-    endpoints (e.g. Bedrock Mantle Responses) expose no ``/models`` route at
-    all yet serve the declared models fine.
-
-    Slugs use the ``custom:<name>`` shape that ``parse_model_input`` and
-    ``resolve_runtime_provider`` already resolve, so encoded choice ids
-    (``custom:<name>:<model>``) round-trip through ``set_session_model``
-    unchanged.
-    """
-    try:
-        from hermes_cli.config import (
-            get_compatible_custom_providers,
-            is_provider_enabled,
-            load_config,
-        )
-        from hermes_cli.model_switch import (
-            _NativePickerModelList,
-            _declared_model_ids,
-            _entry_models_discovered,
-            _fetch_picker_live_models,
-            _models_config_is_allowlist,
-        )
-        from hermes_cli.models import should_use_ollama_native_catalog
-        from hermes_cli.providers import custom_provider_slug
-    except ImportError:
-        return []
-
-    try:
-        cfg = load_config()
-        entries = get_compatible_custom_providers(cfg)
-    except Exception:
-        logger.debug("Could not load named custom providers", exc_info=True)
-        return []
-
-    # ``get_compatible_custom_providers`` drops the ``enabled`` flag during
-    # normalization, so collect explicitly disabled provider keys from the
-    # raw config and skip their entries below.
-    disabled_keys: set[str] = set()
-    raw_providers = cfg.get("providers") if isinstance(cfg, dict) else None
-    if isinstance(raw_providers, dict):
-        for raw_key, raw_entry in raw_providers.items():
-            if isinstance(raw_entry, dict) and not is_provider_enabled(raw_entry):
-                disabled_keys.add(str(raw_key).strip().lower())
-
-    catalogs: list[tuple[str, str, list[tuple[str, str]]]] = []
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        provider_key = str(entry.get("provider_key", "") or "").strip()
-        if provider_key.lower() in disabled_keys:
-            continue
-        name = str(entry.get("name", "") or "").strip()
-        base_url = str(entry.get("base_url", "") or "").strip()
-        if not name or not base_url:
-            continue
-        slug = custom_provider_slug(name, provider_key)
-
-        api_key = str(entry.get("api_key", "") or "").strip()
-        if not api_key:
-            key_env = str(
-                entry.get("key_env") or entry.get("api_key_env") or ""
-            ).strip()
-            api_key = os.environ.get(key_env, "").strip() if key_env else ""
-
-        declared: list[str] = []
-        default_model = str(entry.get("model", "") or "").strip()
-        if default_model:
-            declared.append(default_model)
-        models_cfg = entry.get("models")
-        for mid in _declared_model_ids(models_cfg):
-            if mid not in declared:
-                declared.append(mid)
-
-        native_headers = entry.get("extra_headers") or None
-        native_catalog_provider = (
-            provider_key
-            if provider_key.lower() in {"ollama", "custom:ollama"}
-            else "custom"
-        )
-        is_native_ollama = should_use_ollama_native_catalog(
-            native_catalog_provider, base_url, headers=native_headers
-        )
-        explicit_catalog = _models_config_is_allowlist(
-            models_cfg, _entry_models_discovered(entry)
-        )
-        if not api_key and not declared and not is_native_ollama:
-            # No credential to discover with and nothing declared:
-            # not addressable from the selector.
-            continue
-
-        model_ids = list(declared)
-        discover = entry.get("discover_models", True)
-        if isinstance(discover, str):
-            discover = discover.lower() not in {"false", "no", "0"}
-        native_catalog_provider = native_catalog_provider if is_native_ollama else "custom"
-        live = None
-        if discover and (api_key or is_native_ollama):
-            try:
-                live = _fetch_picker_live_models(
-                    api_key,
-                    base_url,
-                    native_catalog_provider,
-                    explicit_catalog,
-                    headers=native_headers,
-                    timeout=1.5,
-                    api_mode=entry.get("api_mode"),
-                )
-            except Exception:
-                live = None
-            if live is not None:
-                if isinstance(live, _NativePickerModelList):
-                    model_ids = list(live)
-                else:
-                    model_ids = declared + [m for m in live if m not in declared]
-
-        if not model_ids:
-            if isinstance(live if "live" in locals() else None, _NativePickerModelList):
-                catalogs.append((slug, name, []))
-            continue
-        catalogs.append((slug, name, [(mid, "") for mid in model_ids]))
-
-    return catalogs
 def _sanitize_failed_turn_history(
     messages: Any,
     *,
@@ -458,476 +308,207 @@ def _rewrite_agent_active_history(
     return False
 
 
-def _dispose_replaced_agent(agent: Any) -> None:
-    """Release agent-owned clients without touching shared session resources."""
-    if agent is None:
-        return
-    try:
-        attrs = getattr(agent, "__dict__", {})
-        codex_session = attrs.get("_codex_session") if isinstance(attrs, dict) else None
-        if codex_session is not None:
-            codex_session.close()
-            agent._codex_session = None
-    except Exception:
-        logger.debug("Failed to close replaced Codex app-server session", exc_info=True)
-    try:
-        release_clients = getattr(agent, "release_clients", None)
-        if callable(release_clients):
-            release_clients()
-    except Exception:
-        logger.debug("Failed to release replaced ACP agent clients", exc_info=True)
+def _flatten_history_text(value: Any) -> str:
+    """Persisted content/reasoning (str, or list of ``{"text"}`` / ``{"type": "text", "content"}``
+    parts) -> one stripped string; whitespace-only collapses to ``""`` ("nothing to emit")."""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+                elif item.get("type") == "text" and isinstance(item.get("content"), str):
+                    parts.append(item["content"])
+            elif isinstance(item, str):
+                parts.append(item)
+        return "\n".join(part.strip() for part in parts if part and part.strip()).strip()
+    return ""
 
-try:
-    from hermes_cli import __version__ as HERMES_VERSION
-except Exception:
-    HERMES_VERSION = "0.0.0"
 
-# Thread pool for running AIAgent (synchronous) in parallel.
-_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="acp-agent")
+def _history_reasoning_text(message: dict[str, Any]) -> str:
+    """First non-empty of ``reasoning_content`` and ``reasoning`` — both live keys, for
+    different transports (not old-vs-new)."""
+    for key in ("reasoning_content", "reasoning"):
+        text = _flatten_history_text(message.get(key))
+        if text:
+            return text
+    return ""
 
-# Server-side page size for list_sessions. The ACP ListSessionsRequest schema
-# does not expose a client-side limit, so this is a fixed cap that clients
-# paginate against using `cursor` / `next_cursor`.
-_LIST_SESSIONS_PAGE_SIZE = 50
-# Per-provider cap for the ACP model selector. ACP clients (Zed, Buzz) render
-# the whole `availableModels` array in one dropdown, so an unbounded
-# cross-provider catalog degrades the picker. Mirrors the cap the MoA picker
-# already uses (`hermes_cli/moa_cmd.py`). This bounds each provider's row, not
-# the total; aggregator providers stay intentionally uncapped inside the shared
-# inventory, and the current model is always kept via the fallback insert below.
-ACP_MAX_MODELS_PER_PROVIDER = 200
-_MAX_ACP_RESOURCE_BYTES = 512 * 1024
-_TEXT_RESOURCE_MIME_PREFIXES = ("text/",)
-_TEXT_RESOURCE_MIME_TYPES = {
-    "application/json",
-    "application/javascript",
-    "application/typescript",
-    "application/xml",
-    "application/x-yaml",
-    "application/yaml",
-    "application/toml",
-    "application/sql",
+
+def _history_summary_meta(message: dict[str, Any], text: str) -> dict[str, Any] | None:
+    """``_meta`` for a replayed compaction summary, else None.
+
+    Summaries persist as ordinary messages, standalone (either role) or merged into the first
+    preserved tail message. Two keys so clients can't hide real content: ``compactionSummary``
+    (whole chunk; safe to collapse) vs ``containsCompactionSummary`` (real content + summary).
+    Uses the in-process flag, falling back to content classification for DB-reloaded sessions."""
+    kind = ContextCompressor.classify_summary_content(text)
+    if kind is None and message.get(COMPRESSED_SUMMARY_METADATA_KEY):
+        # Flagged but unclassified (prefix drift): the flag only marks summaries -> standalone.
+        kind = "standalone"
+    if kind == "standalone":
+        return {"hermes": {"compactionSummary": True}}
+    if kind == "merged":
+        return {"hermes": {"containsCompactionSummary": True}}
+    return None
+
+
+# role -> (chunk class, session_update tag) for history replay.
+_HISTORY_CHUNK_TYPES = {
+    "user": (UserMessageChunk, "user_message_chunk"), "assistant": (AgentMessageChunk, "agent_message_chunk")
 }
 
 
-def _resource_display_name(uri: str, name: str | None = None, title: str | None = None) -> str:
-    """Human-readable attachment name for prompt context."""
-    raw_name = (name or "").strip()
-    raw_title = (title or "").strip()
-    if raw_title and raw_name and raw_title != raw_name:
-        return f"{raw_title} ({raw_name})"
-    if raw_title:
-        return raw_title
-    if raw_name:
-        return raw_name
-    parsed = urlparse(uri)
-    candidate = parsed.path if parsed.scheme else uri
-    return Path(unquote(candidate)).name or uri or "resource"
+def _history_tool_call_name_args(tool_call: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """Extract function name/arguments from an OpenAI-style tool_call."""
+    function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+    name = str(function.get("name") or tool_call.get("name") or "unknown_tool")
+    raw_args = function.get("arguments") or tool_call.get("arguments") or tool_call.get("args") or {}
+    return name, coerce_tool_args(raw_args)
 
 
-def _is_text_resource(mime_type: str | None) -> bool:
-    mime = (mime_type or "").split(";", 1)[0].strip().lower()
-    if not mime:
-        return False
-    return mime.startswith(_TEXT_RESOURCE_MIME_PREFIXES) or mime in _TEXT_RESOURCE_MIME_TYPES
-
-
-def _is_image_resource(mime_type: str | None) -> bool:
-    mime = (mime_type or "").split(";", 1)[0].strip().lower()
-    return mime.startswith("image/")
-
-
-def _guess_image_mime_from_path(path: Path) -> str | None:
-    suffix = path.suffix.lower()
-    return {
-        ".png": "image/png",
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".gif": "image/gif",
-        ".webp": "image/webp",
-        ".bmp": "image/bmp",
-        ".svg": "image/svg+xml",
-    }.get(suffix)
-
-
-def _image_data_url(data: bytes, mime_type: str) -> str:
-    return f"data:{mime_type};base64,{base64.b64encode(data).decode('ascii')}"
-
-
-def _path_from_file_uri(uri: str) -> Path | None:
-    """Convert local file URIs/paths from ACP clients into a readable Path.
-
-    Zed may send POSIX file URIs from Linux/WSL workspaces or Windows-ish paths
-    when launched through wsl.exe. Translate the common Windows drive form to
-    /mnt/<drive>/... so Hermes running in WSL can read it.
-    """
-    raw = (uri or "").strip()
-    if not raw:
+def _history_message_chunk(role: str, message: dict[str, Any]) -> UserMessageChunk | AgentMessageChunk | None:
+    text = _flatten_history_text(message.get("content"))
+    if not text:
         return None
-
-    parsed = urlparse(raw)
-    if parsed.scheme and parsed.scheme != "file":
-        return None
-
-    if parsed.scheme == "file":
-        if parsed.netloc and parsed.netloc not in {"", "localhost"}:
-            return None
-        path_text = unquote(parsed.path or "")
-    else:
-        path_text = unquote(raw)
-
-    # file:///C:/Users/... or C:\Users\...
-    if len(path_text) >= 3 and path_text[0] == "/" and path_text[2] == ":" and path_text[1].isalpha():
-        drive = path_text[1].lower()
-        rest = path_text[3:].lstrip("/\\").replace("\\", "/")
-        return Path("/mnt") / drive / rest
-    if len(path_text) >= 2 and path_text[1] == ":" and path_text[0].isalpha():
-        drive = path_text[0].lower()
-        rest = path_text[2:].lstrip("/\\").replace("\\", "/")
-        return Path("/mnt") / drive / rest
-
-    return Path(path_text)
-
-
-def _decode_text_bytes(data: bytes, mime_type: str | None) -> str | None:
-    """Decode resource bytes if they are probably text; return None for binary."""
-    if b"\x00" in data and not _is_text_resource(mime_type):
-        return None
-    for encoding in ("utf-8-sig", "utf-8", "latin-1"):
-        try:
-            return data.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-    return data.decode("utf-8", errors="replace")
-
-
-def _format_resource_text(
-    *,
-    uri: str,
-    body: str,
-    name: str | None = None,
-    title: str | None = None,
-    note: str | None = None,
-) -> str:
-    display = _resource_display_name(uri, name=name, title=title)
-    header = f"[Attached file: {display}]"
-    if note:
-        header += f" ({note})"
-    return f"{header}\nURI: {uri}\n\n{body}"
-
-
-def _resource_link_to_parts(block: ResourceContentBlock) -> list[dict[str, Any]]:
-    """Convert an ACP resource_link block to OpenAI content parts.
-
-    Returns a list of {"type": "text", ...} and/or {"type": "image_url", ...}
-    parts. Image resources produce an image_url part with a small text header
-    so the model knows which attachment it is. Non-image resources return a
-    single text part with the inlined file body (or a binary-omit note).
-    """
-    uri = str(getattr(block, "uri", "") or "").strip()
-    if not uri:
-        return []
-
-    name = str(getattr(block, "name", "") or "").strip() or None
-    title = str(getattr(block, "title", "") or "").strip() or None
-    mime_type = str(getattr(block, "mime_type", "") or "").strip() or None
-    path = _path_from_file_uri(uri)
-
-    if path is None:
-        return [{
-            "type": "text",
-            "text": _format_resource_text(
-                uri=uri,
-                name=name,
-                title=title,
-                body="[Resource link only; Hermes cannot read non-file ACP resource URIs directly.]",
-            ),
-        }]
-
-    # Image files: emit a short text header + image_url data URL so vision
-    # models can see the attachment instead of a "binary omitted" note.
-    image_mime = mime_type if _is_image_resource(mime_type) else _guess_image_mime_from_path(path)
-    if image_mime and _is_image_resource(image_mime):
-        try:
-            size = path.stat().st_size
-            if size > _MAX_ACP_RESOURCE_BYTES:
-                return [{
-                    "type": "text",
-                    "text": _format_resource_text(
-                        uri=uri,
-                        name=name,
-                        title=title,
-                        body=f"[Image too large to inline: {size} bytes, cap={_MAX_ACP_RESOURCE_BYTES}]",
-                    ),
-                }]
-            with path.open("rb") as fh:
-                data = fh.read()
-        except OSError as exc:
-            logger.warning("ACP image resource read failed: %s", uri, exc_info=True)
-            return [{
-                "type": "text",
-                "text": _format_resource_text(
-                    uri=uri,
-                    name=name,
-                    title=title,
-                    body=f"[Could not read attached image: {exc}]",
-                ),
-            }]
-        display = _resource_display_name(uri, name=name, title=title)
-        return [
-            {"type": "text", "text": f"[Attached image: {display}]\nURI: {uri}"},
-            {"type": "image_url", "image_url": {"url": _image_data_url(data, image_mime)}},
-        ]
-
-    try:
-        size = path.stat().st_size
-        read_size = min(size, _MAX_ACP_RESOURCE_BYTES)
-        with path.open("rb") as fh:
-            data = fh.read(read_size)
-        text = _decode_text_bytes(data, mime_type)
-        if text is None:
-            return [{
-                "type": "text",
-                "text": _format_resource_text(
-                    uri=uri,
-                    name=name,
-                    title=title,
-                    body=f"[Binary file omitted: {size} bytes, mime={mime_type or 'unknown'}]",
-                ),
-            }]
-        note = None
-        if size > _MAX_ACP_RESOURCE_BYTES:
-            note = f"truncated to {_MAX_ACP_RESOURCE_BYTES} of {size} bytes"
-        return [{
-            "type": "text",
-            "text": _format_resource_text(uri=uri, name=name, title=title, body=text, note=note),
-        }]
-    except OSError as exc:
-        logger.warning("ACP resource read failed: %s", uri, exc_info=True)
-        return [{
-            "type": "text",
-            "text": _format_resource_text(
-                uri=uri,
-                name=name,
-                title=title,
-                body=f"[Could not read attached file: {exc}]",
-            ),
-        }]
-
-
-def _embedded_resource_to_parts(block: EmbeddedResourceContentBlock) -> list[dict[str, Any]]:
-    resource = getattr(block, "resource", None)
-    if resource is None:
-        return []
-
-    uri = str(getattr(resource, "uri", "") or "").strip()
-    mime_type = str(getattr(resource, "mime_type", "") or "").strip() or None
-
-    if isinstance(resource, TextResourceContents):
-        return [{"type": "text", "text": _format_resource_text(uri=uri, body=resource.text)}]
-
-    if isinstance(resource, BlobResourceContents):
-        blob = resource.blob or ""
-        try:
-            data = base64.b64decode(blob, validate=True)
-        except Exception:
-            data = blob.encode("utf-8", errors="replace")
-
-        # Image blobs go through as image_url so vision models can see them.
-        if _is_image_resource(mime_type):
-            if len(data) > _MAX_ACP_RESOURCE_BYTES:
-                return [{
-                    "type": "text",
-                    "text": _format_resource_text(
-                        uri=uri,
-                        body=f"[Embedded image too large to inline: {len(data)} bytes, cap={_MAX_ACP_RESOURCE_BYTES}]",
-                    ),
-                }]
-            display = _resource_display_name(uri)
-            return [
-                {"type": "text", "text": f"[Attached image: {display}]" + (f"\nURI: {uri}" if uri else "")},
-                {"type": "image_url", "image_url": {"url": _image_data_url(data, mime_type or "image/png")}},
-            ]
-
-        text = _decode_text_bytes(data[:_MAX_ACP_RESOURCE_BYTES], mime_type)
-        if text is None:
-            body = f"[Binary embedded file omitted: {len(data)} bytes, mime={mime_type or 'unknown'}]"
-        else:
-            body = text
-            if len(data) > _MAX_ACP_RESOURCE_BYTES:
-                body += f"\n\n[Truncated to {_MAX_ACP_RESOURCE_BYTES} of {len(data)} bytes]"
-        return [{"type": "text", "text": _format_resource_text(uri=uri, body=body)}]
-
-    text = getattr(resource, "text", None)
-    if text:
-        return [{"type": "text", "text": _format_resource_text(uri=uri, body=str(text))}]
-    return []
-
-
-def _extract_text(
-    prompt: list[
-        TextContentBlock
-        | ImageContentBlock
-        | AudioContentBlock
-        | ResourceContentBlock
-        | EmbeddedResourceContentBlock
-    ],
-) -> str:
-    """Extract plain text from ACP content blocks for display/commands."""
-    parts: list[str] = []
-    for block in prompt:
-        if isinstance(block, TextContentBlock):
-            parts.append(block.text)
-        elif hasattr(block, "text"):
-            parts.append(str(block.text))
-    return "\n".join(parts)
-
-
-def _image_block_to_openai_part(block: ImageContentBlock) -> dict[str, Any] | None:
-    """Convert an ACP image content block to OpenAI-style multimodal content."""
-    data = str(getattr(block, "data", "") or "").strip()
-    uri = str(getattr(block, "uri", "") or "").strip()
-    mime_type = str(getattr(block, "mime_type", "") or "image/png").strip() or "image/png"
-
-    if data:
-        url = data if data.startswith("data:") else f"data:{mime_type};base64,{data}"
-    elif uri:
-        url = uri
-    else:
-        return None
-
-    return {"type": "image_url", "image_url": {"url": url}}
-
-
-def _content_blocks_to_openai_user_content(
-    prompt: list[
-        TextContentBlock
-        | ImageContentBlock
-        | AudioContentBlock
-        | ResourceContentBlock
-        | EmbeddedResourceContentBlock
-    ],
-) -> str | list[dict[str, Any]]:
-    """Convert ACP prompt blocks into a Hermes/OpenAI-compatible user content payload."""
-    parts: list[dict[str, Any]] = []
-    text_parts: list[str] = []
-
-    for block in prompt:
-        if isinstance(block, TextContentBlock):
-            if block.text:
-                parts.append({"type": "text", "text": block.text})
-                text_parts.append(block.text)
-            continue
-        if isinstance(block, ImageContentBlock):
-            image_part = _image_block_to_openai_part(block)
-            if image_part is not None:
-                parts.append(image_part)
-            continue
-        if isinstance(block, ResourceContentBlock):
-            resource_parts = _resource_link_to_parts(block)
-            for part in resource_parts:
-                parts.append(part)
-                if part.get("type") == "text":
-                    text_parts.append(part["text"])
-            continue
-        if isinstance(block, EmbeddedResourceContentBlock):
-            resource_parts = _embedded_resource_to_parts(block)
-            for part in resource_parts:
-                parts.append(part)
-                if part.get("type") == "text":
-                    text_parts.append(part["text"])
-            continue
-
-    if not parts:
-        return _extract_text(prompt)
-
-    # Keep pure text prompts as strings so slash-command handling and text-only
-    # providers keep the exact legacy path. Switch to structured content only
-    # when an actual non-text block is present.
-    if all(part.get("type") == "text" for part in parts):
-        return "\n".join(text_parts)
-
-    return parts
-
-
-class HermesACPAgent(acp.Agent):
-    """ACP Agent implementation wrapping Hermes AIAgent."""
-
-    _SLASH_COMMANDS = {
-        "help": "Show available commands",
-        "model": "Show or change current model",
-        "tools": "List available tools",
-        "context": "Show conversation context info",
-        "reset": "Clear conversation history",
-        "compress": "Compress conversation context",
-        "steer": "Inject guidance into the currently running agent turn",
-        "queue": "Queue a prompt to run after the current turn finishes",
-        "version": "Show Hermes version",
-    }
-
-    _ADVERTISED_COMMANDS = (
-        {
-            "name": "help",
-            "description": "List available commands",
-        },
-        {
-            "name": "model",
-            "description": "Show current model and provider, or switch models",
-            "input_hint": "model name to switch to",
-        },
-        {
-            "name": "tools",
-            "description": "List available tools with descriptions",
-        },
-        {
-            "name": "context",
-            "description": "Show conversation message counts by role",
-        },
-        {
-            "name": "reset",
-            "description": "Clear conversation history",
-        },
-        {
-            "name": "compress",
-            "description": "Compress conversation context",
-        },
-        {
-            "name": "steer",
-            "description": "Inject guidance into the currently running agent turn",
-            "input_hint": "guidance for the active turn",
-        },
-        {
-            "name": "queue",
-            "description": "Queue a prompt to run after the current turn finishes",
-            "input_hint": "prompt to run next",
-        },
-        {
-            "name": "version",
-            "description": "Show Hermes version",
-        },
+    cls, session_update = _HISTORY_CHUNK_TYPES[role]
+    return cls(
+        session_update=session_update, content=TextContentBlock(type="text", text=text),
+        field_meta=_history_summary_meta(message, text),
     )
+
+
+def _history_replay_updates(history: list[dict[str, Any]]):
+    """Yield ACP session updates that reconstruct a persisted transcript, in order: user/assistant
+    text (with compaction ``_meta``), assistant thoughts, and tool-call start/complete pairs
+    (``todo`` results also re-emit the plan)."""
+    active_tool_calls: dict[str, tuple[str, dict[str, Any]]] = {}
+    for message in history:
+        role = str(message.get("role") or "")
+        if role == "user":
+            if (chunk := _history_message_chunk(role, message)) is not None:
+                yield chunk
+        elif role == "assistant":
+            thought = _history_reasoning_text(message)
+            if thought:
+                yield acp.update_agent_thought_text(thought)
+            if (chunk := _history_message_chunk(role, message)) is not None:
+                yield chunk
+            tool_calls = message.get("tool_calls")
+            for tool_call in tool_calls if isinstance(tool_calls, list) else ():
+                if not isinstance(tool_call, dict):
+                    continue
+                tool_call_id = str(
+                    tool_call.get("id") or tool_call.get("call_id") or tool_call.get("tool_call_id") or ""
+                ).strip()
+                if not tool_call_id:
+                    continue
+                tool_name, args = _history_tool_call_name_args(tool_call)
+                active_tool_calls[tool_call_id] = (tool_name, args)
+                yield build_tool_start(tool_call_id, tool_name, args)
+        elif role == "tool":
+            tool_call_id = str(message.get("tool_call_id") or "").strip()
+            tool_name = str(message.get("tool_name") or "").strip()
+            function_args: dict[str, Any] | None = None
+            if tool_call_id in active_tool_calls:
+                tool_name, function_args = active_tool_calls.pop(tool_call_id)
+            if not tool_call_id or not tool_name:
+                continue
+            result = message.get("content")
+            result_text = result if isinstance(result, (str, dict, list)) else None
+            yield build_tool_complete(tool_call_id, tool_name, result=result_text, function_args=function_args)
+            if tool_name in {"todo", "todo_list"}:
+                plan_update = _build_plan_update_from_todo_result(result_text)
+                if plan_update is not None:
+                    yield plan_update
+
+
+def _mcp_server_config(server: McpServerStdio | McpServerHttp | McpServerSse) -> dict:
+    if isinstance(server, McpServerStdio):
+        return {"command": server.command, "args": list(server.args), "env": {i.name: i.value for i in server.env}}
+    return {"url": server.url, "headers": {i.name: i.value for i in server.headers}}
+
+
+def _restore_env(key: str, value: str | None) -> None:
+    if value is None:
+        os.environ.pop(key, None)
+    else:
+        os.environ[key] = value
+
+
+def _bind_guarded(stack: contextlib.ExitStack, label: str, setup: Callable[[], Callable[[], None]]) -> None:
+    """Run ``setup`` (returns its teardown) and register the teardown; failures in either half only
+    log — the turn must still run without the binding."""
+    try:
+        teardown = setup()
+    except Exception:
+        logger.debug("Could not set ACP %s", label, exc_info=True)
+        return
+
+    def _teardown() -> None:
+        try:
+            teardown()
+        except Exception:
+            logger.debug("Could not restore ACP %s", label, exc_info=True)
+
+    stack.callback(_teardown)
+
+
+def _attach_interrupted_prompt(interrupted_prompt: str, guidance: str) -> str:
+    return f"{interrupted_prompt}\n\nUser correction/guidance after interrupt: {guidance}"
+
+
+def _take_interrupted_prompt(state: SessionState) -> tuple[bool, str]:
+    """``(idle, interrupted_prompt)``; consumes the cancelled prompt only when the session is idle."""
+    with state.runtime_lock:
+        if state.is_running:
+            return False, ""
+        text, state.interrupted_prompt_text = state.interrupted_prompt_text, ""
+        return True, text
+
+
+@dataclass
+class _TurnCallbacks:
+    """Per-turn ACP streaming callbacks; all None when no client is connected."""
+
+    tool_progress_cb: Any = None
+    reasoning_cb: Any = None
+    step_cb: Any = None
+    stream_delta_cb: Any = None
+    approval_cb: Any = None
+    edit_approval_requester: Any = None
+    streamed: bool = False
+
+
+class HermesACPAgent(SlashCommandsMixin, acp.Agent):
+    """ACP Agent implementation wrapping Hermes AIAgent."""
 
     _EDIT_APPROVAL_POLICY_CONFIG_ID = "edit_approval_policy"
     _EDIT_APPROVAL_POLICY_DEFAULT = "ask"
     _MODE_DEFAULT = "default"
-    _MODE_ACCEPT_EDITS = "accept_edits"
-    _MODE_DONT_ASK = "dont_ask"
-    _MODE_TO_EDIT_APPROVAL_POLICY = {
-        _MODE_DEFAULT: "ask",
-        _MODE_ACCEPT_EDITS: "workspace_session",
-        _MODE_DONT_ASK: "session",
+    # mode id -> (edit approval policy, display name, description)
+    _MODES: dict[str, tuple[str, str, str]] = {
+        "default": ("ask", "Default", "Ask before edits."),
+        "accept_edits": (
+            "workspace_session",
+            "Accept Edits",
+            "Auto-allow workspace and /tmp edits; still asks for sensitive paths.",
+        ),
+        "dont_ask": (
+            "session", "Don't Ask", "Auto-allow file edits for this session except sensitive paths."
+        ),
     }
-    _EDIT_APPROVAL_POLICY_TO_MODE = {
-        value: key for key, value in _MODE_TO_EDIT_APPROVAL_POLICY.items()
-    }
+    _MODE_TO_EDIT_APPROVAL_POLICY = {mode: spec[0] for mode, spec in _MODES.items()}
+    _EDIT_APPROVAL_POLICY_TO_MODE = {spec[0]: mode for mode, spec in _MODES.items()}
 
     def __init__(self, session_manager: SessionManager | None = None):
         super().__init__()
         self.session_manager = session_manager or SessionManager()
         self._conn: Optional[acp.Client] = None
         self._delegation_watcher_task: Optional[asyncio.Task] = None
-
-    # ---- Background delegation completions -----------------------------------
 
     def _ensure_delegation_watcher(self, loop: asyncio.AbstractEventLoop) -> None:
         """Start the completion watcher once, on the running loop."""
@@ -1192,7 +773,6 @@ class HermesACPAgent(acp.Agent):
             )
         except Exception:
             logger.debug("Failed to send background completion frames", exc_info=True)
-
     # ---- Connection lifecycle -----------------------------------------------
 
     def on_connect(self, conn: acp.Client) -> None:
@@ -1200,38 +780,31 @@ class HermesACPAgent(acp.Agent):
         self._conn = conn
         logger.info("ACP client connected")
 
+    async def _send(self, session_id: str, update: Any, *, fail_msg: str, level: int = logging.WARNING) -> bool:
+        """``session_update`` that logs instead of raising; False on failure."""
+        try:
+            await self._conn.session_update(session_id=session_id, update=update)
+            return True
+        except Exception:
+            logger.log(level, fail_msg, session_id, exc_info=True)
+            return False
+
+    def _schedule_soon(self, make_coro: Callable[[], Any]) -> None:
+        """Run a notification coroutine right after the current response is queued."""
+        if not self._conn:
+            return
+        loop = asyncio.get_running_loop()
+        loop.call_soon(asyncio.create_task, make_coro())
 
     def _session_modes(self, state: SessionState) -> SessionModeState:
-        """Return ACP session modes while preserving Zed's separate model picker.
-
-        Zed renders ``config_options`` in the prominent selector slot where the
-        model picker was visible. Claude/Codex expose policy-like controls as ACP
-        modes, which coexist with the model picker, so Hermes maps edit approval
-        policy onto modes instead of advertising config options.
-        """
-
+        """Edit-approval policy as ACP modes. Zed renders ``config_options`` in the model
+        picker's slot; modes (as Claude/Codex use) coexist with the picker."""
         current = str(getattr(state, "mode", "") or self._MODE_DEFAULT)
-        if current not in self._MODE_TO_EDIT_APPROVAL_POLICY:
+        if current not in self._MODES:
             current = self._MODE_DEFAULT
         return SessionModeState(
             current_mode_id=current,
-            available_modes=[
-                SessionMode(
-                    id=self._MODE_DEFAULT,
-                    name="Default",
-                    description="Ask before edits.",
-                ),
-                SessionMode(
-                    id=self._MODE_ACCEPT_EDITS,
-                    name="Accept Edits",
-                    description="Auto-allow workspace and /tmp edits; still asks for sensitive paths.",
-                ),
-                SessionMode(
-                    id=self._MODE_DONT_ASK,
-                    name="Don't Ask",
-                    description="Auto-allow file edits for this session except sensitive paths.",
-                ),
-            ],
+            available_modes=[SessionMode(id=m, name=n, description=d) for m, (_p, n, d) in self._MODES.items()],
         )
 
     def _edit_approval_policy_for_state(self, state: SessionState) -> tuple[str, str | None]:
@@ -1239,271 +812,27 @@ class HermesACPAgent(acp.Agent):
         policy = self._MODE_TO_EDIT_APPROVAL_POLICY.get(mode, self._EDIT_APPROVAL_POLICY_DEFAULT)
         return policy, state.cwd
 
-    @staticmethod
-    def _encode_model_choice(provider: str | None, model: str | None) -> str:
-        """Encode a model selection so ACP clients can keep provider context."""
-        raw_model = str(model or "").strip()
-        if not raw_model:
-            return ""
-        raw_provider = str(provider or "").strip().lower()
-        if not raw_provider:
-            return raw_model
-        return f"{raw_provider}:{raw_model}"
-
     def _build_model_state(self, state: SessionState) -> SessionModelState | None:
-        """Return authenticated providers and their models for ACP clients.
-
-        The shared Hermes inventory is also used by ``hermes model``, the TUI,
-        and the dashboard. Keeping ACP on that substrate prevents its selector
-        from silently collapsing to the current provider's curated list.
-        """
+        """Authenticated providers + models, from the shared Hermes inventory (same substrate
+        as ``hermes model``/TUI/dashboard) so the selector isn't just the current curated list."""
         model = str(state.model or getattr(state.agent, "model", "") or "").strip()
         provider = getattr(state.agent, "provider", None) or detect_provider() or "openrouter"
-
         try:
-            from hermes_cli.inventory import build_models_payload, load_picker_context
-            from hermes_cli.models import normalize_provider, provider_label
-
-            normalized_provider = normalize_provider(provider)
-            context = load_picker_context().with_overrides(
-                current_provider=normalized_provider,
-                current_model=model,
-                current_base_url=str(getattr(state.agent, "base_url", "") or ""),
-            )
-            payload = build_models_payload(
-                context,
-                explicit_only=True,
-                include_unconfigured=False,
-                picker_hints=False,
-                canonical_order=True,
-                pricing=False,
-                capabilities=False,
-                refresh=False,
-                probe_custom_providers=False,
-                probe_current_custom_provider=False,
-                max_models=ACP_MAX_MODELS_PER_PROVIDER,
-            )
-
-            available_models: list[ModelInfo] = []
-            seen_ids: set[str] = set()
-            current_choice_provider = str(provider or "").strip().lower()
-            if current_choice_provider == "ollama":
-                current_choice_provider = "custom:ollama"
-            current_base_url = str(
-                getattr(state.agent, "base_url", "") or ""
-            ).strip().rstrip("/").lower()
-
-            def semantic_provider(provider_id: str) -> str:
-                raw = str(provider_id or "").strip().lower()
-                if raw in {"ollama", "custom:ollama"}:
-                    return "ollama"
-                if raw.startswith("custom:"):
-                    return raw
-                return normalize_provider(raw)
-
-            seen_semantic_ids: set[str] = set()
-            native_empty_rows: set[str] = set()
-            current_identity_resolved = current_choice_provider not in {"", "custom"}
-            for row in payload.get("providers") or []:
-                raw_row_provider = str(row.get("slug") or "").strip().lower()
-                row_provider = normalize_provider(raw_row_provider)
-                row_base_url = str(row.get("api_url") or "").strip().rstrip("/").lower()
-                if row.get("native_catalog_empty"):
-                    native_empty_rows.add(raw_row_provider)
-                if (
-                    not current_identity_resolved
-                    and raw_row_provider in {"ollama", "custom:ollama"}
-                    and current_base_url
-                    and row_base_url == current_base_url
-                ):
-                    current_choice_provider = "custom:ollama"
-                    current_identity_resolved = True
-                if not row_provider:
-                    continue
-                provider_name = str(row.get("name") or "").strip() or provider_label(
-                    row_provider
-                )
-                row_models = row.get("models")
-                if not isinstance(row_models, (list, tuple)):
-                    continue
-                for model_entry in row_models:
-                    if isinstance(model_entry, dict):
-                        rendered_model = str(
-                            model_entry.get("id")
-                            or model_entry.get("model")
-                            or model_entry.get("name")
-                            or ""
-                        ).strip()
-                    else:
-                        rendered_model = str(model_entry or "").strip()
-                    if not rendered_model:
-                        continue
-                    encoded_provider = (
-                        "custom:ollama"
-                        if raw_row_provider == "ollama"
-                        else raw_row_provider
-                        if raw_row_provider == "custom:ollama"
-                        else raw_row_provider
-                        if raw_row_provider.startswith("custom:")
-                        else row_provider
-                    )
-                    choice_id = self._encode_model_choice(
-                        encoded_provider, rendered_model
-                    )
-                    semantic_id = f"{semantic_provider(encoded_provider)}:{rendered_model}"
-                    if choice_id in seen_ids or semantic_id in seen_semantic_ids:
-                        continue
-                    is_current = (
-                        semantic_provider(encoded_provider)
-                        == semantic_provider(current_choice_provider)
-                        and rendered_model == model
-                    )
-                    description = f"Provider: {provider_name}"
-                    if is_current:
-                        description += " • current"
-                    available_models.append(
-                        ModelInfo(
-                            model_id=choice_id,
-                            name=f"{provider_name} · {rendered_model}",
-                            description=description,
-                        )
-                    )
-                    seen_ids.add(choice_id)
-                    seen_semantic_ids.add(semantic_id)
-
-            # Named user-defined endpoints (providers: / custom_providers:)
-            # are invisible to canonical provider enumeration — append them
-            # so editor clients can select them like the TUI /model picker.
-            named_empty_authoritative: set[str] = set(native_empty_rows)
-            for named_slug, named_label, named_catalog in _named_custom_provider_catalogs():
-                if not named_catalog:
-                    named_empty_authoritative.add(str(named_slug).strip().lower())
-                    continue
-                for named_model, named_desc in named_catalog:
-                    named_choice = self._encode_model_choice(named_slug, named_model)
-                    named_semantic_id = (
-                        f"{semantic_provider(named_slug)}:{named_model}"
-                    )
-                    if (
-                        not named_choice
-                        or named_choice in seen_ids
-                        or named_semantic_id in seen_semantic_ids
-                    ):
-                        continue
-                    named_parts = [f"Provider: {named_label}"]
-                    if named_desc:
-                        named_parts.append(str(named_desc).strip())
-                    if named_slug == normalized_provider and named_model == model:
-                        named_parts.append("current")
-                    available_models.append(
-                        ModelInfo(
-                            model_id=named_choice,
-                            name=named_model,
-                            description=" • ".join(part for part in named_parts if part),
-                        )
-                    )
-                    seen_ids.add(named_choice)
-                    seen_semantic_ids.add(named_semantic_id)
-
-            def empty_catalog_applies(provider_id: str) -> bool:
-                raw = str(provider_id or "").strip().lower()
-                normalized = normalize_provider(raw)
-                if normalized == "custom":
-                    return any(
-                        candidate == raw
-                        or f"custom:{candidate}" == raw
-                        or (raw == "custom" and candidate == "custom")
-                        for candidate in named_empty_authoritative
-                    )
-                return any(
-                    candidate == raw
-                    or candidate == f"custom:{normalized}"
-                    or candidate == f"custom:{raw}"
-                    or normalize_provider(candidate) == normalized
-                    for candidate in named_empty_authoritative
-                )
-
-            def choice_provider(model_id: str) -> str:
-                parts = model_id.split(":")
-                if parts[:1] == ["custom"] and len(parts) > 1:
-                    from hermes_cli.models import _configured_custom_provider_ids
-
-                    lowered = model_id.lower()
-                    for candidate in sorted(
-                        (
-                            provider_id
-                            for provider_id in _configured_custom_provider_ids()
-                            if provider_id.startswith("custom:")
-                        ),
-                        key=len,
-                        reverse=True,
-                    ):
-                        if lowered.startswith(candidate + ":"):
-                            return candidate
-                    return "custom"
-                return parts[0]
-
-            if named_empty_authoritative:
-                available_models = [
-                    item
-                    for item in available_models
-                    if not empty_catalog_applies(choice_provider(item.model_id))
-                ]
-                seen_ids = {item.model_id for item in available_models}
-
-            current_is_empty = empty_catalog_applies(current_choice_provider)
-            if current_is_empty:
-                available_models = [
-                    item
-                    for item in available_models
-                    if " • current" not in str(item.description or "")
-                ]
-                seen_ids = {item.model_id for item in available_models}
-            current_model_id = (
-                "" if current_is_empty else self._encode_model_choice(current_choice_provider, model)
-            )
-            if (
-                current_model_id
-                and current_model_id not in seen_ids
-                and not current_is_empty
-            ):
-                provider_name = provider_label(normalized_provider)
-                available_models.insert(
-                    0,
-                    ModelInfo(
-                        model_id=current_model_id,
-                        name=f"{provider_name} · {model}",
-                        description=f"Provider: {provider_name} • current",
-                    ),
-                )
-
-            if not available_models and current_is_empty:
-                return SessionModelState(available_models=[], current_model_id="")
-            if available_models:
-                return SessionModelState(
-                    available_models=available_models,
-                    current_model_id=current_model_id
-                    if current_model_id or current_is_empty
-                    else available_models[0].model_id,
-                )
+            picker = build_model_state(model, provider, str(getattr(state.agent, "base_url", "") or ""))
+            if picker is not None:
+                return picker
         except Exception:
             logger.debug("Could not build ACP model state", exc_info=True)
 
         if not model:
             return None
-
-        fallback_choice = self._encode_model_choice(provider, model)
-        return SessionModelState(
-            available_models=[ModelInfo(model_id=fallback_choice, name=model)],
-            current_model_id=fallback_choice,
-        )
+        choice = encode_model_choice(provider, model)
+        return SessionModelState(available_models=[ModelInfo(model_id=choice, name=model)], current_model_id=choice)
 
     @staticmethod
     def _resolve_model_selection(raw_model: str, current_provider: str) -> tuple[str, str]:
         """Resolve ``provider:model`` input into the provider and normalized model id."""
-        target_provider = current_provider
-        new_model = raw_model.strip()
-
+        target_provider, new_model = current_provider, raw_model.strip()
         try:
             from hermes_cli.models import detect_provider_for_model, parse_model_input
 
@@ -1519,81 +848,57 @@ class HermesACPAgent(acp.Agent):
                     target_provider, new_model = detected
         except Exception:
             logger.debug("Provider detection failed, using model as-is", exc_info=True)
-
         return target_provider, new_model
 
-    def _commit_model_switch(
-        self,
-        state: SessionState,
-        *,
-        model: str,
-        new_agent: Any,
-    ) -> None:
+    def _commit_model_switch(self, state: SessionState, *, model: str, new_agent: Any) -> None:
         """Persist a replacement before retiring the previous live agent."""
-        previous_model = state.model
-        previous_agent = state.agent
-        state.model = model
-        state.agent = new_agent
-        if not self.session_manager.save_session(state.session_id):
-            state.model = previous_model
-            state.agent = previous_agent
+        previous_model, previous_agent = state.model, state.agent
+        state.model, state.agent = model, new_agent
+        saved = self.session_manager.save_session(state.session_id)
+        if saved is False:
+            state.model, state.agent = previous_model, previous_agent
             self.session_manager.save_session(state.session_id)
             _dispose_replaced_agent(new_agent)
             raise RuntimeError("Failed to persist ACP model switch")
         _dispose_replaced_agent(previous_agent)
 
+    def _switch_model(
+        self, state: SessionState, raw_model: str, *, keep_endpoint: bool = False
+    ) -> tuple[str | None, str, str]:
+        """Rebuild the session agent on a new model -> (old provider, new provider, model).
+        ``keep_endpoint`` carries base_url/api_mode over when the provider is unchanged."""
+        current_provider = getattr(state.agent, "provider", None)
+        target_provider, new_model = self._resolve_model_selection(raw_model, current_provider or "openrouter")
+        endpoint: dict[str, Any] = {}
+        if keep_endpoint and not (current_provider and target_provider != current_provider):
+            endpoint = {
+                "base_url": getattr(state.agent, "base_url", None), "api_mode": getattr(state.agent, "api_mode", None)
+            }
+        new_agent = self.session_manager._make_agent(
+            session_id=state.session_id, cwd=state.cwd, model=new_model,
+            requested_provider=target_provider, **endpoint,
+        )
+        self._commit_model_switch(state, model=new_model, new_agent=new_agent)
+        return current_provider, target_provider, new_model
+
     @staticmethod
     def _build_usage_update(state: SessionState) -> UsageUpdate | None:
-        """Build ACP native context-usage data for clients like Zed.
-
-        Zed's circular context indicator is driven by ACP ``usage_update``
-        session updates: ``size`` is the model context window and ``used`` is
-        the current request pressure.  Hermes estimates ``used`` from the same
-        buckets it sends to providers: system prompt, conversation history, and
-        tool schemas.
-        """
-        agent = state.agent
-        compressor = getattr(agent, "context_compressor", None)
+        """``usage_update`` for Zed's context indicator: ``size`` = context window, ``used`` =
+        estimated request pressure (system prompt + history + tool schemas)."""
+        compressor = getattr(state.agent, "context_compressor", None)
         size = int(getattr(compressor, "context_length", 0) or 0)
         if size <= 0:
             return None
-
         try:
-            from agent.model_metadata import estimate_request_tokens_rough
-
-            used = estimate_request_tokens_rough(
-                state.history,
-                system_prompt=getattr(agent, "_cached_system_prompt", "") or "",
-                tools=getattr(agent, "tools", None) or None,
-            )
+            used = _estimate_tokens(state.history, state.agent)
         except Exception:
             logger.debug("Could not estimate ACP native context usage", exc_info=True)
             used = int(getattr(compressor, "last_prompt_tokens", 0) or 0)
-
-        return UsageUpdate(
-            session_update="usage_update",
-            size=max(size, 0),
-            used=max(used, 0),
-        )
+        return UsageUpdate(session_update="usage_update", size=max(size, 0), used=max(used, 0))
 
     async def _send_usage_update(self, state: SessionState) -> None:
-        """Send ACP native context usage to the connected client."""
-        if not self._conn:
-            return
-        update = self._build_usage_update(state)
-        if update is None:
-            return
-        try:
-            await self._conn.session_update(
-                session_id=state.session_id,
-                update=update,
-            )
-        except Exception:
-            logger.warning(
-                "Failed to send ACP usage update for session %s",
-                state.session_id,
-                exc_info=True,
-            )
+        if self._conn and (update := self._build_usage_update(state)) is not None:
+            await self._send(state.session_id, update, fail_msg="Failed to send ACP usage update for session %s")
 
     async def _turn_keepalive_loop(self, state: SessionState) -> None:
         """Feed the gateway's turn-stall watchdog during long SILENT work.
@@ -1646,23 +951,16 @@ class HermesACPAgent(acp.Agent):
             )
 
     def _provenance_meta(
-        self,
-        acp_session_id: str,
-        current_hermes_session_id: str,
-        previous_hermes_session_id: Optional[str] = None,
+        self, acp_session_id: str, current_hermes_session_id: str, previous_hermes_session_id: Optional[str] = None
     ) -> Optional[dict]:
         """Best-effort ``_meta.hermes.sessionProvenance`` for an ACP session."""
         try:
             return session_provenance_meta(
-                self.session_manager._get_db(),
-                acp_session_id,
-                current_hermes_session_id,
+                self.session_manager._get_db(), acp_session_id, current_hermes_session_id,
                 previous_hermes_session_id=previous_hermes_session_id,
             )
         except Exception:
-            logger.debug(
-                "Could not build ACP session provenance for %s", acp_session_id, exc_info=True
-            )
+            logger.debug("Could not build ACP session provenance for %s", acp_session_id, exc_info=True)
             return None
 
     def _session_meta(
@@ -1708,12 +1006,7 @@ class HermesACPAgent(acp.Agent):
         current_hermes_session_id: Optional[str] = None,
         previous_hermes_session_id: Optional[str] = None,
     ) -> None:
-        """Send ACP native session metadata after Hermes changes it.
-
-        When the internal Hermes head rotated (e.g. compression-driven session
-        split during a turn), pass ``previous_hermes_session_id`` so the
-        attached ``_meta.hermes.sessionProvenance`` flags the rotation reason.
-        """
+        """Send ACP native session metadata after Hermes changes it."""
         if not self._conn:
             return
         try:
@@ -1723,12 +1016,7 @@ class HermesACPAgent(acp.Agent):
             return
         if not row:
             return
-
         title = row.get("title")
-        # The `sessions` table does not have an `updated_at` column (see
-        # hermes_state.py schema — only started_at/ended_at). Use "now" as
-        # the updated_at since we're emitting this notification precisely
-        # because the title was just refreshed.
         updated_at = datetime.now(timezone.utc).isoformat()
         state = self.session_manager.peek_session(session_id)
         if state is not None:
@@ -1750,10 +1038,7 @@ class HermesACPAgent(acp.Agent):
             field_meta=meta,
         )
         try:
-            await self._conn.session_update(
-                session_id=session_id,
-                update=update,
-            )
+            await self._conn.session_update(session_id=session_id, update=update)
         except Exception:
             logger.debug("Could not send ACP session info update for %s", session_id, exc_info=True)
 
@@ -1980,43 +1265,21 @@ class HermesACPAgent(acp.Agent):
         return True
 
     def _schedule_mcp_late_refresh(self, state: SessionState) -> None:
-        """Refresh the agent's tool snapshot when background MCP discovery lands late.
+        """Refresh the tool snapshot when background MCP discovery lands after agent build
+        (``_make_agent`` only joins ~1.5s). Waits up to 30s off the critical path, then rebuilds
+        via ``refresh_agent_mcp_tools`` (same as ``/reload-mcp``).
 
-        ACP entry.py starts MCP tool discovery in a background daemon thread so a
-        slow/dead configured server can't block ``asyncio.run()``.  ``_make_agent``
-        briefly joins that thread (``wait_for_mcp_discovery``, bounded ~1.5s) so
-        already-spawning fast servers land in the snapshot — but a server slower
-        than the bound lands *after* the agent is built, leaving its tools absent
-        for the whole session.
-
-        This schedules an off-critical-path daemon that waits for discovery to
-        finish (bounded 30s), then rebuilds the snapshot via the shared
-        ``refresh_agent_mcp_tools`` helper — the same rebuild ``/reload-mcp``
-        performs, but automatic.  Mirrors the TUI late-refresh (PR #48403).
-
-        Cache safety: the rebuild only runs while the session is still
-        pre-first-turn (no API call made yet → nothing cached to invalidate).
-        Once the user has sent a message we leave the snapshot frozen rather
-        than break the cached prompt prefix mid-conversation; servers that land
-        later are picked up cache-safely by the between-turns prologue refresh
-        (``agent/turn_context.py``) at the next turn boundary.  The marginal
-        value of this pre-first-turn daemon is therefore freshness in the
-        window [session created → first message] — e.g. the "Available tools"
-        listing a client may request before the first prompt.
-        No-op when discovery already finished, when the join times out, when the
-        registry was unchanged, or when the session was closed while waiting.
-        """
+        Cache safety: only pre-first-turn (nothing cached yet); afterwards the snapshot stays
+        frozen and late servers land via the between-turns prologue refresh
+        (``agent/turn_context.py``). No-op if discovery finished, join timed out, registry
+        unchanged, or session closed."""
         try:
             from hermes_cli.mcp_startup import mcp_discovery_in_flight
         except Exception:
             return
         if not mcp_discovery_in_flight():
             return
-
-        import threading
-
-        agent = state.agent
-        session_id = state.session_id
+        agent, session_id = state.agent, state.session_id
 
         def _wait_then_refresh() -> None:
             try:
@@ -2025,75 +1288,43 @@ class HermesACPAgent(acp.Agent):
                 if not join_mcp_discovery(timeout=30.0):
                     return
 
-                # Session may have been closed while we waited.  In-memory-only
-                # lookup on purpose: ``get_session()`` falls through to a DB
-                # restore that builds a whole new AIAgent as a side effect just
-                # to decide "no-op" here (the TUI equivalent also checks its
-                # in-memory dict only).
+                # In-memory only: ``get_session()`` would restore from DB and build a new AIAgent.
                 with self.session_manager._lock:
                     current = self.session_manager._sessions.get(session_id)
                 if current is None or current.agent is not agent:
                     return
 
-                # Cache safety: never rebuild the tool list once the conversation
-                # has started — that would invalidate the cached prompt prefix.
-                # Serialized with turn start: ``prompt()`` flips ``is_running``
-                # under ``runtime_lock`` before dispatching, so holding it here
-                # (and bailing when a turn is already running) closes the window
-                # where the guard passes but the first prompt starts before the
-                # refresh publishes — which would swap ``tools=`` mid-turn and
-                # break the just-created cache prefix.
+                # ``prompt()`` flips ``is_running`` under ``runtime_lock`` before dispatching, so
+                # holding it here closes the window where a refresh would swap ``tools=`` mid-turn.
                 with current.runtime_lock:
                     if current.is_running:
                         return
-                    if (
-                        int(getattr(agent, "_user_turn_count", 0) or 0) > 0
-                        or int(getattr(agent, "_api_call_count", 0) or 0) > 0
-                    ):
+                    if any(int(getattr(agent, k, 0) or 0) > 0 for k in ("_user_turn_count", "_api_call_count")):
                         return
 
-                    from tools.mcp_tool import refresh_agent_mcp_tools
+                    from tools.mcp_tool_agent import refresh_agent_mcp_tools
 
                     added = refresh_agent_mcp_tools(agent, quiet_mode=True)
                 if added:
                     logger.info(
                         "Session %s: late MCP refresh added %d tools: %s",
-                        session_id,
-                        len(added),
-                        ", ".join(sorted(added)),
+                        session_id, len(added), ", ".join(sorted(added)),
                     )
             except Exception:
-                logger.debug(
-                    "Session %s: late MCP refresh failed",
-                    session_id,
-                    exc_info=True,
-                )
+                logger.debug("Session %s: late MCP refresh failed", session_id, exc_info=True)
 
-        threading.Thread(
-            target=_wait_then_refresh,
-            name=f"acp-mcp-late-refresh-{session_id}",
-            daemon=True,
-        ).start()
+        threading.Thread(target=_wait_then_refresh, name=f"acp-mcp-late-refresh-{session_id}", daemon=True).start()
 
     # ---- ACP lifecycle ------------------------------------------------------
 
     async def initialize(
-        self,
-        protocol_version: int | None = None,
-        client_capabilities: ClientCapabilities | None = None,
-        client_info: Implementation | None = None,
-        **kwargs: Any,
+        self, protocol_version: int | None = None, client_capabilities: ClientCapabilities | None = None,
+        client_info: Implementation | None = None, **kwargs: Any,
     ) -> InitializeResponse:
-        resolved_protocol_version = (
-            protocol_version if isinstance(protocol_version, int) else acp.PROTOCOL_VERSION
-        )
         auth_methods = build_auth_methods()
-
-        client_name = client_info.name if client_info else "unknown"
         logger.info(
-            "Initialize from %s (protocol v%s)",
-            client_name,
-            resolved_protocol_version,
+            "Initialize from %s (protocol v%s)", client_info.name if client_info else "unknown",
+            protocol_version if isinstance(protocol_version, int) else acp.PROTOCOL_VERSION,
         )
 
         return InitializeResponse(
@@ -2103,30 +1334,21 @@ class HermesACPAgent(acp.Agent):
                 load_session=True,
                 prompt_capabilities=PromptCapabilities(image=True),
                 session_capabilities=SessionCapabilities(
-                    fork=SessionForkCapabilities(),
-                    list=SessionListCapabilities(),
-                    resume=SessionResumeCapabilities(),
+                    fork=SessionForkCapabilities(), list=SessionListCapabilities(), resume=SessionResumeCapabilities(),
                 ),
             ),
             auth_methods=auth_methods,
         )
 
     async def authenticate(self, method_id: str, **kwargs: Any) -> AuthenticateResponse | None:
-        # Only accept authenticate() calls whose method_id matches the
-        # provider we advertised in initialize(). Without this check,
-        # authenticate() would acknowledge any method_id as long as the
-        # server has provider credentials configured — harmless under
-        # Hermes' threat model (ACP is stdio-only, local-trust), but poor
-        # API hygiene and confusing if ACP ever grows multi-method auth.
+        # Only acknowledge the method_id advertised in initialize().
         if not isinstance(method_id, str):
             return None
         normalized_method = method_id.strip().lower()
         provider = detect_provider()
 
         if normalized_method == TERMINAL_SETUP_AUTH_METHOD_ID:
-            # Terminal auth launches Hermes setup/model selection out-of-band.
-            # Only report success once that flow has produced usable runtime
-            # credentials for the normal ACP session.
+            # Terminal auth runs setup out-of-band; succeed only once credentials exist.
             return AuthenticateResponse() if provider else None
 
         if not provider or normalized_method != provider:
@@ -2135,245 +1357,14 @@ class HermesACPAgent(acp.Agent):
 
     # ---- Session management -------------------------------------------------
 
-    @staticmethod
-    def _flatten_history_text(value: Any) -> str:
-        """Normalize a persisted text-or-text-parts value into a single string.
-
-        OpenAI-style assistant content (and provider reasoning fields) can arrive
-        as either a scalar string or a list of ``{"text": ...}`` /
-        ``{"type": "text", "content": ...}`` parts. Whitespace-only inputs
-        collapse to an empty string so callers can treat ``""`` as "nothing to
-        emit".
-        """
-        if isinstance(value, str):
-            return value.strip()
-        if isinstance(value, list):
-            parts: list[str] = []
-            for item in value:
-                if isinstance(item, dict):
-                    text = item.get("text")
-                    if isinstance(text, str):
-                        parts.append(text)
-                    elif item.get("type") == "text" and isinstance(item.get("content"), str):
-                        parts.append(item["content"])
-                elif isinstance(item, str):
-                    parts.append(item)
-            return "\n".join(part.strip() for part in parts if part and part.strip()).strip()
-        return ""
-
-    @classmethod
-    def _history_message_text(cls, message: dict[str, Any]) -> str:
-        """Extract displayable text from a persisted OpenAI-style message."""
-        return cls._flatten_history_text(message.get("content"))
-
-    @classmethod
-    def _history_reasoning_text(cls, message: dict[str, Any]) -> str:
-        """Extract displayable reasoning/thought text from a persisted assistant message.
-
-        Returns the first non-empty value among ``reasoning_content`` (the
-        canonical field used by DeepSeek / Moonshot and the post-#16892
-        chat-completions normalizer) and ``reasoning`` (used by the codex
-        event projector and several other transports). Both keys are
-        actively written by live code paths, so neither branch is
-        deprecated — they cover different transports rather than old vs.
-        new sessions.
-        """
-        for key in ("reasoning_content", "reasoning"):
-            text = cls._flatten_history_text(message.get(key))
-            if text:
-                return text
-        return ""
-
-    @staticmethod
-    def _history_summary_meta(message: dict[str, Any], text: str) -> dict[str, Any] | None:
-        """Build the ``_meta`` payload for a replayed compaction summary.
-
-        Compaction summaries are persisted as ordinary history messages —
-        standalone handoffs under ``role="user"`` OR ``role="assistant"``
-        (the compressor picks whichever role keeps alternation valid), and
-        merge-into-tail messages where the summary is appended after the
-        first preserved tail message's real content. Without a wire flag,
-        ACP frontends render all of these as ordinary turns.
-
-        Two distinct keys under ``_meta.hermes`` (ACP's extensibility
-        channel), so clients cannot accidentally hide real content:
-
-        * ``compactionSummary: true`` — the entire chunk is the handoff
-          summary. Safe to restyle or collapse wholesale.
-        * ``containsCompactionSummary: true`` — a merged-tail message: real
-          preserved turn content followed by the summary. Clients may style
-          it, but collapsing the whole chunk would hide the preserved
-          content, hence the separate key.
-
-        Detection honors the in-process ``_compressed_summary`` flag and
-        falls back to content classification, so it also works for a
-        DB-reloaded session that lost the in-memory flag.
-        """
-        kind = ContextCompressor.classify_summary_content(text)
-        if kind is None and message.get(COMPRESSED_SUMMARY_METADATA_KEY):
-            # Flagged in-process but content didn't classify (e.g. future
-            # prefix drift): treat as a standalone summary — the flag is only
-            # ever set on summary-bearing messages.
-            kind = "standalone"
-        if kind == "standalone":
-            return {"hermes": {"compactionSummary": True}}
-        if kind == "merged":
-            return {"hermes": {"containsCompactionSummary": True}}
-        return None
-
-    @staticmethod
-    def _history_message_update(
-        *,
-        role: str,
-        text: str,
-        field_meta: dict[str, Any] | None = None,
-    ) -> UserMessageChunk | AgentMessageChunk | None:
-        """Build an ACP history replay update for a user/assistant message."""
-        block = TextContentBlock(type="text", text=text)
-        if role == "user":
-            return UserMessageChunk(
-                session_update="user_message_chunk",
-                content=block,
-                field_meta=field_meta,
-            )
-        if role == "assistant":
-            return AgentMessageChunk(
-                session_update="agent_message_chunk",
-                content=block,
-                field_meta=field_meta,
-            )
-        return None
-
-    @staticmethod
-    def _history_thought_update(text: str) -> AgentThoughtChunk:
-        """Build an ACP history replay update for an assistant thought."""
-        return acp.update_agent_thought_text(text)
-
-    @staticmethod
-    def _history_tool_call_name_args(tool_call: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-        """Extract function name/arguments from an OpenAI-style tool_call."""
-        function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
-        name = str(function.get("name") or tool_call.get("name") or "unknown_tool")
-        raw_args = function.get("arguments") or tool_call.get("arguments") or tool_call.get("args") or {}
-        if isinstance(raw_args, str):
-            try:
-                parsed = json.loads(raw_args)
-            except Exception:
-                parsed = {"raw": raw_args}
-            raw_args = parsed
-        if not isinstance(raw_args, dict):
-            raw_args = {}
-        return name, raw_args
-
-    @staticmethod
-    def _history_tool_call_id(tool_call: dict[str, Any]) -> str:
-        """Return the stable provider tool call id for ACP history replay."""
-        return str(
-            tool_call.get("id")
-            or tool_call.get("call_id")
-            or tool_call.get("tool_call_id")
-            or ""
-        ).strip()
-
     async def _replay_session_history(self, state: SessionState) -> None:
-        """Replay persisted user/assistant history during session/load or session/resume.
-
-        Invoked inline (``await``) from both ``load_session`` and
-        ``resume_session`` so that spec-compliant ACP clients receive the
-        full transcript within the request's lifetime — see the comment at
-        the call sites for the rationale and prior-art citations.
-
-        Replays the conversation as user/assistant chunks, thinking-mode
-        thought chunks, plus reconstructed tool-call start/completion
-        notifications. Merely restoring server-side state makes Hermes
-        remember context, but leaves the editor looking like a clean thread.
-        """
+        """Replay history as user/assistant/thought chunks plus reconstructed tool-call
+        start/complete events so the editor shows the transcript, not a clean thread."""
         if not self._conn or not state.history:
             return
-
-        active_tool_calls: dict[str, tuple[str, dict[str, Any]]] = {}
-
-        async def _send(update: Any) -> bool:
-            try:
-                await self._conn.session_update(session_id=state.session_id, update=update)
-                return True
-            except Exception:
-                logger.warning(
-                    "Failed to replay ACP history for session %s",
-                    state.session_id,
-                    exc_info=True,
-                )
-                return False
-
-        for message in state.history:
-            role = str(message.get("role") or "")
-
-            if role == "user":
-                text = self._history_message_text(message)
-                if text:
-                    update = self._history_message_update(
-                        role=role,
-                        text=text,
-                        field_meta=self._history_summary_meta(message, text),
-                    )
-                    if update is not None and not await _send(update):
-                        return
-                continue
-
-            if role == "assistant":
-                thought = self._history_reasoning_text(message)
-                if thought and not await _send(self._history_thought_update(thought)):
-                    return
-
-                text = self._history_message_text(message)
-                if text:
-                    update = self._history_message_update(
-                        role=role,
-                        text=text,
-                        field_meta=self._history_summary_meta(message, text),
-                    )
-                    if update is not None and not await _send(update):
-                        return
-
-                tool_calls = message.get("tool_calls")
-                if isinstance(tool_calls, list):
-                    for tool_call in tool_calls:
-                        if not isinstance(tool_call, dict):
-                            continue
-                        tool_call_id = self._history_tool_call_id(tool_call)
-                        if not tool_call_id:
-                            continue
-                        tool_name, args = self._history_tool_call_name_args(tool_call)
-                        active_tool_calls[tool_call_id] = (tool_name, args)
-                        if not await _send(build_tool_start(tool_call_id, tool_name, args)):
-                            return
-                continue
-
-            if role == "tool":
-                tool_call_id = str(message.get("tool_call_id") or "").strip()
-                tool_name = str(message.get("tool_name") or "").strip()
-                function_args: dict[str, Any] | None = None
-                if tool_call_id in active_tool_calls:
-                    tool_name, function_args = active_tool_calls.pop(tool_call_id)
-                if not tool_call_id or not tool_name:
-                    continue
-                result = message.get("content")
-                result_text = result if isinstance(result, str) else None
-                if not await _send(
-                    build_tool_complete(
-                        tool_call_id,
-                        tool_name,
-                        result=result_text,
-                        function_args=function_args,
-                    )
-                ):
-                    return
-                if tool_name == "todo":
-                    plan_update = _build_plan_update_from_todo_result(result_text)
-                    if plan_update is not None and not await _send(plan_update):
-                        return
-
-    # ---- Cross-session ownership guard --------------------------------------
+        for update in _history_replay_updates(state.history):
+            if not await self._send(state.session_id, update, fail_msg="Failed to replay ACP history for session %s"):
+                return
 
     def _guard_owned_session(self, session_id: str, method: str) -> None:
         """Refuse *session_id* unless it belongs to this process's owned set.
@@ -2426,6 +1417,38 @@ class HermesACPAgent(acp.Agent):
             f"session {session_id} refused: {denial}",
             {"session_id": session_id, "owned_primary": primary, "method": method},
         )
+
+    async def _session_response_fields(self, state: SessionState, replay_verb: str | None = None) -> dict[str, Any]:
+        """``models``/``modes``/``field_meta`` for session responses, after an optional history replay;
+        schedules command advertisement + usage refresh.
+
+        Per ACP spec, load/resume must stream history via ``session/update`` BEFORE responding
+        (Codex/Claude Code/OpenCode/Zed rely on this; deferring via ``call_soon`` broke them).
+        Best-effort: a corrupt message must not turn the load into an error."""
+        if replay_verb:
+            try:
+                # Per ACP spec, `session/load` must stream the prior conversation back to the client via
+                # `session/update` notifications BEFORE responding, so the client receives the full
+                # transcript within the load request's lifetime. Awaiting the replay here matches Codex /
+                # Claude Code / OpenCode / Pi and the Zed client (which registers the session-update routing
+                # entry before awaiting the loadSession RPC specifically so in-call history replay updates
+                # can find the thread). Deferring this via `loop.call_soon` (as we did briefly in May 2026)
+                # broke every spec-compliant ACP client that measures notifications synchronously against
+                # the load response — see #12285 follow-up.
+                await self._replay_session_history(state)
+            except Exception:
+                logger.warning(
+                    f"ACP history replay raised during session/{replay_verb} for %s — "
+                    f"{replay_verb} will still succeed, partial transcript may be missing",
+                    state.session_id, exc_info=True,
+                )
+        self._schedule_available_commands_update(state.session_id)
+        self._schedule_usage_update(state)
+        return {
+            "models": self._build_model_state(state),
+            "modes": self._session_modes(state),
+            "field_meta": self._session_meta(state),
+        }
 
     async def new_session(
         self,
@@ -2601,19 +1624,10 @@ class HermesACPAgent(acp.Agent):
         )
 
     async def list_sessions(
-        self,
-        cursor: str | None = None,
-        cwd: str | None = None,
-        **kwargs: Any,
+        self, cursor: str | None = None, cwd: str | None = None, **kwargs: Any
     ) -> ListSessionsResponse:
-        """List ACP sessions with optional ``cwd`` filtering and cursor pagination.
-
-        ``cwd`` is passed through to ``SessionManager.list_sessions`` which already
-        normalizes and filters by working directory. ``cursor`` is a ``session_id``
-        previously returned as ``next_cursor``; results resume after that entry.
-        Server-side page size is capped at ``_LIST_SESSIONS_PAGE_SIZE``; when more
-        results remain, ``next_cursor`` is set to the last returned ``session_id``.
-        """
+        """``cursor`` is a ``session_id`` returned as ``next_cursor``; results resume after it
+        (unknown cursor -> empty page, never the full list). Pages cap at the fixed size."""
         infos = self.session_manager.list_sessions(cwd=cwd)
 
         if cursor:
@@ -2622,30 +1636,129 @@ class HermesACPAgent(acp.Agent):
                     infos = infos[idx + 1:]
                     break
             else:
-                # Unknown cursor -> empty page (do not fall back to full list).
                 infos = []
 
         has_more = len(infos) > _LIST_SESSIONS_PAGE_SIZE
-        infos = infos[:_LIST_SESSIONS_PAGE_SIZE]
-
-        sessions = []
-        for s in infos:
-            updated_at = s.get("updated_at")
-            if updated_at is not None and not isinstance(updated_at, str):
-                updated_at = str(updated_at)
-            sessions.append(
-                SessionInfo(
-                    session_id=s["session_id"],
-                    cwd=s["cwd"],
-                    title=s.get("title"),
-                    updated_at=updated_at,
-                )
+        sessions = [
+            SessionInfo(
+                session_id=s["session_id"], cwd=s["cwd"], title=s.get("title"),
+                updated_at=None if s.get("updated_at") is None else str(s["updated_at"]),
             )
-
+            for s in infos[:_LIST_SESSIONS_PAGE_SIZE]
+        ]
         next_cursor = sessions[-1].session_id if has_more and sessions else None
         return ListSessionsResponse(sessions=sessions, next_cursor=next_cursor)
 
     # ---- Prompt (core) ------------------------------------------------------
+
+    def _rewrite_prompt_for_interrupt(
+        self, state: SessionState, user_text: str, user_content: Any, text_only: bool
+    ) -> tuple[str, Any]:
+        """Idle ``/steer`` has nothing to inject into (gateway parity): if a prompt was just
+        cancelled, replay it with the steer text as explicit correction; otherwise run the steer
+        payload as a plain prompt rather than silently queueing it as if ``/queue`` was typed.
+        Plain text after a cancel likewise keeps the cancelled request attached ("stop and
+        send" clients) so deictic follow-ups have a target."""
+        if not (text_only and isinstance(user_content, str)):
+            return user_text, user_content
+
+        if user_text.startswith("/steer"):
+            split = user_text.split(maxsplit=1)
+            steer_text = split[1].strip() if len(split) > 1 else ""
+            if not steer_text:
+                return user_text, user_content
+            idle, interrupted_prompt = _take_interrupted_prompt(state)
+            if interrupted_prompt:
+                return (_attach_interrupted_prompt(interrupted_prompt, steer_text),) * 2
+            return (steer_text, steer_text) if idle else (user_text, user_content)
+        if not user_text.startswith("/") and (interrupted_prompt := _take_interrupted_prompt(state)[1]):
+            return (_attach_interrupted_prompt(interrupted_prompt, user_text),) * 2
+        return user_text, user_content
+
+    def _claim_turn_or_queue(
+        self, state: SessionState, session_id: str, user_text: str, user_content: Any, text_only: bool
+    ) -> str | None:
+        """Mark the session running; if a turn is active, redirect it (text-only, supported
+        runtime) or queue it. Returns the client message when absorbed, else None."""
+        with state.runtime_lock:
+            if not state.is_running:
+                state.is_running = True
+                state.current_prompt_text = user_text or "[Image attachment]"
+                return None
+            if text_only and isinstance(user_content, str) and hasattr(state.agent, "redirect") and (
+                getattr(state.agent, "_supports_active_turn_redirect", False) is True
+            ):
+                try:
+                    if state.agent.redirect(user_content):
+                        return "Redirected the active turn with your correction."
+                except Exception:
+                    logger.debug("ACP active-turn redirect failed for %s", session_id, exc_info=True)
+            state.queued_prompts.append(user_text or "[Image attachment]")
+            return f"Queued for the next turn. ({len(state.queued_prompts)} queued)"
+
+    def _run_agent_turn(
+        self, *, state: SessionState, session_id: str, user_text: str, user_content: Any, conn: Any,
+        loop: asyncio.AbstractEventLoop, approval_cb: Any, edit_approval_requester: Any,
+    ) -> dict:
+        """Executor-thread body of one turn, run inside ``contextvars.copy_context()`` so
+        ContextVar writes are isolated from concurrent sessions.
+
+        Approval routing is thread-local, so it MUST be bound here, not on the loop thread.
+        Interactive routing is a ``tools.approval`` contextvar, not ``HERMES_INTERACTIVE`` in
+        os.environ, so concurrent workers can't race a global flag onto the non-interactive
+        auto-approve path (GHSA-96vc-wcxf-jjff)."""
+        agent = state.agent
+        with contextlib.ExitStack() as stack:
+            # HERMES_SESSION_KEY scopes per-session caches (interactive sudo password) to this
+            # session, not the reused thread. ``cwd`` pins what the system prompt reports as the
+            # working directory — otherwise it advertises the Hermes workspace while tools are
+            # rooted at the client's project and edits land outside it. ``cron_session=""`` masks
+            # any leaked process-global HERMES_CRON_SESSION.
+            def _session_context() -> Callable[[], None]:
+                from gateway.session_context import clear_session_vars, set_session_vars
+
+                tokens = set_session_vars(
+                    session_key=session_id, session_id=session_id, cwd=state.cwd, cron_session="",
+                )
+                return lambda: clear_session_vars(tokens)
+
+            def _approval() -> Callable[[], None]:
+                from tools import terminal_tool
+
+                previous = terminal_tool._get_approval_callback()
+                terminal_tool.set_approval_callback(approval_cb)
+                return lambda: terminal_tool.set_approval_callback(previous)
+
+            def _edit_approval() -> Callable[[], None]:
+                from acp_adapter.edit_approval import reset_edit_approval_requester, set_edit_approval_requester
+
+                token = set_edit_approval_requester(edit_approval_requester)
+                return lambda: reset_edit_approval_requester(token)
+
+            _bind_guarded(stack, "session context", _session_context)
+            if approval_cb:
+                _bind_guarded(stack, "approval callback", _approval)
+            if edit_approval_requester:
+                _bind_guarded(stack, "edit approval requester", _edit_approval)
+            stack.callback(reset_hermes_interactive_context, set_hermes_interactive_context(True))
+            # Tools tag side-effects with the ACP session (``kanban_create``); save/restore it.
+            stack.callback(_restore_env, "HERMES_SESSION_ID", os.environ.get("HERMES_SESSION_ID"))
+            os.environ["HERMES_SESSION_ID"] = session_id
+
+            # Auto-titling fires in the turn prologue; push the title now as a session-info update.
+            def _notify_title_update(_title: str, _source: str) -> None:
+                if conn:
+                    loop.call_soon_threadsafe(asyncio.create_task, self._send_session_info_update(session_id))
+
+            agent._on_session_title = _notify_title_update
+            try:
+                return agent.run_conversation(
+                    user_message=user_content, conversation_history=state.history, task_id=session_id,
+                    persist_user_message=user_text or "[Image attachment]",
+                )
+            except Exception as e:
+                logger.exception("Agent error in session %s", session_id)
+                return {"final_response": f"Error: {e}", "messages": state.history}
 
     async def prompt(
         self,
@@ -3879,350 +2992,10 @@ class HermesACPAgent(acp.Agent):
         )
         return PromptResponse(stop_reason=stop_reason, usage=usage)
 
-    # ---- Slash commands (headless) -------------------------------------------
-
-    @classmethod
-    def _available_commands(cls) -> list[AvailableCommand]:
-        commands: list[AvailableCommand] = []
-        for spec in cls._ADVERTISED_COMMANDS:
-            input_hint = spec.get("input_hint")
-            commands.append(
-                AvailableCommand(
-                    name=spec["name"],
-                    description=spec["description"],
-                    input=UnstructuredCommandInput(hint=input_hint)
-                    if input_hint
-                    else None,
-                )
-            )
-        return commands
-
-    async def _send_available_commands_update(self, session_id: str) -> None:
-        """Advertise supported slash commands to the connected ACP client."""
-        if not self._conn:
-            return
-
-        try:
-            await self._conn.session_update(
-                session_id=session_id,
-                update=AvailableCommandsUpdate(
-                    session_update="available_commands_update",
-                    available_commands=self._available_commands(),
-                ),
-            )
-        except Exception:
-            logger.warning(
-                "Failed to advertise ACP slash commands for session %s",
-                session_id,
-                exc_info=True,
-            )
-
-    def _schedule_available_commands_update(self, session_id: str) -> None:
-        """Send the command advertisement after the session response is queued."""
-        if not self._conn:
-            return
-        loop = asyncio.get_running_loop()
-        loop.call_soon(
-            asyncio.create_task, self._send_available_commands_update(session_id)
-        )
-
-    def _handle_slash_command(self, text: str, state: SessionState) -> str | None:
-        """Dispatch a slash command and return the response text.
-
-        Returns ``None`` for unrecognized commands so they fall through
-        to the LLM (the user may have typed ``/something`` as prose).
-        """
-        parts = text.split(maxsplit=1)
-        cmd = parts[0].lstrip("/").lower()
-        args = parts[1].strip() if len(parts) > 1 else ""
-
-        handler = {
-            "help": self._cmd_help,
-            "model": self._cmd_model,
-            "tools": self._cmd_tools,
-            "context": self._cmd_context,
-            "reset": self._cmd_reset,
-            "compress": self._cmd_compress,
-            "steer": self._cmd_steer,
-            "queue": self._cmd_queue,
-            "version": self._cmd_version,
-        }.get(cmd)
-
-        if handler is None:
-            return None  # not a known command — let the LLM handle it
-
-        # Slash handlers run on the event-loop thread, OUTSIDE the per-turn
-        # contextvars.copy_context() that pins the session cwd for the agent
-        # call. ``/compress`` and ``/model`` reach code that REBUILDS the
-        # system prompt (agent._build_system_prompt -> resolve_agent_cwd), so
-        # an unpinned handler bakes the Hermes install tree into the session's
-        # cached prompt — persisted, and therefore poisoning every later turn
-        # even though the turn itself is pinned. Pin inside a fresh context so
-        # the write can't leak into other concurrent ACP sessions and needs no
-        # teardown.
-        def _dispatch() -> str | None:
-            try:
-                from agent.runtime_cwd import set_session_cwd
-
-                set_session_cwd(state.cwd)
-            except Exception:
-                logger.debug("Could not pin ACP session cwd for slash command", exc_info=True)
-            return handler(args, state)
-
-        try:
-            return contextvars.copy_context().run(_dispatch)
-        except Exception as e:
-            logger.error("Slash command /%s error: %s", cmd, e, exc_info=True)
-            return f"Error executing /{cmd}: {e}"
-
-    def _cmd_help(self, args: str, state: SessionState) -> str:
-        lines = ["Available commands:", ""]
-        for cmd, desc in self._SLASH_COMMANDS.items():
-            lines.append(f"  /{cmd:10s}  {desc}")
-        lines.append("")
-        lines.append("Unrecognized /commands are sent to the model as normal messages.")
-        return "\n".join(lines)
-
-    def _cmd_model(self, args: str, state: SessionState) -> str:
-        if not args:
-            model = state.model or getattr(state.agent, "model", "unknown")
-            provider = getattr(state.agent, "provider", None) or "auto"
-            return f"Current model: {model}\nProvider: {provider}"
-
-        current_provider = getattr(state.agent, "provider", None) or "openrouter"
-        target_provider, new_model = self._resolve_model_selection(args, current_provider)
-
-        new_agent = self.session_manager._make_agent(
-            session_id=state.session_id,
-            cwd=state.cwd,
-            model=new_model,
-            requested_provider=target_provider,
-        )
-        self._commit_model_switch(state, model=new_model, new_agent=new_agent)
-        provider_label = getattr(state.agent, "provider", None) or target_provider or current_provider
-        logger.info("Session %s: model switched to %s", state.session_id, new_model)
-        return f"Model switched to: {new_model}\nProvider: {provider_label}"
-
-    def _cmd_tools(self, args: str, state: SessionState) -> str:
-        try:
-            from model_tools import get_tool_definitions
-            from types import SimpleNamespace
-            from agent.memory_manager import inject_memory_provider_tools
-
-            toolsets = _expand_acp_enabled_toolsets(
-                getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"]
-            )
-            tools = get_tool_definitions(enabled_toolsets=toolsets, quiet_mode=True)
-            tool_view = SimpleNamespace(
-                tools=list(tools or []),
-                valid_tool_names={
-                    tool.get("function", {}).get("name")
-                    for tool in tools or []
-                    if isinstance(tool, dict)
-                },
-                enabled_toolsets=toolsets,
-                _memory_manager=getattr(state.agent, "_memory_manager", None),
-            )
-            inject_memory_provider_tools(tool_view)
-            tools = tool_view.tools
-            if not tools:
-                return "No tools available."
-            lines = [f"Available tools ({len(tools)}):"]
-            for t in tools:
-                name = (t.get("function") or {}).get("name", "?")
-                desc = (t.get("function") or {}).get("description", "")
-                # Truncate long descriptions
-                if len(desc) > 80:
-                    desc = desc[:77] + "..."
-                lines.append(f"  {name}: {desc}")
-            return "\n".join(lines)
-        except Exception as e:
-            return f"Could not list tools: {e}"
-
-    def _cmd_context(self, args: str, state: SessionState) -> str:
-        """Show ACP session context pressure and compression guidance."""
-        n_messages = len(state.history)
-
-        # Count by role.
-        roles: dict[str, int] = {}
-        for msg in state.history:
-            role = msg.get("role", "unknown")
-            roles[role] = roles.get(role, 0) + 1
-
-        agent = state.agent
-        model = state.model or getattr(agent, "model", "")
-        provider = getattr(agent, "provider", None) or "auto"
-        compressor = getattr(agent, "context_compressor", None)
-        context_length = int(getattr(compressor, "context_length", 0) or 0)
-        threshold_tokens = int(getattr(compressor, "threshold_tokens", 0) or 0)
-
-        try:
-            from agent.model_metadata import estimate_request_tokens_rough
-
-            system_prompt = getattr(agent, "_cached_system_prompt", "") or ""
-            tools = getattr(agent, "tools", None) or None
-            approx_tokens = estimate_request_tokens_rough(
-                state.history,
-                system_prompt=system_prompt,
-                tools=tools,
-            )
-        except Exception:
-            logger.debug("Could not estimate ACP context usage", exc_info=True)
-            approx_tokens = 0
-
-        if threshold_tokens <= 0 and context_length > 0:
-            threshold_tokens = int(context_length * 0.80)
-
-        lines = [
-            f"Conversation: {n_messages} messages"
-            if n_messages
-            else "Conversation is empty (no messages yet).",
-            f"  user: {roles.get('user', 0)}, assistant: {roles.get('assistant', 0)}, "
-            f"tool: {roles.get('tool', 0)}, system: {roles.get('system', 0)}",
-        ]
-        if model:
-            lines.append(f"Model: {model}")
-        lines.append(f"Provider: {provider}")
-
-        if approx_tokens > 0:
-            if context_length > 0:
-                usage_pct = (approx_tokens / context_length) * 100
-                lines.append(
-                    f"Context usage: ~{approx_tokens:,} / {context_length:,} tokens ({usage_pct:.1f}%)"
-                )
-            else:
-                lines.append(f"Context usage: ~{approx_tokens:,} tokens")
-
-        if threshold_tokens > 0:
-            if approx_tokens > 0:
-                threshold_pct = (threshold_tokens / context_length) * 100 if context_length > 0 else 0
-                remaining = max(threshold_tokens - approx_tokens, 0)
-                if approx_tokens >= threshold_tokens:
-                    lines.append(
-                        f"Compression: due now (threshold ~{threshold_tokens:,}"
-                        + (f", {threshold_pct:.0f}%" if threshold_pct else "")
-                        + "). Run /compress."
-                    )
-                else:
-                    lines.append(
-                        f"Compression: ~{remaining:,} tokens until threshold "
-                        f"(~{threshold_tokens:,}"
-                        + (f", {threshold_pct:.0f}%" if threshold_pct else "")
-                        + ")."
-                    )
-            else:
-                lines.append(f"Compression threshold: ~{threshold_tokens:,} tokens")
-
-        if getattr(agent, "compression_enabled", True) is False:
-            lines.append(
-                "Auto-compaction is disabled (compression.enabled: false); "
-                "/compress still compresses manually."
-            )
-        else:
-            lines.append("Tip: run /compress to compress manually before the threshold.")
-
-        return "\n".join(lines)
-
-    def _cmd_reset(self, args: str, state: SessionState) -> str:
-        state.history.clear()
-        reset_failed = False
-        try:
-            reset_session_state = getattr(state.agent, "reset_session_state", None)
-            if callable(reset_session_state):
-                reset_session_state()
-        except Exception:
-            reset_failed = True
-            logger.warning("ACP session state reset failed for %s", state.session_id, exc_info=True)
-        finally:
-            self.session_manager.save_session(state.session_id)
-        if reset_failed:
-            return "Conversation history cleared. Agent session state reset failed; see logs."
-        return "Conversation history cleared."
-
-    def _cmd_compress(self, args: str, state: SessionState) -> str:
-        if not state.history:
-            return "Nothing to compress — conversation is empty."
-        try:
-            agent = state.agent
-            # No compression_enabled gate: the flag disables *automatic*
-            # compaction only; manual /compress must keep working (matches
-            # the CLI /compress and gateway handlers).
-            if not hasattr(agent, "_compress_context"):
-                return "Context compression not available for this agent."
-
-            from agent.model_metadata import estimate_request_tokens_rough
-
-            original_count = len(state.history)
-            # Include system prompt + tool schemas so the figure reflects real
-            # request pressure, not a transcript-only underestimate (#6217).
-            _sys_prompt = getattr(agent, "_cached_system_prompt", "") or ""
-            _tools = getattr(agent, "tools", None) or None
-            approx_tokens = estimate_request_tokens_rough(
-                state.history, system_prompt=_sys_prompt, tools=_tools
-            )
-            original_session_db = getattr(agent, "_session_db", None)
-
-            try:
-                # ACP sessions must keep a stable session id, so avoid the
-                # SQLite session-splitting side effect inside _compress_context.
-                agent._session_db = None
-                compressed, _ = agent._compress_context(
-                    state.history,
-                    getattr(agent, "_cached_system_prompt", "") or "",
-                    approx_tokens=approx_tokens,
-                    task_id=state.session_id,
-                    force=True,
-                )
-            finally:
-                agent._session_db = original_session_db
-
-            state.history = compressed
-            self.session_manager.save_session(state.session_id)
-
-            new_count = len(state.history)
-            _sys_prompt_after = getattr(agent, "_cached_system_prompt", "") or _sys_prompt
-            _tools_after = getattr(agent, "tools", None) or _tools
-            new_tokens = estimate_request_tokens_rough(
-                state.history,
-                system_prompt=_sys_prompt_after,
-                tools=_tools_after,
-            )
-            return (
-                f"Context compressed: {original_count} -> {new_count} messages\n"
-                f"~{approx_tokens:,} -> ~{new_tokens:,} tokens"
-            )
-        except Exception as e:
-            return f"Compression failed: {e}"
-
-    def _cmd_steer(self, args: str, state: SessionState) -> str:
-        steer_text = args.strip()
-        if not steer_text:
-            return "Usage: /steer <guidance>"
-
-        if state.is_running and hasattr(state.agent, "steer"):
-            try:
-                if state.agent.steer(steer_text):
-                    preview = steer_text[:80] + ("..." if len(steer_text) > 80 else "")
-                    return f"⏩ Steer queued for the active turn: {preview}"
-            except Exception as exc:
-                logger.warning("ACP steer failed for session %s: %s", state.session_id, exc)
-                return f"⚠️ Steer failed: {exc}"
-
-        with state.runtime_lock:
-            state.queued_prompts.append(steer_text)
-            depth = len(state.queued_prompts)
-        return f"No active turn — queued for the next turn. ({depth} queued)"
-
-    def _cmd_queue(self, args: str, state: SessionState) -> str:
-        queued_text = args.strip()
-        if not queued_text:
-            return "Usage: /queue <prompt>"
-        with state.runtime_lock:
-            state.queued_prompts.append(queued_text)
-            depth = len(state.queued_prompts)
-        return f"Queued for the next turn. ({depth} queued)"
+    # ---- Session settings (ACP protocol methods) -----------------------------
 
     def _cmd_version(self, args: str, state: SessionState) -> str:
+        """Show the Hermes version together with the active Git identity."""
         try:
             from hermes_cli.banner import get_git_build_identity
 
@@ -4231,8 +3004,6 @@ class HermesACPAgent(acp.Agent):
             identity = None
         suffix = f" · {identity}" if identity else ""
         return f"Hermes Agent v{HERMES_VERSION}{suffix}"
-
-    # ---- Model switching (ACP protocol method) -------------------------------
 
     async def set_session_model(
         self, model_id: str, session_id: str, **kwargs: Any
@@ -4314,3 +3085,40 @@ class HermesACPAgent(acp.Agent):
         self.session_manager.save_session(session_id)
         logger.info("Session %s: config option %s updated", session_id, config_id)
         return SetSessionConfigOptionResponse(config_options=[])
+
+
+# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
+# Names external plugins imported from this module before the Sep 2026 decomposition.
+# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
+# The whole block is removed by reverting the commit that added it.
+from acp.schema import AgentThoughtChunk  # noqa: F401,E402
+from acp.schema import AudioContentBlock  # noqa: F401,E402
+from acp.schema import AvailableCommand  # noqa: F401,E402
+from acp.schema import AvailableCommandsUpdate  # noqa: F401,E402
+from acp.schema import BlobResourceContents  # noqa: F401,E402
+from acp.schema import EmbeddedResourceContentBlock  # noqa: F401,E402
+from acp.schema import ImageContentBlock  # noqa: F401,E402
+from pathlib import Path  # noqa: F401,E402
+from acp.schema import ResourceContentBlock  # noqa: F401,E402
+from acp.schema import TextResourceContents  # noqa: F401,E402
+from acp.schema import UnstructuredCommandInput  # noqa: F401,E402
+import base64  # noqa: F401,E402
+import json  # noqa: F401,E402
+from urllib.parse import unquote  # noqa: F401,E402
+from urllib.parse import urlparse  # noqa: F401,E402
+
+
+_PLUGIN_COMPAT_LAZY = {
+    'ACP_MAX_MODELS_PER_PROVIDER': ('acp_adapter.model_catalog', 'ACP_MAX_MODELS_PER_PROVIDER'),
+}
+
+
+def __getattr__(name):  # PEP 562 — lazy so no import cycles
+    target = _PLUGIN_COMPAT_LAZY.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import importlib
+    from hermes_cli.plugin_compat import warn_once
+    warn_once(__name__, name, *target)
+    return getattr(importlib.import_module(target[0]), target[1])
+# ---- END PLUGIN-COMPAT ----

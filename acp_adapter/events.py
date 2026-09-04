@@ -60,18 +60,27 @@ def _build_plan_update_from_todo_result(result: Any) -> AgentPlanUpdate | None:
     ACP adapter should expose that state natively instead of only as a generic
     tool-call transcript block.
     """
-    if not isinstance(result, str) or not result.strip():
+    if isinstance(result, str):
+        if not result.strip():
+            return None
+        try:
+            data = _json_loads_maybe_prefix(result)
+        except Exception:
+            return None
+    elif isinstance(result, dict):
+        data = result
+    else:
         return None
 
-    try:
-        data = _json_loads_maybe_prefix(result)
-    except Exception:
+    if not isinstance(data, dict):
         return None
 
-    if not isinstance(data, dict) or not isinstance(data.get("todos"), list):
+    todos = next(
+        (data[key] for key in ("todos", "todo_list", "todo") if isinstance(data.get(key), list)),
+        None,
+    )
+    if todos is None:
         return None
-
-    todos = data["todos"]
     if not todos:
         return AgentPlanUpdate(session_update="plan", entries=[])
 
@@ -480,7 +489,7 @@ def make_step_cb(
                         snapshot=meta.get("snapshot"),
                     )
                     _send_update(conn, session_id, loop, update)
-                    if tool_name == "todo":
+                    if tool_name in {"todo", "todo_list"}:
                         plan_update = _build_plan_update_from_todo_result(result)
                         if plan_update is not None:
                             _send_update(conn, session_id, loop, plan_update)

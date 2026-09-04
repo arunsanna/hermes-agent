@@ -40,7 +40,7 @@ class SynapseProfile(ProviderProfile):
 synapse = SynapseProfile(
     name="synapse",
     aliases=("arunlabs", "forge"),
-    env_vars=("SYNAPSE_API_KEY",),
+    env_vars=("SYNAPSE_API_KEY", "SYNAPSE_BASE_URL"),
     display_name="ArunLabs Synapse",
     description="Self-hosted OpenAI-compatible gateway (forge k3s)",
     base_url="https://synapse.arunlabs.com/v1",
