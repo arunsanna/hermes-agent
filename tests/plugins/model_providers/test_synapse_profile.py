@@ -46,3 +46,68 @@ class TestSynapseReasoningWireShape:
         )
         assert extra_body == {}
         assert top_level == {}
+
+
+class TestSynapseCatalogIsTheSourceOfTruth:
+    """Synapse advertises ``capabilities.reasoning_levels`` per model on its
+    ``/v1/chat/models`` catalog and rejects anything else with HTTP 400
+    (``reasoning_effort must be one of: minimal, low, medium, high``). Hermes'
+    own ladder (``xhigh``/``max``/``ultra``, config defaults) must be clamped
+    onto that list before the request leaves the process."""
+
+    QWEN = "qwen3.8-abliterated"
+
+    @pytest.fixture(autouse=True)
+    def _catalog(self, synapse_profile, monkeypatch):
+        import hermes_cli.models as models_module
+
+        models_module._reset_synapse_catalog_cache_for_testing()
+        self.catalog = {
+            self.QWEN: {
+                "supports_reasoning_levels": True,
+                "reasoning_levels": ["minimal", "low", "medium", "high"],
+            },
+            "no-levels-model": {"supports_reasoning_levels": False},
+        }
+        self.fetches = 0
+
+        def fake_fetch(*, base_url, api_key, timeout):
+            self.fetches += 1
+            return self.catalog
+
+        monkeypatch.setattr(models_module, "_fetch_synapse_capabilities", fake_fetch)
+
+    @pytest.mark.parametrize("effort", ["xhigh", "max", "ultra"])
+    def test_levels_above_the_catalog_clamp_to_high(self, synapse_profile, effort):
+        _, top_level = synapse_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": effort}, model=self.QWEN
+        )
+        assert top_level == {"reasoning_effort": "high"}
+
+    @pytest.mark.parametrize("effort", ["minimal", "low", "medium", "high"])
+    def test_advertised_levels_pass_through(self, synapse_profile, effort):
+        _, top_level = synapse_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": effort}, model=self.QWEN
+        )
+        assert top_level == {"reasoning_effort": effort}
+
+    def test_model_without_levels_omits_the_field(self, synapse_profile):
+        _, top_level = synapse_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "high"},
+            model="no-levels-model",
+        )
+        assert top_level == {}
+
+    def test_unknown_catalog_passes_the_request_through(self, synapse_profile):
+        self.catalog = None
+        _, top_level = synapse_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "max"}, model=self.QWEN
+        )
+        assert top_level == {"reasoning_effort": "max"}
+
+    def test_catalog_is_fetched_once_per_process(self, synapse_profile):
+        for _ in range(3):
+            synapse_profile.build_api_kwargs_extras(
+                reasoning_config={"enabled": True, "effort": "max"}, model=self.QWEN
+            )
+        assert self.fetches == 1

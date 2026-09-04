@@ -2017,6 +2017,116 @@ def clamp_reasoning_effort_to_supported(
     return _clamp_effort(effort, supported_efforts)
 
 
+# ── Synapse (ArunLabs forge gateway) reasoning levels ────────────────────────
+# Synapse publishes ``capabilities.supports_reasoning_levels`` and
+# ``capabilities.reasoning_levels`` per model on ``/v1/chat/models`` and answers
+# HTTP 400 to any other ``reasoning_effort`` (verified 2026-09-04: ``xhigh``,
+# ``max`` and ``ultra`` are rejected while the model advertises
+# minimal/low/medium/high). That catalogue is the source of truth; Hermes'
+# ladder is clamped onto it here so the bundled synapse profile and a
+# HERMES_HOME plugin override share one implementation.
+_SYNAPSE_CATALOG_TTL_S = 600.0
+_SYNAPSE_CATALOG_FAILURE_TTL_S = 30.0
+_synapse_catalog_lock = threading.Lock()
+_synapse_catalog_cache: dict[str, tuple[float, Optional[dict[str, dict[str, Any]]]]] = {}
+
+
+def _fetch_synapse_capabilities(
+    *, base_url: str, api_key: Optional[str], timeout: float
+) -> Optional[dict[str, dict[str, Any]]]:
+    """Return ``{model_id: capabilities}`` from the Synapse chat catalogue, or None."""
+    url = base_url.rstrip("/") + "/chat/models"
+    req = urllib.request.Request(url)
+    if api_key:
+        req.add_header("Authorization", f"Bearer {api_key}")
+    req.add_header("Accept", "application/json")
+    try:
+        with open_credentialed_url(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception as exc:
+        logger.debug("synapse: capability catalogue unavailable (%s): %s", url, exc)
+        return None
+    items = data if isinstance(data, list) else data.get("data", [])
+    capabilities: dict[str, dict[str, Any]] = {}
+    for item in items:
+        if isinstance(item, dict) and isinstance(item.get("id"), str):
+            caps = item.get("capabilities")
+            capabilities[item["id"]] = caps if isinstance(caps, dict) else {}
+    return capabilities
+
+
+def synapse_model_reasoning_capabilities(
+    model: Optional[str], base_url: Optional[str], *, timeout: float = 6.0
+) -> Optional[dict[str, Any]]:
+    """Cached catalogue ``capabilities`` for *model*; None when unknown.
+
+    A failed fetch is cached briefly so a down catalogue never turns the
+    per-request hot path into a retry storm.
+    """
+    key = str(base_url or "").rstrip("/")
+    if not key:
+        return None
+    now = time.monotonic()
+    with _synapse_catalog_lock:
+        cached = _synapse_catalog_cache.get(key)
+        if cached is None or cached[0] <= now:
+            catalogue = _fetch_synapse_capabilities(
+                base_url=key,
+                api_key=os.environ.get("SYNAPSE_API_KEY") or None,
+                timeout=timeout,
+            )
+            ttl = (
+                _SYNAPSE_CATALOG_TTL_S
+                if catalogue is not None
+                else _SYNAPSE_CATALOG_FAILURE_TTL_S
+            )
+            cached = (now + ttl, catalogue)
+            _synapse_catalog_cache[key] = cached
+    catalogue = cached[1]
+    if catalogue is None:
+        return None
+    return catalogue.get(str(model or "").strip())
+
+
+def _reset_synapse_catalog_cache_for_testing() -> None:
+    with _synapse_catalog_lock:
+        _synapse_catalog_cache.clear()
+
+
+def synapse_wire_reasoning_effort(
+    reasoning_config: Optional[dict],
+    *,
+    model: Optional[str],
+    base_url: Optional[str],
+) -> Optional[str]:
+    """Wire ``reasoning_effort`` for a Synapse request, or None to omit the field.
+
+    The selected level is clamped onto the model's advertised
+    ``reasoning_levels`` (nearest weaker, :func:`agent.reasoning_effort.clamp_effort`).
+    None when reasoning is unset/disabled or the model takes no levels at all;
+    verbatim when the catalogue is unreachable, the model id is unknown, or the
+    model is unlisted — Synapse then stays the validator.
+    """
+    from agent.reasoning_effort import requested_effort
+
+    effort = requested_effort(reasoning_config)
+    if effort is None or not model:
+        return effort
+    caps = synapse_model_reasoning_capabilities(model, base_url)
+    if caps is None:
+        return effort
+    if not caps.get("supports_reasoning_levels"):
+        return None
+    levels = caps.get("reasoning_levels")
+    wire = _clamp_effort(effort, levels if isinstance(levels, list) else None) or effort
+    if wire != effort:
+        logger.info(
+            "synapse: clamped reasoning_effort %r -> %r for %s (catalogue levels=%s)",
+            effort, wire, model, levels,
+        )
+    return wire
+
+
 def fetch_openrouter_models(
     timeout: float = 8.0,
     *,

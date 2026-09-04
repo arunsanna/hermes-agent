@@ -1,8 +1,11 @@
 """ArunLabs Synapse provider profile.
 
-Synapse owns its live model catalogue and accepted reasoning levels. Hermes
-discovers models from Synapse's chat-only endpoint and forwards the selected
-``reasoning_effort`` as the top-level OpenAI-compatible request field.
+Synapse owns its live model catalogue and accepted reasoning levels: each
+``/v1/chat/models`` entry advertises ``capabilities.reasoning_levels`` and the
+gateway answers HTTP 400 to anything else. The selected ``reasoning_effort`` is
+clamped onto that catalogue by :func:`hermes_cli.models.synapse_wire_reasoning_effort`
+(shared with HERMES_HOME plugin overrides) and sent as the top-level
+OpenAI-compatible request field.
 """
 
 from __future__ import annotations
@@ -12,26 +15,26 @@ from typing import Any
 from providers import register_provider
 from providers.base import ProviderProfile
 
-def _synapse_reasoning_effort(reasoning_config: dict | None) -> str | None:
-    """Return the caller's selected level; Synapse validates its own schema."""
-    if not isinstance(reasoning_config, dict):
-        return None
-    if reasoning_config.get("enabled") is False:
-        return None
-    effort = (reasoning_config.get("effort") or "").strip().lower()
-    return effort or None
-
 
 class SynapseProfile(ProviderProfile):
-    """Synapse — live model discovery and top-level reasoning effort."""
+    """Synapse — live model discovery and catalogue-clamped reasoning effort."""
 
     def build_api_kwargs_extras(
-        self, *, reasoning_config: dict | None = None, **context
+        self,
+        *,
+        reasoning_config: dict | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+        **context: Any,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        effort = _synapse_reasoning_effort(reasoning_config)
-        if effort is None:
+        from hermes_cli.models import synapse_wire_reasoning_effort
+
+        wire = synapse_wire_reasoning_effort(
+            reasoning_config, model=model, base_url=base_url or self.base_url
+        )
+        if wire is None:
             return {}, {}
-        return {}, {"reasoning_effort": effort}
+        return {}, {"reasoning_effort": wire}
 
 
 synapse = SynapseProfile(
