@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid
 from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import urlsplit
+from urllib.request import url2pathname
 
 import acp
 from acp.schema import ToolCallLocation, ToolCallProgress, ToolCallStart, ToolKind
@@ -837,6 +840,70 @@ def _build_tool_complete_content(
     return [_text(text)] if text else [_text(_truncate_text(result or ""))]
 
 
+_GEMINI_IMAGE_MCP_TOOLS = {
+    "mcp__gemini_image__generate_image",
+    "mcp__gemini_image__refine_image",
+}
+
+
+def _completion_image_locations(
+    tool_name: str, result: Optional[str], function_args: Optional[Args]
+) -> Optional[List[ToolCallLocation]]:
+    """Return a successful image tool's absolute local path as an ACP location."""
+    data = _json_loads_maybe(result)
+    if tool_name in _GEMINI_IMAGE_MCP_TOOLS and not isinstance(data, dict):
+        text = result.strip() if isinstance(result, str) else ""
+        prefix = f'<untrusted_tool_result source="{tool_name}">\n'
+        suffix = "\n</untrusted_tool_result>"
+        if text.startswith(prefix) and text.endswith(suffix):
+            _, separator, payload = text[len(prefix):-len(suffix)].partition("\n\n")
+            data = _json_loads_maybe(payload) if separator else None
+    source: Any = None
+    if tool_name == "vision_analyze":
+        native_content = isinstance(data, list) and any(
+            isinstance(part, dict)
+            and (
+                part.get("type") == "image_url"
+                or (
+                    part.get("type") == "content"
+                    and isinstance(part.get("content"), dict)
+                    and part["content"].get("type") == "image_url"
+                )
+            )
+            for part in data
+        )
+        if not (
+            isinstance(data, dict)
+            and (data.get("success") is True or data.get("_multimodal") is True)
+        ) and not native_content:
+            return None
+        source = (function_args or {}).get("image_url")
+    elif tool_name == "image_generate":
+        if not isinstance(data, dict) or data.get("success") is not True:
+            return None
+        source = data.get("image")
+    elif tool_name in _GEMINI_IMAGE_MCP_TOOLS:
+        text = data.get("result") if isinstance(data, dict) and not data.get("error") else None
+        marker = "[Open image](<"
+        start = text.find(marker) + len(marker) if isinstance(text, str) and marker in text else 0
+        end = text.find(">)", start) if start else -1
+        if end < 0:
+            return None
+        try:
+            parsed = urlsplit(text[start:end])
+        except ValueError:
+            return None
+        if parsed.scheme != "file" or parsed.netloc or parsed.query or parsed.fragment:
+            return None
+        source = url2pathname(parsed.path)
+    if not isinstance(source, str):
+        return None
+    source = source.strip()
+    if not source or "\x00" in source or source.startswith(("http://", "https://", "data:")) or not os.path.isabs(source):
+        return None
+    return [ToolCallLocation(path=source)]
+
+
 # --- ToolCallStart / ToolCallProgress events ---------------------------------
 
 
@@ -1021,9 +1088,10 @@ def build_tool_complete(
     raw_output = None if tool_name in _POLISHED_TOOLS or structured else result
     if delegation_attempt is not None:
         raw_output = delegation_attempt
+    locations = _completion_image_locations(tool_name, result, function_args) if status == "completed" else None
     return acp.update_tool_call(
         tool_call_id, kind=get_tool_kind(tool_name),
-        status=status, content=content, raw_output=raw_output,
+        status=status, content=content, locations=locations, raw_output=raw_output,
     )
 
 

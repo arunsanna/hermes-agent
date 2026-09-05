@@ -1,5 +1,8 @@
 """Tests for acp_adapter.tools — tool kind mapping and ACP content building."""
 
+import json
+import pytest
+
 
 from acp_adapter.edit_approval import EditProposal
 from acp_adapter.tools import (
@@ -184,6 +187,141 @@ class TestBuildToolStart:
 
 
 class TestBuildToolComplete:
+    def test_build_tool_complete_for_vision_local_image_reports_location(self, tmp_path):
+        image_path = tmp_path / "input.png"
+        result = build_tool_complete(
+            "tc-vision-location",
+            "vision_analyze",
+            '{"success": true, "analysis": "ok"}',
+            function_args={"image_url": str(image_path), "question": "describe"},
+        )
+
+        assert result.locations == [ToolCallLocation(path=str(image_path))]
+
+    def test_build_tool_complete_for_native_vision_json_content_reports_location(self, tmp_path):
+        image_path = tmp_path / "native.png"
+        native_content = json.dumps([
+            {"type": "text", "text": "Image loaded into your context."},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ])
+        result = build_tool_complete(
+            "tc-native-vision-location",
+            "vision_analyze",
+            native_content,
+            function_args={"image_url": str(image_path), "question": "describe"},
+        )
+
+        assert result.locations == [ToolCallLocation(path=str(image_path))]
+
+    def test_build_tool_complete_for_image_generate_reports_host_location(self, tmp_path):
+        image_path = tmp_path / "generated.png"
+        result = build_tool_complete(
+            "tc-image-location",
+            "image_generate",
+            '{"success": true, "image": "' + str(image_path) + '"}',
+        )
+
+        assert result.locations == [ToolCallLocation(path=str(image_path))]
+
+    @pytest.mark.parametrize(
+        ("tool_name", "wrapped"),
+        [
+            ("mcp__gemini_image__generate_image", False),
+            ("mcp__gemini_image__generate_image", True),
+            ("mcp__gemini_image__refine_image", False),
+            ("mcp__gemini_image__refine_image", True),
+        ],
+    )
+    def test_build_tool_complete_for_local_gemini_image_mcp_reports_location(
+        self, tmp_path, tool_name, wrapped
+    ):
+        from agent.tool_dispatch_helpers import _maybe_wrap_untrusted
+
+        image_path = tmp_path / "image preview (1).png"
+        label = "Refined image saved" if tool_name.endswith("refine_image") else "Saved"
+        payload = json.dumps({
+            "result": (
+                f"{label}: {image_path}\n"
+                f"[Open image](<{image_path.as_uri()}>)\n"
+                f"MEDIA:{image_path}"
+            )
+        })
+        result = build_tool_complete(
+            "tc-gemini-image-location",
+            tool_name,
+            _maybe_wrap_untrusted(tool_name, payload) if wrapped else payload,
+        )
+
+        assert result.locations == [ToolCallLocation(path=str(image_path))]
+
+    @pytest.mark.parametrize(
+        ("tool_name", "payload"),
+        [
+            ("mcp__gemini_image__generate_image", '{"error":"generation failed"}'),
+            ("mcp__gemini_image__generate_image", '{"result":"Saved: /tmp/output.png"}'),
+            (
+                "mcp__gemini_image__generate_image",
+                '{"result":"[Open image](<https://example.com/output.png>)"}',
+            ),
+            (
+                "mcp__gemini_image__generate_image",
+                '{"result":"[Open image](<file:relative.png>)"}',
+            ),
+            (
+                "mcp__gemini_image__generate_image",
+                '{"result":"[Open image](<file://[invalid/output.png>)"}',
+            ),
+            (
+                "mcp__other__generate_image",
+                '{"result":"[Open image](<file:///tmp/output.png>)"}',
+            ),
+        ],
+    )
+    def test_build_tool_complete_rejects_non_local_gemini_mcp_locations(
+        self, tool_name, payload
+    ):
+        result = build_tool_complete("tc-gemini-no-location", tool_name, payload)
+
+        assert result.locations is None
+
+    def test_build_tool_complete_rejects_invalid_gemini_mcp_wrappers(self):
+        from agent.tool_dispatch_helpers import _maybe_wrap_untrusted
+
+        tool_name = "mcp__gemini_image__generate_image"
+        valid_payload = '{"result":"[Open image](<file:///tmp/output.png>)"}'
+        results = [
+            _maybe_wrap_untrusted(tool_name, '{"error":"generation failed"}'),
+            _maybe_wrap_untrusted("mcp__gemini_image__refine_image", valid_payload),
+            f'<untrusted_tool_result source="{tool_name}">\n{valid_payload}',
+        ]
+
+        assert all(
+            build_tool_complete("tc-gemini-bad-wrapper", tool_name, item).locations is None
+            for item in results
+        )
+
+    @pytest.mark.parametrize(
+        ("tool_name", "result", "function_args"),
+        [
+            ("vision_analyze", '{"success": false}', {"image_url": "/tmp/input.png"}),
+            ("vision_analyze", '{"success": true}', {"image_url": "https://example.com/input.png"}),
+            ("vision_analyze", '{"success": true}', {"image_url": "data:image/png;base64,AAAA"}),
+            ("vision_analyze", '{"success": true}', {"image_url": "relative.png"}),
+            ("vision_analyze", '{"success": true}', {"image_url": 123}),
+            ("image_generate", '{"success": true, "image": "https://example.com/out.png"}', None),
+            ("image_generate", '{"success": true, "image": "relative.png"}', None),
+            ("image_generate", '{"success": true, "image": 123}', None),
+            ("image_generate", '{"success": true, "image": "/tmp/out.png", "error": "late failure"}', None),
+            ("image_generate", "malformed", None),
+        ],
+    )
+    def test_build_tool_complete_rejects_non_local_image_locations(
+        self, tool_name, result, function_args
+    ):
+        update = build_tool_complete("tc-no-image-location", tool_name, result, function_args)
+
+        assert update.locations is None
+
     def test_build_tool_complete_for_terminal(self):
         """Completed terminal call should include output text."""
         result = build_tool_complete("tc-2", "terminal", "total 42\ndrwxr-xr-x 2 root root 4096 ...")
