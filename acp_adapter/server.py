@@ -2967,6 +2967,24 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                             "billingBlock": result.get("billing_block"),
                         },
                     )
+                async def _pause_goal_on_interrupt() -> None:
+                    # CLI parity (cli_loops_mixin._maybe_continue_goal_after_turn):
+                    # an interrupted/cancelled turn auto-pauses the goal instead of
+                    # judging (or acting on) partial output -- the judge would
+                    # almost always say "continue" and re-queue exactly what was
+                    # just interrupted.
+                    goal_mgr = _get_goal_manager(state)
+                    if goal_mgr.is_active():
+                        goal_mgr.pause(reason="user-interrupted (Ctrl+C)")
+                        if conn:
+                            await conn.session_update(
+                                session_id,
+                                acp.update_agent_message_text(
+                                    "⏸ Goal paused — turn was interrupted. "
+                                    "Use /goal resume to continue, or /goal clear to stop."
+                                ),
+                            )
+
                 # Phase 3b: after a normal turn completion, let an active goal judge
                 # whether to keep going. This reuses GoalManager.evaluate_after_turn
                 # (hermes_cli/goals.py) exactly as the CLI/gateway do -- same budget
@@ -2986,6 +3004,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 ):
                     if state.cancel_event and state.cancel_event.is_set():
                         cancelled = True
+                        await _pause_goal_on_interrupt()
                     else:
                         goal_mgr = _get_goal_manager(state)
                         with state.runtime_lock:
@@ -3040,14 +3059,15 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                                         ),
                                     )
                             else:
-                                if goal_decision.get("message") and conn:
-                                    await conn.session_update(
-                                        session_id,
-                                        acp.update_agent_message_text(goal_decision["message"]),
-                                    )
                                 if state.cancel_event and state.cancel_event.is_set():
                                     cancelled = True
+                                    await _pause_goal_on_interrupt()
                                 else:
+                                    if goal_decision.get("message") and conn:
+                                        await conn.session_update(
+                                            session_id,
+                                            acp.update_agent_message_text(goal_decision["message"]),
+                                        )
                                     with state.runtime_lock:
                                         goal_queue_waiting = bool(state.queued_prompts)
                                     if (
@@ -3061,21 +3081,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                     (cancelled or suppress_interrupt_response)
                     and not required_observation_failed
                 ):
-                    # CLI parity (cli_loops_mixin._maybe_continue_goal_after_turn):
-                    # an interrupted/cancelled turn auto-pauses the goal instead of
-                    # judging partial output -- the judge would almost always say
-                    # "continue" and re-queue exactly what was just interrupted.
-                    goal_mgr = _get_goal_manager(state)
-                    if goal_mgr.is_active():
-                        goal_mgr.pause(reason="user-interrupted (Ctrl+C)")
-                        if conn:
-                            await conn.session_update(
-                                session_id,
-                                acp.update_agent_message_text(
-                                    "⏸ Goal paused — turn was interrupted. "
-                                    "Use /goal resume to continue, or /goal clear to stop."
-                                ),
-                            )
+                    await _pause_goal_on_interrupt()
             finally:
                 # Mark this turn idle before draining queued work so recursive prompt()
                 # calls can acquire the session. Queued turns are intentionally run as

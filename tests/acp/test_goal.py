@@ -440,6 +440,91 @@ class TestGoalContinuationLoop:
         assert state.agent.run_conversation.call_count == 1
 
     @pytest.mark.asyncio
+    async def test_cancel_during_judge_pauses_goal_and_suppresses_continue_notice(self, agent):
+        """Regression: a session/cancel that lands while the judge is deliberating
+        must pause the goal with the CLI-parity reason/notice instead of leaving
+        it active, and the "Continuing toward goal" notice for the judge's
+        continue decision must never be streamed once cancel is set.
+        """
+        from acp.schema import PromptResponse
+
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        state.agent.run_conversation = MagicMock(return_value={"final_response": "step 1 done", "messages": []})
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        def fake_judge(goal, last_response, **kwargs):
+            # Simulate a session/cancel landing while the (slow, real) judge call
+            # is "deliberating" for this turn's post-completion evaluation.
+            state.cancel_event.set()
+            return ("continue", "keep going", False, None, False)
+
+        with patch("hermes_cli.goals.judge_goal", side_effect=fake_judge):
+            prompt = [TextContentBlock(type="text", text="/goal Ship the widget")]
+            resp = await agent.prompt(prompt=prompt, session_id=new_resp.session_id)
+
+        assert isinstance(resp, PromptResponse)
+        assert resp.stop_reason == "cancelled"
+        assert state.agent.run_conversation.call_count == 1
+
+        texts = _agent_message_texts(mock_conn)
+        assert not any(t.startswith("↻ Continuing toward goal") for t in texts)
+        assert any(
+            t == "⏸ Goal paused — turn was interrupted. "
+            "Use /goal resume to continue, or /goal clear to stop."
+            for t in texts
+        )
+
+        goal_state = load_goal(new_resp.session_id)
+        assert goal_state.status == "paused"
+        assert goal_state.paused_reason == "user-interrupted (Ctrl+C)"
+
+    @pytest.mark.asyncio
+    async def test_cancel_before_judge_pauses_goal(self, agent):
+        """Regression: a cancel that lands after the turn already committed to
+        "final" (e.g. during the auto-title step that runs between the
+        terminal-winner commit and the goal-continuation block) but before
+        that block's own cancel check must pause the goal with the
+        CLI-parity notice, and the judge must never be consulted.
+        """
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        state.agent.run_conversation = MagicMock(return_value={"final_response": "step 1 done", "messages": []})
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        def fake_auto_title(*args, **kwargs):
+            # Simulate a session/cancel landing between this turn's
+            # terminal-winner commit (already "final") and the
+            # goal-continuation block's own cancel check a beat later.
+            state.cancel_event.set()
+
+        with (
+            patch("agent.title_generator.maybe_auto_title", side_effect=fake_auto_title),
+            patch("hermes_cli.goals.judge_goal") as mock_judge,
+        ):
+            prompt = [TextContentBlock(type="text", text="/goal Ship the widget")]
+            resp = await agent.prompt(prompt=prompt, session_id=new_resp.session_id)
+
+        assert resp.stop_reason == "cancelled"
+        assert state.agent.run_conversation.call_count == 1
+        mock_judge.assert_not_called()
+
+        texts = _agent_message_texts(mock_conn)
+        assert any(
+            t == "⏸ Goal paused — turn was interrupted. "
+            "Use /goal resume to continue, or /goal clear to stop."
+            for t in texts
+        )
+
+        goal_state = load_goal(new_resp.session_id)
+        assert goal_state.status == "paused"
+        assert goal_state.paused_reason == "user-interrupted (Ctrl+C)"
+
+    @pytest.mark.asyncio
     async def test_stops_when_goal_paused_mid_loop(self, agent):
         new_resp = await agent.new_session(cwd=".")
         state = agent.session_manager.get_session(new_resp.session_id)
