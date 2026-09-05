@@ -72,6 +72,7 @@ What you'll see:
 | `/goal gate clear` | Remove all gates. |
 
 Works identically on the CLI and every gateway platform (Telegram, Discord, Slack, Matrix, Signal, WhatsApp, SMS, iMessage, Webhook, API server, and the web dashboard).
+ACP clients (Switchboard, Zed) are also supported, running the continuation loop inside each `session/prompt` call.
 
 ## Completion contracts
 
