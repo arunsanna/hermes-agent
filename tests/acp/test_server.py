@@ -265,6 +265,45 @@ class TestSessionOps:
         assert help_cmd.description == "List available commands"
         assert help_cmd.input is None
 
+    def test_advertised_commands_match_handlers(self, agent):
+        """Every advertised command is exactly the executable set the mixin dispatches."""
+        advertised_names = {cmd.name for cmd in agent._available_commands()}
+        assert advertised_names == set(type(agent)._COMMANDS)
+        for name in advertised_names:
+            assert callable(getattr(agent, f"_cmd_{name}", None))
+
+    def test_advertised_commands_come_from_registry(self, agent):
+        """Advertised description/hint are derived from hermes_cli's CommandDef registry,
+        except entries explicitly listed in ACP_COMMAND_OVERRIDES (registry wording that
+        doesn't hold for ACP's simpler handlers)."""
+        from hermes_cli.commands import resolve_command
+        from acp_adapter.commands import ACP_COMMAND_OVERRIDES
+
+        # "skill" has no hermes_cli.commands registry entry at all: the CLI/gateway only register
+        # a *management* command for skills as a whole ("skills"), never a static CommandDef for
+        # loading one skill by name (that's a dynamically-registered "/<skill-name>" command per
+        # agent/skill_commands.py). Every other ACP_COMMAND_OVERRIDES entry still wraps a real
+        # registry command with different wording — only "skill" has nothing to derive from.
+        REGISTRY_LESS_OVERRIDES = {"skill"}
+
+        for cmd in agent._available_commands():
+            registry_def = resolve_command(cmd.name)
+            if cmd.name in REGISTRY_LESS_OVERRIDES:
+                assert registry_def is None, f"/{cmd.name} unexpectedly has a registry entry now"
+                continue
+            assert registry_def is not None, f"/{cmd.name} has no hermes_cli.commands registry entry"
+
+            if cmd.name in ACP_COMMAND_OVERRIDES:
+                continue
+
+            assert cmd.description == registry_def.description
+            expected_hint = registry_def.args_hint.strip("[]<>").strip() or None
+            if expected_hint:
+                assert cmd.input is not None
+                assert cmd.input.root.hint == expected_hint
+            else:
+                assert cmd.input is None
+
 
     def test_build_usage_update_for_zed_context_indicator(self, agent, mock_manager):
         state = mock_manager.create_session(cwd="/tmp")

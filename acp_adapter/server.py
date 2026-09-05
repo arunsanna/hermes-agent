@@ -28,7 +28,9 @@ from acp.schema import (
 )
 
 from acp_adapter.auth import TERMINAL_SETUP_AUTH_METHOD_ID, build_auth_methods, detect_provider
-from acp_adapter.commands import HERMES_VERSION, SlashCommandsMixin, _estimate_tokens
+from acp_adapter.commands import (
+    HERMES_VERSION, RunPromptAfterCommand, SlashCommandsMixin, _estimate_tokens, _get_goal_manager,
+)
 from acp_adapter.content import PromptBlock, _content_blocks_to_openai_user_content, _extract_text
 from acp_adapter.events import (
     _build_plan_update_from_todo_result,
@@ -1887,7 +1889,16 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         # an ACP command.
         if text_only_prompt and isinstance(user_content, str) and user_text.startswith("/"):
             response_text = self._handle_slash_command(user_text, state)
-            if response_text is not None:
+            if isinstance(response_text, RunPromptAfterCommand):
+                # e.g. /goal <text>, /goal resume, /skill <name>: emit the notice, then fall
+                # through into the normal turn path below with the sentinel's prompt_text as
+                # the user's message — do NOT return end_turn here.
+                if self._conn:
+                    update = acp.update_agent_message_text(response_text.notice)
+                    await self._conn.session_update(session_id, update)
+                user_text = response_text.prompt_text
+                user_content = response_text.prompt_text
+            elif response_text is not None:
                 if self._conn:
                     update = acp.update_agent_message_text(response_text)
                     await self._conn.session_update(session_id, update)
@@ -1976,9 +1987,6 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         delegation_tool_calls: dict[str, str] = {}
         previous_approval_cb = None
         edit_approval_requester = None
-
-        streamed_message = False
-        turn_history_baseline_count = len(state.history)
 
         if conn:
             tool_progress_cb = make_tool_progress_cb(
@@ -2289,369 +2297,559 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                     except Exception:
                         logger.debug("Could not clear ACP session context", exc_info=True)
 
-        try:
-            # Snapshot the internal Hermes DB session id before the turn so we
-            # can detect a compression-driven session rotation afterwards. The
-            # ACP `session_id` stays the stable client handle; agent.session_id
-            # is the live internal head that compression may rotate.
-            pre_turn_hermes_id = getattr(state.agent, "session_id", None)
-            # Wrap the executor call in a fresh copy of the current context so
-            # concurrent ACP sessions on the shared ThreadPoolExecutor don't
-            # stomp on each other's ContextVar writes (HERMES_SESSION_KEY in
-            # particular — used by the interactive sudo password cache scope).
-            ctx = contextvars.copy_context()
-            turn_start_ts = time.time()
-            result = await loop.run_in_executor(_executor, ctx.run, _run_agent)
-        except Exception:
-            logger.exception("Executor error for session %s", session_id)
-            async with state.turn_terminal_lock:
-                executor_cancelled = bool(
-                    state.turn_terminal_winner == "cancelled"
-                    or (
-                        state.cancel_event
-                        and state.cancel_event.is_set()
+        while True:
+            streamed_message = False
+            turn_history_baseline_count = len(state.history)
+            should_continue_goal = False
+            next_turn_text: str | None = None
+
+            try:
+                # Snapshot the internal Hermes DB session id before the turn so we
+                # can detect a compression-driven session rotation afterwards. The
+                # ACP `session_id` stays the stable client handle; agent.session_id
+                # is the live internal head that compression may rotate.
+                pre_turn_hermes_id = getattr(state.agent, "session_id", None)
+                # Wrap the executor call in a fresh copy of the current context so
+                # concurrent ACP sessions on the shared ThreadPoolExecutor don't
+                # stomp on each other's ContextVar writes (HERMES_SESSION_KEY in
+                # particular — used by the interactive sudo password cache scope).
+                ctx = contextvars.copy_context()
+                turn_start_ts = time.time()
+                result = await loop.run_in_executor(
+                    _executor, ctx.run, _run_agent, user_content, (user_text or "[Image attachment]"),
+                )
+            except Exception:
+                logger.exception("Executor error for session %s", session_id)
+                async with state.turn_terminal_lock:
+                    executor_cancelled = bool(
+                        state.turn_terminal_winner == "cancelled"
+                        or (
+                            state.cancel_event
+                            and state.cancel_event.is_set()
+                        )
                     )
+                    state.turn_terminal_winner = (
+                        "cancelled" if executor_cancelled else "refusal"
+                    )
+                with state.runtime_lock:
+                    state.is_running = False
+                    state.current_prompt_text = ""
+                if conn:
+                    flush_open_tool_calls(conn, session_id, loop, tool_call_ids, tool_call_meta)
+                    for update in flush_async_background_dispatches(
+                        delegation_tool_calls, set(delegation_tool_calls)
+                    ):
+                        await conn.session_update(session_id, update)
+                # HOLE 2 (Phase 0 / stop-p0-brief.md): this path must drain
+                # queued_prompts exactly like every other return path below, so a
+                # prompt the user typed while the initial executor dispatch was
+                # crashing doesn't sit stuck forever.
+                await self._drain_queued_prompts(state, session_id, conn)
+                return PromptResponse(
+                    stop_reason="cancelled" if executor_cancelled else "end_turn"
                 )
-                state.turn_terminal_winner = (
-                    "cancelled" if executor_cancelled else "refusal"
-                )
-            with state.runtime_lock:
-                state.is_running = False
-                state.current_prompt_text = ""
-            if conn:
-                flush_open_tool_calls(conn, session_id, loop, tool_call_ids, tool_call_meta)
-                for update in flush_async_background_dispatches(
-                    delegation_tool_calls, set(delegation_tool_calls)
-                ):
-                    await conn.session_update(session_id, update)
-            # HOLE 2 (Phase 0 / stop-p0-brief.md): this path must drain
-            # queued_prompts exactly like every other return path below, so a
-            # prompt the user typed while the initial executor dispatch was
-            # crashing doesn't sit stuck forever.
-            await self._drain_queued_prompts(state, session_id, conn)
-            return PromptResponse(
-                stop_reason="cancelled" if executor_cancelled else "end_turn"
+
+            if result.get("messages"):
+                state.history = result["messages"]
+
+            joined_completed_ids: set[str] = set()
+            # Everything from the same-turn delegation barrier through delivering
+            # the final response is wrapped in this try/finally so a turn that
+            # cooperatively returns from the executor ALWAYS frees the session
+            # (`is_running=False`) and drains anything queued while it ran — on
+            # normal, cancelled, or errored exit. No path below may leave
+            # `is_running` True (Phase 0 / stop-p0-brief.md P0.1).
+            # Computed before the barrier (Phase 0 / stop-p0-brief.md P0.2): a
+            # turn that was cancelled must skip the join barrier entirely rather
+            # than re-running the agent with a "consolidate results" prompt the
+            # user never asked for.
+            cancelled_before_barrier = bool(
+                state.cancel_event and state.cancel_event.is_set()
             )
-
-        if result.get("messages"):
-            state.history = result["messages"]
-
-        joined_completed_ids: set[str] = set()
-        # Everything from the same-turn delegation barrier through delivering
-        # the final response is wrapped in this try/finally so a turn that
-        # cooperatively returns from the executor ALWAYS frees the session
-        # (`is_running=False`) and drains anything queued while it ran — on
-        # normal, cancelled, or errored exit. No path below may leave
-        # `is_running` True (Phase 0 / stop-p0-brief.md P0.1).
-        # Computed before the barrier (Phase 0 / stop-p0-brief.md P0.2): a
-        # turn that was cancelled must skip the join barrier entirely rather
-        # than re-running the agent with a "consolidate results" prompt the
-        # user never asked for.
-        cancelled_before_barrier = bool(
-            state.cancel_event and state.cancel_event.is_set()
-        )
-        try:
-            if cancelled_before_barrier:
-                try:
-                    from tools.async_delegation import interrupt_for_session
-
-                    interrupt_for_session(
-                        session_key=session_id, reason="user cancelled"
-                    )
-                except Exception:
-                    logger.exception(
-                        "Failed to interrupt async delegations for cancelled "
-                        "session %s",
-                        session_id,
-                    )
-            else:
-                try:
-                    from tools.async_delegation import join, running_for_session
-                    from tools.delegate_tool import _load_config
-                    from tools.process_registry import (
-                        format_process_notification,
-                        process_registry,
-                    )
-                    from utils import is_truthy_value
-
-                    delegation_config = _load_config()
-                    join_enabled = is_truthy_value(
-                        delegation_config.get("acp_join_same_turn"), default=True
-                    )
+            try:
+                if cancelled_before_barrier:
                     try:
-                        max_join_rounds = max(
-                            0, int(delegation_config.get("acp_join_max_rounds", 3))
-                        )
-                    except (TypeError, ValueError):
-                        max_join_rounds = 3
-                    try:
-                        join_timeout = max(
-                            0.0,
-                            float(
-                                delegation_config.get(
-                                    "acp_join_timeout_seconds", 180
-                                )
-                            ),
-                        )
-                    except (TypeError, ValueError):
-                        join_timeout = 180.0
+                        from tools.async_delegation import interrupt_for_session
 
-                    def _cancelled() -> bool:
-                        return bool(
-                            state.cancel_event and state.cancel_event.is_set()
+                        interrupt_for_session(
+                            session_key=session_id, reason="user cancelled"
                         )
-
-                    def _interrupt_cancelled_subagents(where: str) -> None:
-                        try:
-                            from tools.async_delegation import (
-                                interrupt_for_session,
-                            )
-
-                            interrupt_for_session(
-                                session_key=session_id, reason="user cancelled"
-                            )
-                        except Exception:
-                            logger.exception(
-                                "Failed to interrupt async delegations for "
-                                "session %s cancelled %s",
-                                session_id,
-                                where,
-                            )
-
-                    pending = (
-                        running_for_session(session_id, turn_start_ts)
-                        if join_enabled
-                        else []
-                    )
-                    pending_note_added = False
-                    for _round in range(max_join_rounds):
-                        if not pending:
-                            # Nothing left to join. Still interrupt if STOP
-                            # landed exactly as the last round's pending list
-                            # emptied out, so a race here can't leave a
-                            # subagent running unattended past cancellation
-                            # (Phase 0 / stop-p0-brief.md HOLE 1).
-                            if _cancelled():
-                                _interrupt_cancelled_subagents("with nothing pending")
-                            break
-                        # Re-check at the TOP of each round: STOP can land while
-                        # we're waiting on join() below, or during the
-                        # continuation re-run's executor call. Abort the
-                        # barrier loop rather than keep consolidating a turn
-                        # the user already cancelled.
-                        if _cancelled():
-                            _interrupt_cancelled_subagents("mid-join")
-                            break
-                        delegation_ids = [
-                            str(record.get("delegation_id") or "")
-                            for record in pending
-                            if record.get("delegation_id")
-                        ]
-                        joined = await loop.run_in_executor(
-                            _executor, join, delegation_ids, join_timeout
-                        )
-                        # Re-check IMMEDIATELY after join() returns: STOP can
-                        # land while this coroutine was blocked waiting on the
-                        # executor, before any of the completed delegations'
-                        # results are consolidated into a continuation turn
-                        # (Phase 0 / stop-p0-brief.md HOLE 1, checkpoint a).
-                        if _cancelled():
-                            _interrupt_cancelled_subagents("right after join() returned")
-                            break
-                        joined_completed_ids.update(
-                            str(delegation_id)
-                            for delegation_id in joined.get("completed") or []
-                        )
-                        completed_events = self._drain_session_delegation_completions(
-                            process_registry,
-                            format_process_notification,
+                    except Exception:
+                        logger.exception(
+                            "Failed to interrupt async delegations for cancelled "
+                            "session %s",
                             session_id,
-                            state,
                         )
-                        for event in completed_events:
-                            delegation_id = str(event.get("delegation_id") or "")
-                            tool_call_id = delegation_tool_calls.pop(
-                                delegation_id, None
+                else:
+                    try:
+                        from tools.async_delegation import join, running_for_session
+                        from tools.delegate_tool import _load_config
+                        from tools.process_registry import (
+                            format_process_notification,
+                            process_registry,
+                        )
+                        from utils import is_truthy_value
+
+                        delegation_config = _load_config()
+                        join_enabled = is_truthy_value(
+                            delegation_config.get("acp_join_same_turn"), default=True
+                        )
+                        try:
+                            max_join_rounds = max(
+                                0, int(delegation_config.get("acp_join_max_rounds", 3))
                             )
-                            if conn and tool_call_id:
-                                formatted_result = format_process_notification(event) or str(
-                                    event.get("summary") or event.get("error") or ""
+                        except (TypeError, ValueError):
+                            max_join_rounds = 3
+                        try:
+                            join_timeout = max(
+                                0.0,
+                                float(
+                                    delegation_config.get(
+                                        "acp_join_timeout_seconds", 180
+                                    )
+                                ),
+                            )
+                        except (TypeError, ValueError):
+                            join_timeout = 180.0
+
+                        def _cancelled() -> bool:
+                            return bool(
+                                state.cancel_event and state.cancel_event.is_set()
+                            )
+
+                        def _interrupt_cancelled_subagents(where: str) -> None:
+                            try:
+                                from tools.async_delegation import (
+                                    interrupt_for_session,
                                 )
-                                await conn.session_update(
+
+                                interrupt_for_session(
+                                    session_key=session_id, reason="user cancelled"
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "Failed to interrupt async delegations for "
+                                    "session %s cancelled %s",
                                     session_id,
-                                    build_async_background_completion(
-                                        tool_call_id, event, formatted_result
-                                    ),
+                                    where,
                                 )
-                        if joined.get("pending"):
+
+                        pending = (
+                            running_for_session(session_id, turn_start_ts)
+                            if join_enabled
+                            else []
+                        )
+                        pending_note_added = False
+                        for _round in range(max_join_rounds):
+                            if not pending:
+                                # Nothing left to join. Still interrupt if STOP
+                                # landed exactly as the last round's pending list
+                                # emptied out, so a race here can't leave a
+                                # subagent running unattended past cancellation
+                                # (Phase 0 / stop-p0-brief.md HOLE 1).
+                                if _cancelled():
+                                    _interrupt_cancelled_subagents("with nothing pending")
+                                break
+                            # Re-check at the TOP of each round: STOP can land while
+                            # we're waiting on join() below, or during the
+                            # continuation re-run's executor call. Abort the
+                            # barrier loop rather than keep consolidating a turn
+                            # the user already cancelled.
+                            if _cancelled():
+                                _interrupt_cancelled_subagents("mid-join")
+                                break
+                            delegation_ids = [
+                                str(record.get("delegation_id") or "")
+                                for record in pending
+                                if record.get("delegation_id")
+                            ]
+                            joined = await loop.run_in_executor(
+                                _executor, join, delegation_ids, join_timeout
+                            )
+                            # Re-check IMMEDIATELY after join() returns: STOP can
+                            # land while this coroutine was blocked waiting on the
+                            # executor, before any of the completed delegations'
+                            # results are consolidated into a continuation turn
+                            # (Phase 0 / stop-p0-brief.md HOLE 1, checkpoint a).
+                            if _cancelled():
+                                _interrupt_cancelled_subagents("right after join() returned")
+                                break
+                            joined_completed_ids.update(
+                                str(delegation_id)
+                                for delegation_id in joined.get("completed") or []
+                            )
+                            completed_events = self._drain_session_delegation_completions(
+                                process_registry,
+                                format_process_notification,
+                                session_id,
+                                state,
+                            )
+                            for event in completed_events:
+                                delegation_id = str(event.get("delegation_id") or "")
+                                tool_call_id = delegation_tool_calls.pop(
+                                    delegation_id, None
+                                )
+                                if conn and tool_call_id:
+                                    formatted_result = format_process_notification(event) or str(
+                                        event.get("summary") or event.get("error") or ""
+                                    )
+                                    await conn.session_update(
+                                        session_id,
+                                        build_async_background_completion(
+                                            tool_call_id, event, formatted_result
+                                        ),
+                                    )
+                            if joined.get("pending"):
+                                state.history.append(
+                                    {
+                                        "role": "user",
+                                        "content": (
+                                            "Background subagent(s) still running; results "
+                                            "will arrive shortly."
+                                        ),
+                                    }
+                                )
+                                pending_note_added = True
+                                break
+                            if not completed_events:
+                                break
+
+                            # Re-check IMMEDIATELY BEFORE dispatching the
+                            # continuation: STOP can land during the completion
+                            # drain/notification work above, between join()
+                            # returning and this dispatch (Phase 0 /
+                            # stop-p0-brief.md HOLE 1, checkpoint b).
+                            if _cancelled():
+                                _interrupt_cancelled_subagents(
+                                    "right before the continuation dispatch"
+                                )
+                                break
+
+                            continuation = (
+                                "Your background subagent(s) have completed; their results "
+                                "are above. Incorporate them and give your consolidated "
+                                "final answer."
+                            )
+                            continuation_ctx = contextvars.copy_context()
+                            result = await loop.run_in_executor(
+                                _executor,
+                                continuation_ctx.run,
+                                _run_agent,
+                                continuation,
+                                continuation,
+                            )
+                            if result.get("messages"):
+                                state.history = result["messages"]
+                            pending = running_for_session(session_id, turn_start_ts)
+
+                        if pending and not pending_note_added:
                             state.history.append(
                                 {
                                     "role": "user",
                                     "content": (
-                                        "Background subagent(s) still running; results "
-                                        "will arrive shortly."
+                                        "Background subagent(s) still running; results will "
+                                        "arrive shortly."
                                     ),
                                 }
                             )
-                            pending_note_added = True
-                            break
-                        if not completed_events:
-                            break
-
-                        # Re-check IMMEDIATELY BEFORE dispatching the
-                        # continuation: STOP can land during the completion
-                        # drain/notification work above, between join()
-                        # returning and this dispatch (Phase 0 /
-                        # stop-p0-brief.md HOLE 1, checkpoint b).
-                        if _cancelled():
-                            _interrupt_cancelled_subagents(
-                                "right before the continuation dispatch"
-                            )
-                            break
-
-                        continuation = (
-                            "Your background subagent(s) have completed; their results "
-                            "are above. Incorporate them and give your consolidated "
-                            "final answer."
+                    except Exception:
+                        logger.exception(
+                            "ACP same-turn delegation join failed for session %s", session_id
                         )
-                        continuation_ctx = contextvars.copy_context()
-                        result = await loop.run_in_executor(
-                            _executor,
-                            continuation_ctx.run,
-                            _run_agent,
-                            continuation,
-                            continuation,
-                        )
-                        if result.get("messages"):
-                            state.history = result["messages"]
-                        pending = running_for_session(session_id, turn_start_ts)
 
-                    if pending and not pending_note_added:
-                        state.history.append(
-                            {
-                                "role": "user",
-                                "content": (
-                                    "Background subagent(s) still running; results will "
-                                    "arrive shortly."
-                                ),
-                            }
-                        )
-                except Exception:
-                    logger.exception(
-                        "ACP same-turn delegation join failed for session %s", session_id
-                    )
+                missing_result_ids = {
+                    delegation_id
+                    for delegation_id in joined_completed_ids
+                    if delegation_id in delegation_tool_calls
+                }
 
-            missing_result_ids = {
-                delegation_id
-                for delegation_id in joined_completed_ids
-                if delegation_id in delegation_tool_calls
-            }
-
-            # The turn is over: close any tool calls whose completion never made it
-            # through the name-keyed FIFO pairing (long-turn steering/compression
-            # drift), so clients never keep stuck in-progress items past end_turn.
-            if conn:
-                flush_open_tool_calls(conn, session_id, loop, tool_call_ids, tool_call_meta)
-                for update in flush_async_background_dispatches(
-                    delegation_tool_calls, missing_result_ids
-                ):
-                    await conn.session_update(session_id, update)
-
-            # Detect a compression-driven internal session rotation. If the agent's
-            # DB head moved during the turn, emit a session_info_update carrying
-            # _meta.hermes.sessionProvenance so ACP clients can render the boundary
-            # and keep old/new ids in lineage. The ACP session_id is unchanged.
-            post_turn_hermes_id = getattr(state.agent, "session_id", None)
-            if (
-                conn
-                and post_turn_hermes_id
-                and pre_turn_hermes_id
-                and post_turn_hermes_id != pre_turn_hermes_id
-            ):
-                try:
-                    await self._send_session_info_update(
-                        session_id,
-                        current_hermes_session_id=post_turn_hermes_id,
-                        previous_hermes_session_id=pre_turn_hermes_id,
-                    )
-                except Exception:
-                    logger.debug(
-                        "Could not emit ACP provenance update after rotation for %s",
-                        session_id,
-                        exc_info=True,
-                    )
-
-            final_response = str(result.get("final_response") or "")
-            cancelled = False
-            interrupted = bool(result.get("interrupted"))
-            required_failure_code = result.get("error")
-            required_observation_failed = required_failure_code in {
-                "required_delegation_observation_failed",
-                "required_delegation_observation_persistence_failed",
-            }
-            # Every "give up" exit in conversation_loop.py's retry/fallback
-            # ladder (max API retries, billing wall, thinking timeout, ...)
-            # sets failed=True and stuffs a human-readable explanation into
-            # final_response. Delivering that as ordinary assistant prose
-            # makes a provider outage indistinguishable from a real answer;
-            # route it through a genuine JSON-RPC error instead (raised at
-            # the end of this try body) so the gateway's existing error feed
-            # path renders it distinctly. required_observation_failed keeps
-            # its own dedicated async-delegation handling.
-            provider_call_failed = (
-                bool(result.get("failed")) and not required_observation_failed
-            )
-            history_rewrite_failed = (
-                required_failure_code
-                == "required_delegation_observation_persistence_failed"
-            )
-            if required_observation_failed:
-                # Treat the error flag as authoritative even if a malformed
-                # internal result also carried candidate prose.
-                result["final_response"] = ""
-                final_response = ""
-                state.history = _sanitize_failed_turn_history(
-                    result.get("messages") or state.history,
-                    baseline_count=turn_history_baseline_count,
-                )
-                result["messages"] = state.history
-                if "history_rewrite_succeeded" not in result:
-                    history_rewrite_succeeded = await asyncio.to_thread(
-                        _rewrite_agent_active_history,
-                        state.agent,
-                        state.history,
-                        state,
-                        self.session_manager,
-                    )
-                    history_rewrite_failed = not history_rewrite_succeeded
-                poison_marker_failed = (
-                    state.transcript_correction_poisoned
-                    and state.transcript_correction_poison_persisted is False
-                )
-                if poison_marker_failed:
-                    required_error_text = (
-                        "Hermes could not durably correct the cancelled turn "
-                        "or record its transcript safety marker. No final "
-                        "answer was produced; do not resume this session "
-                        "because stale candidate replay cannot be ruled out."
-                    )
-                elif history_rewrite_failed:
-                    required_error_text = (
-                        "Hermes could not durably correct the cancelled turn. "
-                        "No final answer was produced; this session is blocked "
-                        "from resume until its transcript is repaired."
-                    )
-                else:
-                    required_error_text = (
-                        "Hermes could not safely persist the required child "
-                        "result. No final answer was produced; the child work "
-                        "was cancelled to keep this turn consistent."
-                    )
-                logger.error(
-                    "ACP required-delegation observation failed for session %s",
-                    session_id,
-                )
+                # The turn is over: close any tool calls whose completion never made it
+                # through the name-keyed FIFO pairing (long-turn steering/compression
+                # drift), so clients never keep stuck in-progress items past end_turn.
                 if conn:
+                    flush_open_tool_calls(conn, session_id, loop, tool_call_ids, tool_call_meta)
+                    for update in flush_async_background_dispatches(
+                        delegation_tool_calls, missing_result_ids
+                    ):
+                        await conn.session_update(session_id, update)
+
+                # Detect a compression-driven internal session rotation. If the agent's
+                # DB head moved during the turn, emit a session_info_update carrying
+                # _meta.hermes.sessionProvenance so ACP clients can render the boundary
+                # and keep old/new ids in lineage. The ACP session_id is unchanged.
+                post_turn_hermes_id = getattr(state.agent, "session_id", None)
+                if (
+                    conn
+                    and post_turn_hermes_id
+                    and pre_turn_hermes_id
+                    and post_turn_hermes_id != pre_turn_hermes_id
+                ):
+                    try:
+                        await self._send_session_info_update(
+                            session_id,
+                            current_hermes_session_id=post_turn_hermes_id,
+                            previous_hermes_session_id=pre_turn_hermes_id,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Could not emit ACP provenance update after rotation for %s",
+                            session_id,
+                            exc_info=True,
+                        )
+
+                final_response = str(result.get("final_response") or "")
+                cancelled = False
+                interrupted = bool(result.get("interrupted"))
+                required_failure_code = result.get("error")
+                required_observation_failed = required_failure_code in {
+                    "required_delegation_observation_failed",
+                    "required_delegation_observation_persistence_failed",
+                }
+                # Every "give up" exit in conversation_loop.py's retry/fallback
+                # ladder (max API retries, billing wall, thinking timeout, ...)
+                # sets failed=True and stuffs a human-readable explanation into
+                # final_response. Delivering that as ordinary assistant prose
+                # makes a provider outage indistinguishable from a real answer;
+                # route it through a genuine JSON-RPC error instead (raised at
+                # the end of this try body) so the gateway's existing error feed
+                # path renders it distinctly. required_observation_failed keeps
+                # its own dedicated async-delegation handling.
+                provider_call_failed = (
+                    bool(result.get("failed")) and not required_observation_failed
+                )
+                history_rewrite_failed = (
+                    required_failure_code
+                    == "required_delegation_observation_persistence_failed"
+                )
+                if required_observation_failed:
+                    # Treat the error flag as authoritative even if a malformed
+                    # internal result also carried candidate prose.
+                    result["final_response"] = ""
+                    final_response = ""
+                    state.history = _sanitize_failed_turn_history(
+                        result.get("messages") or state.history,
+                        baseline_count=turn_history_baseline_count,
+                    )
+                    result["messages"] = state.history
+                    if "history_rewrite_succeeded" not in result:
+                        history_rewrite_succeeded = await asyncio.to_thread(
+                            _rewrite_agent_active_history,
+                            state.agent,
+                            state.history,
+                            state,
+                            self.session_manager,
+                        )
+                        history_rewrite_failed = not history_rewrite_succeeded
+                    poison_marker_failed = (
+                        state.transcript_correction_poisoned
+                        and state.transcript_correction_poison_persisted is False
+                    )
+                    if poison_marker_failed:
+                        required_error_text = (
+                            "Hermes could not durably correct the cancelled turn "
+                            "or record its transcript safety marker. No final "
+                            "answer was produced; do not resume this session "
+                            "because stale candidate replay cannot be ruled out."
+                        )
+                    elif history_rewrite_failed:
+                        required_error_text = (
+                            "Hermes could not durably correct the cancelled turn. "
+                            "No final answer was produced; this session is blocked "
+                            "from resume until its transcript is repaired."
+                        )
+                    else:
+                        required_error_text = (
+                            "Hermes could not safely persist the required child "
+                            "result. No final answer was produced; the child work "
+                            "was cancelled to keep this turn consistent."
+                        )
+                    logger.error(
+                        "ACP required-delegation observation failed for session %s",
+                        session_id,
+                    )
+                    if conn:
+                        try:
+                            from acp_adapter.tools import (
+                                _text as _tool_text,
+                                make_tool_call_id,
+                            )
+
+                            failure_call_id = make_tool_call_id()
+                            await conn.session_update(
+                                session_id,
+                                acp.start_tool_call(
+                                    failure_call_id,
+                                    "required delegation observation",
+                                    kind="execute",
+                                    raw_input={
+                                        "tool": "delegation_wait",
+                                        "arguments": {
+                                            "status": (
+                                                "persistence_failed"
+                                                if history_rewrite_failed
+                                                else "observation_failed"
+                                            ),
+                                        },
+                                    },
+                                ),
+                            )
+                            await conn.session_update(
+                                session_id,
+                                acp.update_tool_call(
+                                    failure_call_id,
+                                    kind="execute",
+                                    status="failed",
+                                    content=[_tool_text(required_error_text)],
+                                ),
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Could not emit ACP required-delegation failure "
+                                "for session %s",
+                                session_id,
+                            )
+                    # Emit/log the structured failure before abandoning the old
+                    # owner. The next user turn must not inherit or strand a
+                    # process-local record tied to this turn id.
+                    try:
+                        from tools.async_delegation import stop_required_for_agent
+
+                        stop_required_for_agent(
+                            state.agent,
+                            reason=(
+                                "required child result could not be persisted "
+                                "atomically"
+                            ),
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Could not abandon failed required delegation for "
+                            "session %s",
+                            session_id,
+                        )
+                    state.agent._required_delegation_launching = False
+                    state.agent._required_observation_failed = False
+                    try:
+                        state.agent._finish_acp_provisional_stream(discard=True)
+                    except Exception:
+                        logger.debug(
+                            "Required failure provisional cleanup failed",
+                            exc_info=True,
+                        )
+                # Hermes' local "waiting for model response" interrupt status is metadata,
+                # not assistant prose — clients get cancellation from stop_reason instead.
+                from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
+
+                # Final delivery, durable history, and STOP share one per-session
+                # terminal claim. Once final owns this lock, cancel() waits and
+                # observes the committed winner instead of changing an already
+                # delivered answer into a cancelled turn.
+                async with state.turn_terminal_lock:
+                    event_cancelled = bool(
+                        state.cancel_event
+                        and state.cancel_event.is_set()
+                    )
+                    if (
+                        state.turn_terminal_winner == "cancelled"
+                        or (
+                            state.turn_terminal_winner != "final"
+                            and event_cancelled
+                        )
+                    ):
+                        state.turn_terminal_winner = "cancelled"
+                        cancelled = True
+                        interrupted = True
+                        result["final_response"] = ""
+                        final_response = ""
+                        state.history = _sanitize_failed_turn_history(
+                            result.get("messages") or state.history,
+                            baseline_count=turn_history_baseline_count,
+                        )
+                        result["messages"] = state.history
+                        history_rewrite_succeeded = await asyncio.to_thread(
+                            _rewrite_agent_active_history,
+                            state.agent,
+                            state.history,
+                            state,
+                            self.session_manager,
+                        )
+                        history_rewrite_failed = not history_rewrite_succeeded
+                        try:
+                            state.agent._finish_acp_provisional_stream(
+                                discard=True
+                            )
+                        except Exception:
+                            logger.debug(
+                                "Cancelled ACP provisional cleanup failed",
+                                exc_info=True,
+                            )
+                    elif required_observation_failed:
+                        state.turn_terminal_winner = "refusal"
+                    elif provider_call_failed:
+                        state.turn_terminal_winner = "provider_error"
+                        # Same failed-turn history semantics as a cancelled turn:
+                        # strip the fabricated failure-text assistant candidate so
+                        # it neither reaches the model as genuine prior context on
+                        # the next turn nor replays as an ordinary answer after a
+                        # session reload. final_response is intentionally kept —
+                        # it becomes the JSON-RPC error message below.
+                        state.history = _sanitize_failed_turn_history(
+                            result.get("messages") or state.history,
+                            baseline_count=turn_history_baseline_count,
+                        )
+                        result["messages"] = state.history
+                        history_rewrite_succeeded = await asyncio.to_thread(
+                            _rewrite_agent_active_history,
+                            state.agent,
+                            state.history,
+                            state,
+                            self.session_manager,
+                        )
+                        history_rewrite_failed = not history_rewrite_succeeded
+                        try:
+                            state.agent._finish_acp_provisional_stream(
+                                discard=True
+                            )
+                        except Exception:
+                            logger.debug(
+                                "provider_error provisional cleanup failed",
+                                exc_info=True,
+                            )
+                    else:
+                        state.turn_terminal_winner = "final"
+
+                    suppress_interrupt_response = (
+                        interrupted
+                        and final_response.startswith(
+                            INTERRUPT_WAITING_FOR_MODEL_PREFIX
+                        )
+                    )
+                    if result.get("messages"):
+                        # Persist only after the terminal winner sanitizes the
+                        # turn, and keep the commit serialized with final delivery.
+                        self.session_manager.save_session(session_id)
+                    if (
+                        state.turn_terminal_winner == "final"
+                        and final_response
+                        and conn
+                        and not suppress_interrupt_response
+                        and (
+                            not streamed_message
+                            or result.get("response_transformed")
+                        )
+                    ):
+                        # Deliver the final response when streaming did not already
+                        # send it, or when a plugin transformed it afterwards.
+                        update = acp.update_agent_message_text(final_response)
+                        await conn.session_update(session_id, update)
+
+                    terminal_winner = state.turn_terminal_winner
+
+                if (
+                    history_rewrite_failed
+                    and not required_observation_failed
+                    and conn
+                ):
                     try:
                         from acp_adapter.tools import (
                             _text as _tool_text,
@@ -2659,21 +2857,32 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                         )
 
                         failure_call_id = make_tool_call_id()
+                        if (
+                            state.transcript_correction_poisoned
+                            and state.transcript_correction_poison_persisted
+                            is False
+                        ):
+                            failure_text = (
+                                "Hermes cancelled this turn but could not durably "
+                                "remove the rejected assistant candidate or record "
+                                "its transcript safety marker. Do not resume this "
+                                "session because stale replay cannot be ruled out."
+                            )
+                        else:
+                            failure_text = (
+                                "Hermes cancelled this turn but could not durably "
+                                "remove the rejected assistant candidate. No final "
+                                "answer was delivered; this session is blocked "
+                                "from resume until its transcript is repaired."
+                            )
                         await conn.session_update(
                             session_id,
                             acp.start_tool_call(
                                 failure_call_id,
-                                "required delegation observation",
+                                "turn history correction",
                                 kind="execute",
                                 raw_input={
-                                    "tool": "delegation_wait",
-                                    "arguments": {
-                                        "status": (
-                                            "persistence_failed"
-                                            if history_rewrite_failed
-                                            else "observation_failed"
-                                        ),
-                                    },
+                                    "status": "persistence_failed",
                                 },
                             ),
                         )
@@ -2683,290 +2892,221 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                                 failure_call_id,
                                 kind="execute",
                                 status="failed",
-                                content=[_tool_text(required_error_text)],
+                                content=[_tool_text(failure_text)],
                             ),
                         )
                     except Exception:
                         logger.exception(
-                            "Could not emit ACP required-delegation failure "
+                            "Could not emit ACP transcript-correction failure "
                             "for session %s",
                             session_id,
                         )
-                # Emit/log the structured failure before abandoning the old
-                # owner. The next user turn must not inherit or strand a
-                # process-local record tied to this turn id.
-                try:
-                    from tools.async_delegation import stop_required_for_agent
 
-                    stop_required_for_agent(
-                        state.agent,
-                        reason=(
-                            "required child result could not be persisted "
-                            "atomically"
-                        ),
-                    )
-                except Exception:
-                    logger.exception(
-                        "Could not abandon failed required delegation for "
-                        "session %s",
-                        session_id,
-                    )
-                state.agent._required_delegation_launching = False
-                state.agent._required_observation_failed = False
-                try:
-                    state.agent._finish_acp_provisional_stream(discard=True)
-                except Exception:
-                    logger.debug(
-                        "Required failure provisional cleanup failed",
-                        exc_info=True,
-                    )
-            # Hermes' local "waiting for model response" interrupt status is metadata,
-            # not assistant prose — clients get cancellation from stop_reason instead.
-            from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
-
-            # Final delivery, durable history, and STOP share one per-session
-            # terminal claim. Once final owns this lock, cancel() waits and
-            # observes the committed winner instead of changing an already
-            # delivered answer into a cancelled turn.
-            async with state.turn_terminal_lock:
-                event_cancelled = bool(
-                    state.cancel_event
-                    and state.cancel_event.is_set()
-                )
                 if (
-                    state.turn_terminal_winner == "cancelled"
-                    or (
-                        state.turn_terminal_winner != "final"
-                        and event_cancelled
-                    )
-                ):
-                    state.turn_terminal_winner = "cancelled"
-                    cancelled = True
-                    interrupted = True
-                    result["final_response"] = ""
-                    final_response = ""
-                    state.history = _sanitize_failed_turn_history(
-                        result.get("messages") or state.history,
-                        baseline_count=turn_history_baseline_count,
-                    )
-                    result["messages"] = state.history
-                    history_rewrite_succeeded = await asyncio.to_thread(
-                        _rewrite_agent_active_history,
-                        state.agent,
-                        state.history,
-                        state,
-                        self.session_manager,
-                    )
-                    history_rewrite_failed = not history_rewrite_succeeded
-                    try:
-                        state.agent._finish_acp_provisional_stream(
-                            discard=True
-                        )
-                    except Exception:
-                        logger.debug(
-                            "Cancelled ACP provisional cleanup failed",
-                            exc_info=True,
-                        )
-                elif required_observation_failed:
-                    state.turn_terminal_winner = "refusal"
-                elif provider_call_failed:
-                    state.turn_terminal_winner = "provider_error"
-                    # Same failed-turn history semantics as a cancelled turn:
-                    # strip the fabricated failure-text assistant candidate so
-                    # it neither reaches the model as genuine prior context on
-                    # the next turn nor replays as an ordinary answer after a
-                    # session reload. final_response is intentionally kept —
-                    # it becomes the JSON-RPC error message below.
-                    state.history = _sanitize_failed_turn_history(
-                        result.get("messages") or state.history,
-                        baseline_count=turn_history_baseline_count,
-                    )
-                    result["messages"] = state.history
-                    history_rewrite_succeeded = await asyncio.to_thread(
-                        _rewrite_agent_active_history,
-                        state.agent,
-                        state.history,
-                        state,
-                        self.session_manager,
-                    )
-                    history_rewrite_failed = not history_rewrite_succeeded
-                    try:
-                        state.agent._finish_acp_provisional_stream(
-                            discard=True
-                        )
-                    except Exception:
-                        logger.debug(
-                            "provider_error provisional cleanup failed",
-                            exc_info=True,
-                        )
-                else:
-                    state.turn_terminal_winner = "final"
-
-                suppress_interrupt_response = (
-                    interrupted
-                    and final_response.startswith(
-                        INTERRUPT_WAITING_FOR_MODEL_PREFIX
-                    )
-                )
-                if result.get("messages"):
-                    # Persist only after the terminal winner sanitizes the
-                    # turn, and keep the commit serialized with final delivery.
-                    self.session_manager.save_session(session_id)
-                if (
-                    state.turn_terminal_winner == "final"
+                    terminal_winner == "final"
                     and final_response
-                    and conn
                     and not suppress_interrupt_response
-                    and (
-                        not streamed_message
-                        or result.get("response_transformed")
-                    )
                 ):
-                    # Deliver the final response when streaming did not already
-                    # send it, or when a plugin transformed it afterwards.
-                    update = acp.update_agent_message_text(final_response)
-                    await conn.session_update(session_id, update)
+                    try:
+                        from agent.title_generator import maybe_auto_title
 
-                terminal_winner = state.turn_terminal_winner
+                        def _notify_title_update(_title: str) -> None:
+                            if conn:
+                                loop.call_soon_threadsafe(
+                                    asyncio.create_task,
+                                    self._send_session_info_update(session_id),
+                                )
 
-            if (
-                history_rewrite_failed
-                and not required_observation_failed
-                and conn
-            ):
-                try:
-                    from acp_adapter.tools import (
-                        _text as _tool_text,
-                        make_tool_call_id,
-                    )
-
-                    failure_call_id = make_tool_call_id()
-                    if (
-                        state.transcript_correction_poisoned
-                        and state.transcript_correction_poison_persisted
-                        is False
-                    ):
-                        failure_text = (
-                            "Hermes cancelled this turn but could not durably "
-                            "remove the rejected assistant candidate or record "
-                            "its transcript safety marker. Do not resume this "
-                            "session because stale replay cannot be ruled out."
-                        )
-                    else:
-                        failure_text = (
-                            "Hermes cancelled this turn but could not durably "
-                            "remove the rejected assistant candidate. No final "
-                            "answer was delivered; this session is blocked "
-                            "from resume until its transcript is repaired."
-                        )
-                    await conn.session_update(
-                        session_id,
-                        acp.start_tool_call(
-                            failure_call_id,
-                            "turn history correction",
-                            kind="execute",
-                            raw_input={
-                                "status": "persistence_failed",
+                        # Snapshot the runtime identity; the validator lets the
+                        # background titler skip its LLM call if the session's model
+                        # changed before it fires (#19027).
+                        _title_model = getattr(state.agent, "model", None)
+                        _title_provider = getattr(state.agent, "provider", None)
+                        maybe_auto_title(
+                            self.session_manager._get_db(),
+                            session_id,
+                            user_text,
+                            final_response,
+                            state.history,
+                            main_runtime={
+                                "model": getattr(state.agent, "model", None),
+                                "provider": getattr(state.agent, "provider", None),
+                                "base_url": getattr(state.agent, "base_url", None),
+                                "api_key": getattr(state.agent, "api_key", None),
+                                "api_mode": getattr(state.agent, "api_mode", None),
                             },
-                        ),
-                    )
-                    await conn.session_update(
-                        session_id,
-                        acp.update_tool_call(
-                            failure_call_id,
-                            kind="execute",
-                            status="failed",
-                            content=[_tool_text(failure_text)],
-                        ),
-                    )
-                except Exception:
-                    logger.exception(
-                        "Could not emit ACP transcript-correction failure "
-                        "for session %s",
-                        session_id,
-                    )
+                            runtime_validator=lambda: (
+                                getattr(state.agent, "model", None) == _title_model
+                                and getattr(state.agent, "provider", None) == _title_provider
+                            ),
+                            title_callback=_notify_title_update,
+                        )
+                    except Exception:
+                        logger.debug("Failed to auto-title ACP session %s", session_id, exc_info=True)
 
-            if (
-                terminal_winner == "final"
-                and final_response
-                and not suppress_interrupt_response
-            ):
-                try:
-                    from agent.title_generator import maybe_auto_title
-
-                    def _notify_title_update(_title: str) -> None:
-                        if conn:
-                            loop.call_soon_threadsafe(
-                                asyncio.create_task,
-                                self._send_session_info_update(session_id),
-                            )
-
-                    # Snapshot the runtime identity; the validator lets the
-                    # background titler skip its LLM call if the session's model
-                    # changed before it fires (#19027).
-                    _title_model = getattr(state.agent, "model", None)
-                    _title_provider = getattr(state.agent, "provider", None)
-                    maybe_auto_title(
-                        self.session_manager._get_db(),
-                        session_id,
-                        user_text,
-                        final_response,
-                        state.history,
-                        main_runtime={
-                            "model": getattr(state.agent, "model", None),
-                            "provider": getattr(state.agent, "provider", None),
-                            "base_url": getattr(state.agent, "base_url", None),
-                            "api_key": getattr(state.agent, "api_key", None),
-                            "api_mode": getattr(state.agent, "api_mode", None),
+                if terminal_winner == "provider_error":
+                    # End this session/prompt request with a JSON-RPC error so
+                    # clients render the failure distinctly instead of as chat.
+                    # The acp dispatcher converts this into an error response for
+                    # this request id without crashing the process or connection,
+                    # and the finally: below still resets is_running and drains
+                    # queued prompts, so the session is never left wedged.
+                    # Raised even when partial text already streamed (mirrors
+                    # cancelled-turn semantics: visible partial text + a terminal
+                    # marker); gating on streamed_message would resurrect the
+                    # silent-failure bug for every mid-stream provider drop.
+                    # The usage gauge is refreshed first because the normal
+                    # post-try update is skipped when this raise unwinds.
+                    await self._send_usage_update(state)
+                    raise acp.RequestError(
+                        -32001,
+                        final_response
+                        or "Hermes turn failed: the provider call did not succeed.",
+                        {
+                            "failureReason": result.get("failure_reason"),
+                            "billingBlock": result.get("billing_block"),
                         },
-                        runtime_validator=lambda: (
-                            getattr(state.agent, "model", None) == _title_model
-                            and getattr(state.agent, "provider", None) == _title_provider
-                        ),
-                        title_callback=_notify_title_update,
                     )
-                except Exception:
-                    logger.debug("Failed to auto-title ACP session %s", session_id, exc_info=True)
+                # Phase 3b: after a normal turn completion, let an active goal judge
+                # whether to keep going. This reuses GoalManager.evaluate_after_turn
+                # (hermes_cli/goals.py) exactly as the CLI/gateway do -- same budget
+                # accounting, gates, judge call, and notice wording -- so the loop
+                # itself is just: stream the decision's message, then either run
+                # another turn with its continuation_prompt or stop. Stop conditions
+                # are checked before AND after the (possibly slow) judge call, mirroring
+                # cli_loops_mixin._maybe_continue_goal_after_turn: a real user prompt
+                # already queued always wins over continuing, and a cancel that races
+                # in while the judge is deliberating must not start another turn.
+                if (
+                    terminal_winner == "final"
+                    and not cancelled
+                    and not required_observation_failed
+                    and final_response
+                    and not suppress_interrupt_response
+                ):
+                    if state.cancel_event and state.cancel_event.is_set():
+                        cancelled = True
+                    else:
+                        goal_mgr = _get_goal_manager(state)
+                        with state.runtime_lock:
+                            goal_queue_waiting = bool(state.queued_prompts)
+                        if goal_mgr.is_active() and not goal_queue_waiting:
+                            try:
+                                from hermes_cli.goals import gather_background_processes
 
-            if terminal_winner == "provider_error":
-                # End this session/prompt request with a JSON-RPC error so
-                # clients render the failure distinctly instead of as chat.
-                # The acp dispatcher converts this into an error response for
-                # this request id without crashing the process or connection,
-                # and the finally: below still resets is_running and drains
-                # queued prompts, so the session is never left wedged.
-                # Raised even when partial text already streamed (mirrors
-                # cancelled-turn semantics: visible partial text + a terminal
-                # marker); gating on streamed_message would resurrect the
-                # silent-failure bug for every mid-stream provider drop.
-                # The usage gauge is refreshed first because the normal
-                # post-try update is skipped when this raise unwinds.
-                await self._send_usage_update(state)
-                raise acp.RequestError(
-                    -32001,
-                    final_response
-                    or "Hermes turn failed: the provider call did not succeed.",
-                    {
-                        "failureReason": result.get("failure_reason"),
-                        "billingBlock": result.get("billing_block"),
-                    },
-                )
-        finally:
-            # Mark this turn idle before draining queued work so recursive prompt()
-            # calls can acquire the session. Queued turns are intentionally run as
-            # normal follow-up user prompts, preserving role alternation and history.
-            # This reset + the drain below MUST run no matter how the block above
-            # exits (success, caught error, or an uncaught exception) so a turn
-            # that cooperatively returned from the executor never leaves the
-            # session wedged with is_running=True and an undrained queue.
-            with state.runtime_lock:
-                state.is_running = False
-                state.current_prompt_text = ""
+                                goal_bg_procs = gather_background_processes()
+                            except Exception:
+                                goal_bg_procs = None
+                            # This turn's completion already committed
+                            # state.turn_terminal_winner = "final" above. Clear it
+                            # now, before the (possibly slow) judge call below, so
+                            # a real session/cancel racing in while the judge
+                            # deliberates isn't dropped by cancel()'s
+                            # finalized-session guard -- mirrors the fresh-turn
+                            # reset used when a new prompt() call claims an idle
+                            # session.
+                            async with state.turn_terminal_lock:
+                                state.turn_terminal_winner = None
+                            # judge_goal is a blocking HTTP call to the configured
+                            # auxiliary.goal_judge model (seconds, sometimes tens of
+                            # seconds) -- run it off the event loop like the main
+                            # turn above, not inline.
+                            try:
+                                goal_decision = await loop.run_in_executor(
+                                    _executor,
+                                    lambda: goal_mgr.evaluate_after_turn(
+                                        final_response,
+                                        user_initiated=True,
+                                        background_processes=goal_bg_procs,
+                                    ),
+                                )
+                            except Exception as exc:
+                                # A judge/evaluate crash (bad judge model config,
+                                # transport bug, ...) must not take the whole ACP
+                                # turn down with it -- pause the goal so the user
+                                # sees why and can /goal resume, same as any other
+                                # judge failure mode above.
+                                logger.warning(
+                                    "Goal evaluate_after_turn raised for session %s",
+                                    session_id,
+                                    exc_info=True,
+                                )
+                                goal_mgr.pause("judge-error")
+                                if conn:
+                                    await conn.session_update(
+                                        session_id,
+                                        acp.update_agent_message_text(
+                                            f"⏸ Goal paused — judge error: {exc}"
+                                        ),
+                                    )
+                            else:
+                                if goal_decision.get("message") and conn:
+                                    await conn.session_update(
+                                        session_id,
+                                        acp.update_agent_message_text(goal_decision["message"]),
+                                    )
+                                if state.cancel_event and state.cancel_event.is_set():
+                                    cancelled = True
+                                else:
+                                    with state.runtime_lock:
+                                        goal_queue_waiting = bool(state.queued_prompts)
+                                    if (
+                                        goal_decision.get("should_continue")
+                                        and goal_decision.get("continuation_prompt")
+                                        and not goal_queue_waiting
+                                    ):
+                                        should_continue_goal = True
+                                        next_turn_text = goal_decision["continuation_prompt"]
+                elif (
+                    (cancelled or suppress_interrupt_response)
+                    and not required_observation_failed
+                ):
+                    # CLI parity (cli_loops_mixin._maybe_continue_goal_after_turn):
+                    # an interrupted/cancelled turn auto-pauses the goal instead of
+                    # judging partial output -- the judge would almost always say
+                    # "continue" and re-queue exactly what was just interrupted.
+                    goal_mgr = _get_goal_manager(state)
+                    if goal_mgr.is_active():
+                        goal_mgr.pause(reason="user-interrupted (Ctrl+C)")
+                        if conn:
+                            await conn.session_update(
+                                session_id,
+                                acp.update_agent_message_text(
+                                    "⏸ Goal paused — turn was interrupted. "
+                                    "Use /goal resume to continue, or /goal clear to stop."
+                                ),
+                            )
+            finally:
+                # Mark this turn idle before draining queued work so recursive prompt()
+                # calls can acquire the session. Queued turns are intentionally run as
+                # normal follow-up user prompts, preserving role alternation and history.
+                # This reset + the drain below MUST run no matter how the block above
+                # exits (success, caught error, or an uncaught exception) so a turn
+                # that cooperatively returned from the executor never leaves the
+                # session wedged with is_running=True and an undrained queue.
+                #
+                # Skipped when a goal continuation is about to run another turn in
+                # this same prompt() call (`should_continue_goal`): is_running must
+                # stay True and the keepalive loop must keep feeding the stall
+                # watchdog across iterations (Phase 3b contract). The queued-prompt
+                # check above already guarantees `should_continue_goal` is False
+                # whenever a real user prompt is waiting, so it still gets drained
+                # promptly once the loop does stop.
+                if not should_continue_goal:
+                    with state.runtime_lock:
+                        state.is_running = False
+                        state.current_prompt_text = ""
 
-            if keepalive_task is not None:
-                keepalive_task.cancel()
+                    if keepalive_task is not None:
+                        keepalive_task.cancel()
 
-            await self._drain_queued_prompts(state, session_id, conn)
+                    await self._drain_queued_prompts(state, session_id, conn)
+
+            if should_continue_goal:
+                user_text = next_turn_text
+                user_content = next_turn_text
+                continue
+            break
 
         usage = None
         if any(result.get(key) is not None for key in ("prompt_tokens", "completion_tokens", "total_tokens")):

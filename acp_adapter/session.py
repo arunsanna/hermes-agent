@@ -201,6 +201,7 @@ class SessionState:
     interrupted_prompt_text: str = ""
     transcript_correction_poisoned: bool = False
     transcript_correction_poison_persisted: bool | None = None
+    goal_manager: Any = None  # hermes_cli.goals.GoalManager, lazily built (see commands._get_goal_manager)
 
 
 class OwnedSessions:
