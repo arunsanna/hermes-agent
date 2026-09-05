@@ -2,6 +2,7 @@
 
 import asyncio
 import gc
+import json
 import warnings
 from concurrent.futures import Future
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -14,6 +15,7 @@ from acp.schema import AgentPlanUpdate
 from acp_adapter.events import (
     _build_plan_update_from_todo_result,
     _send_update,
+    flush_open_tool_calls,
     make_message_cb,
     make_step_cb,
     make_thinking_cb,
@@ -94,6 +96,114 @@ class TestToolProgressCallback:
             step_cb(2, [{"name": "terminal", "result": "ok-2"}])
             assert "terminal" not in tool_call_ids
 
+    def test_completion_events_pair_same_name_calls_by_id_exactly_once(
+        self, mock_conn, event_loop_fixture
+    ):
+        tool_call_ids = {}
+        tool_call_meta = {}
+        progress_cb = make_tool_progress_cb(
+            mock_conn, "session-1", event_loop_fixture, tool_call_ids, tool_call_meta
+        )
+        step_cb = make_step_cb(
+            mock_conn, "session-1", event_loop_fixture, tool_call_ids, tool_call_meta
+        )
+
+        with patch("acp_adapter.events._send_update") as send_update:
+            progress_cb(
+                "tool.started", "terminal", "$ first", {"command": "first"},
+                tool_call_id="call-first",
+            )
+            progress_cb(
+                "tool.started", "terminal", "$ second", {"command": "second"},
+                tool_call_id="call-second",
+            )
+            progress_cb(
+                "tool.completed", "terminal", None, None,
+                tool_call_id="call-second", result='{"output":"second"}',
+            )
+            progress_cb(
+                "tool.completed", "terminal", None, None,
+                tool_call_id="call-first", result='{"output":"first"}',
+            )
+
+            # The next-step replay and end-turn safety flush must not duplicate
+            # terminal updates already projected by tool.completed.
+            step_cb(1, [
+                {"name": "terminal", "result": '{"output":"first"}'},
+                {"name": "terminal", "result": '{"output":"second"}'},
+            ])
+            assert flush_open_tool_calls(
+                mock_conn, "session-1", event_loop_fixture, tool_call_ids, tool_call_meta
+            ) == 0
+
+        updates = [call.args[3] for call in send_update.call_args_list]
+        assert [update.session_update for update in updates] == [
+            "tool_call", "tool_call", "tool_call_update", "tool_call_update",
+        ]
+        assert [update.tool_call_id for update in updates] == [
+            "call-first", "call-second", "call-second", "call-first",
+        ]
+        assert [update.status for update in updates[2:]] == ["completed", "completed"]
+
+    def test_completion_render_failure_stays_tracked_for_end_turn_flush(
+        self, mock_conn, event_loop_fixture
+    ):
+        tool_call_ids = {}
+        tool_call_meta = {}
+        progress_cb = make_tool_progress_cb(
+            mock_conn, "session-1", event_loop_fixture, tool_call_ids, tool_call_meta
+        )
+
+        with patch("acp_adapter.events._send_update") as send_update:
+            progress_cb(
+                "tool.started", "terminal", "$ pwd", {"command": "pwd"},
+                tool_call_id="call-render-failure",
+            )
+            with patch(
+                "acp_adapter.events.build_tool_complete",
+                side_effect=ValueError("bad completion payload"),
+            ):
+                progress_cb(
+                    "tool.completed", "terminal", None, None,
+                    tool_call_id="call-render-failure", result="bad result",
+                )
+
+            assert list(tool_call_ids["terminal"]) == ["call-render-failure"]
+            assert "call-render-failure" in tool_call_meta
+            assert flush_open_tool_calls(
+                mock_conn, "session-1", event_loop_fixture, tool_call_ids, tool_call_meta
+            ) == 1
+
+        updates = [call.args[3] for call in send_update.call_args_list]
+        assert [update.session_update for update in updates] == [
+            "tool_call", "tool_call_update",
+        ]
+        assert updates[-1].tool_call_id == "call-render-failure"
+        assert updates[-1].status == "completed"
+
+    def test_completion_schedule_failure_stays_tracked_for_end_turn_flush(
+        self, mock_conn, event_loop_fixture
+    ):
+        tool_call_ids = {}
+        tool_call_meta = {}
+        progress_cb = make_tool_progress_cb(
+            mock_conn, "session-1", event_loop_fixture, tool_call_ids, tool_call_meta
+        )
+
+        with patch("acp_adapter.events._send_update"):
+            progress_cb(
+                "tool.started", "terminal", "$ pwd", {"command": "pwd"},
+                tool_call_id="call-schedule-failure",
+            )
+        with patch("acp_adapter.events._send_update", return_value=False):
+            progress_cb(
+                "tool.completed", "terminal", None, None,
+                tool_call_id="call-schedule-failure", result="done",
+            )
+
+        assert list(tool_call_ids["terminal"]) == ["call-schedule-failure"]
+        assert "call-schedule-failure" in tool_call_meta
+
 
 # ---------------------------------------------------------------------------
 # Thinking callback
@@ -149,6 +259,42 @@ class TestStepCallback:
         mock_btc.assert_called_once_with(
             "tc-xyz789", "terminal", result='{"output": "hello"}', function_args=None, snapshot=None
         )
+
+    def test_native_vision_list_result_emits_completion_location(self, mock_conn, event_loop_fixture, tmp_path):
+        from collections import deque
+        from agent.turn_iteration_prep import _previous_tool_round
+
+        image_path = tmp_path / "native.png"
+        tool_call_ids = {"vision_analyze": deque(["tc-native-vision"])}
+        tool_call_meta = {"tc-native-vision": {"args": {"image_url": str(image_path)}}}
+        cb = make_step_cb(mock_conn, "session-1", event_loop_fixture, tool_call_ids, tool_call_meta)
+        native_content = [
+            {"type": "text", "text": "Image loaded into your context."},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ]
+
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call-native-vision",
+                    "function": {
+                        "name": "vision_analyze",
+                        "arguments": json.dumps({"image_url": str(image_path), "question": "describe"}),
+                    },
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call-native-vision", "content": native_content},
+        ]
+
+        prev_tools = _previous_tool_round(messages)
+        assert isinstance(prev_tools[0]["arguments"], str)
+
+        with patch("acp_adapter.events._send_update") as send_update:
+            cb(1, prev_tools)
+
+        update = send_update.call_args.args[3]
+        assert update.locations[0].path == str(image_path)
 
 
 

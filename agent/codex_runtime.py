@@ -281,13 +281,15 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     def _fire_tool_started(item: dict) -> None:
         item_id, name = item.get("id") or "", _codex_item_to_tool_name(item)
         args = _codex_item_to_args(item)
+        tool_call_id = _stable_call_id(item, name)
         if item_id:
             started[item_id] = (name, args, time.monotonic())
         agent_cb("tool_progress_callback", "tool_progress_callback raised on tool.started for %s", name,
-                 args=("tool.started", name, _codex_item_to_preview(item), args))
+                 args=("tool.started", name, _codex_item_to_preview(item), args),
+                 kwargs={"tool_call_id": tool_call_id})
         # Stable-ID tool card (TUI/desktop) fires alongside the progress bubble.
         agent_cb("tool_start_callback", "tool_start_callback raised for %s", name,
-                 args=(_stable_call_id(item, name), name, args))
+                 args=(tool_call_id, name, args))
 
     def _fire_tool_completed(item: dict) -> None:
         name = _codex_item_to_tool_name(item)
@@ -300,7 +302,8 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         result, is_error = _codex_item_completion_payload(item)
         agent_cb("tool_progress_callback", "tool_progress_callback raised on tool.completed for %s", name,
                  args=("tool.completed", name, None, None),
-                 kwargs={"duration": duration, "is_error": is_error, "result": result})
+                 kwargs={"duration": duration, "is_error": is_error, "result": result,
+                         "tool_call_id": _stable_call_id(item, name)})
         args = prior[1] if prior is not None else _codex_item_to_args(item)
         agent_cb("tool_complete_callback", "tool_complete_callback raised for %s", name,
                  args=(_stable_call_id(item, name), name, args, result))

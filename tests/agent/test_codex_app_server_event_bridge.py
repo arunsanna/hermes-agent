@@ -212,6 +212,7 @@ class TestToolProgressDispatch:
         }))
         # tool.started then tool.completed
         assert agent.tool_progress_callback.call_count == 2
+        started = agent.tool_progress_callback.call_args_list[0]
         completed = agent.tool_progress_callback.call_args_list[1]
         assert completed.args[0] == "tool.completed"
         assert completed.args[1] == "exec_command"
@@ -220,6 +221,8 @@ class TestToolProgressDispatch:
         assert completed.kwargs["duration"] == pytest.approx(0.042)
         assert completed.kwargs["is_error"] is False
         assert completed.kwargs["result"] == "hi\n"
+        assert started.kwargs["tool_call_id"]
+        assert completed.kwargs["tool_call_id"] == started.kwargs["tool_call_id"]
 
 
 

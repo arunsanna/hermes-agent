@@ -114,9 +114,13 @@ def _send_update(
     session_id: str,
     loop: asyncio.AbstractEventLoop,
     update: Any,
-) -> None:
-    """Send an ACP update without ever blocking the ACP event-loop thread."""
-    update_coro = conn.session_update(session_id, update)
+) -> bool:
+    """Schedule an ACP update without blocking; return whether scheduling succeeded."""
+    try:
+        update_coro = conn.session_update(session_id, update)
+    except Exception:
+        logger.debug("Failed to create ACP update", exc_info=True)
+        return False
     try:
         running_loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -139,7 +143,7 @@ def _send_update(
                 logger.debug("Failed to send ACP update", exc_info=True)
 
         task.add_done_callback(_observe_task)
-        return
+        return True
 
     # Worker-thread callbacks must also stay nonblocking. Some lifecycle
     # paths hold child ordering locks while scheduling an update; waiting for
@@ -153,7 +157,7 @@ def _send_update(
         log_message="Failed to send ACP update",
     )
     if future is None:
-        return
+        return False
 
     def _observe_future(done) -> None:
         try:
@@ -162,6 +166,7 @@ def _send_update(
             logger.debug("Failed to send ACP update", exc_info=True)
 
     future.add_done_callback(_observe_future)
+    return True
 
 
 # ------------------------------------------------------------------
@@ -182,10 +187,10 @@ def make_tool_progress_cb(
 
         tool_progress_callback(event_type: str, name: str, preview: str, args: dict, **kwargs)
 
-    Emits ``ToolCallStart`` for ``tool.started`` events and tracks IDs in a FIFO
-    queue per tool name so duplicate/parallel same-name calls still complete
-    against the correct ACP tool call.  Other event types (``tool.completed``,
-    ``reasoning.available``) are silently ignored.
+    Emits ``ToolCallStart`` for ``tool.started`` events and immediately pairs
+    ordinary ``tool.completed`` events by their stable tool-call ID. The FIFO
+    remains as a compatibility fallback for producers without stable IDs and
+    for ``delegate_task``, whose completion has separate background semantics.
     """
 
     # Per-child delegate_task subagent calls (subagent_id -> ACP tool call id)
@@ -372,7 +377,54 @@ def make_tool_progress_cb(
         if isinstance(event_type, str) and event_type.startswith("subagent."):
             _handle_subagent_event(event_type, name, preview, kwargs)
             return
-        # Only emit ACP ToolCallStart for tool.started; ignore other event types
+        if event_type == "tool.completed" and name != "delegate_task":
+            queue = tool_call_ids.get(name or "")
+            if isinstance(queue, str):
+                queue = deque([queue])
+                tool_call_ids[name] = queue
+            source_id = str(kwargs.get("tool_call_id") or "").strip()
+            tc_id = None
+            if queue:
+                if source_id:
+                    if source_id in queue:
+                        tc_id = source_id
+                else:
+                    tc_id = queue[0]
+            if tc_id is None:
+                logger.debug(
+                    "ACP completion for %r has no matching tool_call id; dropping",
+                    name,
+                )
+                return
+            meta = tool_call_meta.get(tc_id, {})
+            result = kwargs.get("result")
+            try:
+                update = build_tool_complete(
+                    tc_id,
+                    name,
+                    result=result,
+                    function_args=meta.get("args"),
+                    snapshot=meta.get("snapshot"),
+                )
+            except Exception:
+                # Leave the call tracked so the end-turn flush can still close
+                # its card with a minimal terminal update.
+                logger.debug(
+                    "Failed to render ACP completion for %r", name, exc_info=True
+                )
+                return
+            if not _send_update(conn, session_id, loop, update):
+                return
+            queue.remove(tc_id)
+            tool_call_meta.pop(tc_id, None)
+            if name in {"todo", "todo_list"}:
+                plan_update = _build_plan_update_from_todo_result(result)
+                if plan_update is not None:
+                    _send_update(conn, session_id, loop, plan_update)
+            if not queue:
+                tool_call_ids.pop(name, None)
+            return
+        # Only emit ACP ToolCallStart for tool.started; ignore other event types.
         if event_type != "tool.started":
             return
         if isinstance(args, str):
@@ -383,7 +435,7 @@ def make_tool_progress_cb(
         if not isinstance(args, dict):
             args = {}
 
-        tc_id = make_tool_call_id()
+        tc_id = str(kwargs.get("tool_call_id") or "").strip() or make_tool_call_id()
         queue = tool_call_ids.get(name)
         if queue is None:
             queue = deque()
@@ -481,11 +533,26 @@ def make_step_cb(
                 if tool_name and queue:
                     tc_id = queue.popleft()
                     meta = tool_call_meta.pop(tc_id, {})
+                    if isinstance(function_args, str):
+                        try:
+                            function_args = json.loads(function_args)
+                        except (json.JSONDecodeError, TypeError):
+                            function_args = None
+                    if not isinstance(function_args, dict):
+                        function_args = meta.get("args")
                     update = build_tool_complete(
                         tc_id,
                         tool_name,
-                        result=str(result) if result is not None else None,
-                        function_args=function_args or meta.get("args"),
+                        result=(
+                            result
+                            if isinstance(result, str)
+                            else json.dumps(result, ensure_ascii=False)
+                            if isinstance(result, (dict, list))
+                            else str(result)
+                            if result is not None
+                            else None
+                        ),
+                        function_args=function_args,
                         snapshot=meta.get("snapshot"),
                     )
                     _send_update(conn, session_id, loop, update)
