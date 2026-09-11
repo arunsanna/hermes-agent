@@ -136,6 +136,37 @@ def _acp_stderr_print(*args, **kwargs) -> None:
     print(*args, **kwargs)
 
 
+def _resolve_acp_max_iterations(config: Dict[str, Any]) -> int:
+    """Resolve the ACP per-turn cap; non-positive values use Hermes' unlimited sentinel."""
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    default = int(DEFAULT_CONFIG["acp"]["max_iterations"])
+    acp_config = config.get("acp") if isinstance(config, dict) else None
+    configured = (
+        acp_config.get("max_iterations", default)
+        if isinstance(acp_config, dict)
+        else default
+    )
+
+    def _parse(raw: Any, fallback: int, source: str) -> int:
+        try:
+            if isinstance(raw, bool):
+                raise ValueError
+            return int(raw)
+        except (TypeError, ValueError):
+            logger.warning("Invalid %s=%r; using %s", source, raw, fallback)
+            return fallback
+
+    configured_value = _parse(configured, default, "acp.max_iterations")
+    env_value = os.environ.get("HERMES_ACP_MAX_ITERATIONS")
+    effective = (
+        _parse(env_value, configured_value, "HERMES_ACP_MAX_ITERATIONS")
+        if env_value is not None
+        else configured_value
+    )
+    return sys.maxsize if effective <= 0 else effective
+
+
 def _register_task_cwd(task_id: str, cwd: str) -> None:
     """Bind a task/session id to the editor's working directory for tools.
 
@@ -898,6 +929,12 @@ class SessionManager:
         from hermes_constants import parse_reasoning_effort
 
         config = load_config()
+        max_iterations = _resolve_acp_max_iterations(config)
+        logger.info(
+            "ACP session %s effective iteration cap: %s",
+            session_id,
+            "unlimited" if max_iterations == sys.maxsize else max_iterations,
+        )
         model_cfg = config.get("model")
         default_model = ""
         config_provider = None
@@ -949,6 +986,7 @@ class SessionManager:
             "session_id": session_id,
             "session_db": self._get_db(),
             "model": model or default_model,
+            "max_iterations": max_iterations,
             "reasoning_config": reasoning_config,
         }
 

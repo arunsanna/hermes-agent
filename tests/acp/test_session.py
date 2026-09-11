@@ -3,6 +3,7 @@
 import contextlib
 import io
 import json
+import sys
 import time
 from types import SimpleNamespace
 import pytest
@@ -64,6 +65,43 @@ class TestCreateSession:
         state = manager.create_session()
         fetched = manager.get_session(state.session_id)
         assert fetched is state
+
+    @pytest.mark.parametrize(
+        ("config_value", "env_value", "expected"),
+        [(None, None, 150), (91, None, 91), (91, "37", 37), (0, None, sys.maxsize)],
+    )
+    def test_acp_agent_max_iterations_uses_default_and_environment(
+        self, monkeypatch, config_value, env_value, expected
+    ):
+        class FakeAgent:
+            model = "fake-model"
+
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        config = {"model": {"default": "fake-model"}, "mcp_servers": {}}
+        if config_value is not None:
+            config["acp"] = {"max_iterations": config_value}
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda requested=None: {
+                "provider": "openrouter",
+                "api_mode": "chat_completions",
+                "base_url": "https://example.invalid",
+                "api_key": "test-key",
+            },
+        )
+        monkeypatch.setattr("acp_adapter.session._register_task_cwd", lambda task_id, cwd: None)
+        if env_value is None:
+            monkeypatch.delenv("HERMES_ACP_MAX_ITERATIONS", raising=False)
+        else:
+            monkeypatch.setenv("HERMES_ACP_MAX_ITERATIONS", env_value)
+
+        state = SessionManager(db=None).create_session(cwd="/tmp/project")
+
+        assert state.agent.kwargs["max_iterations"] == expected
 
 
     @pytest.mark.parametrize(
