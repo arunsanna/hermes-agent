@@ -500,9 +500,10 @@ DEFAULT_CONFIG = {
     # are always on; hard stops are opt-in so interactive sessions keep flowing.
     "tool_loop_guardrails": {
         "warnings_enabled": True,
-        "hard_stop_enabled": False,
-        # Unattended gateway/cron platforms hard-stop by default (nobody can /stop a model that
-        # ignores warnings); interactive cli/tui/desktop/acp stay warning-only.
+        # null = platform default; set false explicitly to disable unattended hard stops.
+        "hard_stop_enabled": None,
+        # Unattended gateway/cron/acp platforms hard-stop by default (nobody can /stop a model that
+        # ignores warnings); interactive cli/tui/desktop stay warning-only.
         "non_interactive_hard_stop_enabled": True,
         "warn_after": {"exact_failure": 2, "same_tool_failure": 3, "idempotent_no_progress": 2},
         "hard_stop_after": {

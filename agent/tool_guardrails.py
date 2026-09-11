@@ -72,7 +72,8 @@ _DEFAULT_MAX_SUBAGENTS_PER_TURN = 50
 
 # Interactive surfaces plus bounded supervised task loops (subagent stopped by its parent;
 # api_server has a live client) doing real edit -> re-run work keep the warn-only default.
-_ATTENDED_PLATFORMS = frozenset({"cli", "tui", "desktop", "acp", "subagent", "api_server"})
+# ACP is excluded because Switchboard runs it unattended over stdio.
+_ATTENDED_PLATFORMS = frozenset({"cli", "tui", "desktop", "subagent", "api_server"})
 
 
 def is_stall_guard_repeatable(tool_name: str) -> bool:
@@ -130,7 +131,11 @@ class ToolCallGuardrailConfig:
             data = {}
         d = cls()
         flags = {name: _as_bool(data.get(name), getattr(d, name)) for name in _BOOL_FIELDS}
-        if flags["non_interactive_hard_stop_enabled"] and _is_non_interactive_platform(platform):
+        if (
+            data.get("hard_stop_enabled") is None
+            and flags["non_interactive_hard_stop_enabled"]
+            and _is_non_interactive_platform(platform)
+        ):
             flags["hard_stop_enabled"] = True
 
         def threshold(name: str, section_name: str, key: str) -> int:

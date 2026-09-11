@@ -78,7 +78,7 @@ def test_config_parses_nested_warn_and_hard_stop_thresholds():
 def test_gateway_platform_defaults_to_hard_stop_without_changing_interactive_defaults():
     interactive_configs = [
         ToolCallGuardrailConfig.from_mapping({}, platform=platform)
-        for platform in ("cli", "tui", "desktop", "acp")
+        for platform in ("cli", "tui", "desktop")
     ]
     telegram_cfg = ToolCallGuardrailConfig.from_mapping({}, platform="telegram")
     cron_cfg = ToolCallGuardrailConfig.from_mapping({}, platform="cron")
@@ -320,6 +320,14 @@ def test_fix_retest_loop_is_never_hard_stopped():
                      '{"success": true, "diff": "..."}', failed=False)
     assert c.halt_decision is None
     assert c.before_call("terminal", _PYTEST).allows_execution
+
+
+def test_acp_is_non_interactive_by_default_but_explicit_config_wins():
+    assert ToolCallGuardrailConfig.from_mapping({}, platform="acp").hard_stop_enabled is True
+    assert ToolCallGuardrailConfig.from_mapping(
+        {"hard_stop_enabled": False}, platform="acp"
+    ).hard_stop_enabled is False
+    assert ToolCallGuardrailConfig.from_mapping({}, platform="cli").hard_stop_enabled is False
 
 
 def test_pure_replay_with_no_intervening_change_is_still_blocked():
