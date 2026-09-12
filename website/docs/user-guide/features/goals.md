@@ -71,8 +71,11 @@ What you'll see:
 | `/goal gate remove <N>` | Remove the Nth gate (1-based). |
 | `/goal gate clear` | Remove all gates. |
 
-Works identically on the CLI and every gateway platform (Telegram, Discord, Slack, Matrix, Signal, WhatsApp, SMS, iMessage, Webhook, API server, and the web dashboard).
-ACP clients (Switchboard, Zed) are also supported, running the continuation loop inside each `session/prompt` call.
+The classic CLI, TUI, Desktop, dashboard chat, and messaging gateways use one shared `/goal` command handler. ACP clients (Switchboard, Zed) expose the same command set through the ACP adapter's own handler, including draft/show, inline contracts, wait/unwait, quality gates, and the clear/stop/done aliases. ACP clients run the continuation loop inside each `session/prompt` call.
+
+`/goal draft <text>` both creates the goal and starts its first turn, including when drafting is unavailable and Hermes falls back to a free-form goal. `draft` is a whole-word subcommand: `/goal drafting docs` keeps `drafting docs` as the literal objective without calling the draft model.
+
+Messaging platforms retain their access rules: `/goal gate add` requires an explicitly configured gateway admin; listing, removing, and clearing gates remain available for recovery. Rendering, parsing, and turn scheduling are surface-specific, while persisted goal state is shared.
 
 ## Completion contracts
 
@@ -153,7 +156,7 @@ Gates and contracts compose: use a contract to shape *what the agent aims for*, 
 
 Some goals are gated on something that takes minutes and runs on its own — CI on a pushed PR, a long build, a test matrix, a deploy, a rate-limit cooldown. Without help, the goal loop would re-poke the agent every turn into "is it done yet?" busy-work while it waits.
 
-**This is handled automatically.** Every turn, the judge is shown the agent's live background processes (the `terminal(background=true)` registry — pid, session id, command, uptime, recent output, and any `watch_patterns` / `notify_on_complete` trigger) alongside the goal and the agent's response. When the agent's progress is genuinely gated on one of them, the judge returns a **`wait`** verdict instead of `continue`, and the loop **parks**: the next turns are skipped (no judge call, no continuation, no turn consumed) until the wait is satisfied — then it resumes normally with the result in hand. The judge can also park on a **time** basis (`wait_for_seconds`) for backoff/cooldown waits. `/goal status` shows `⏳ Goal (parked …)` while parked.
+**This is handled automatically.** Every turn, the judge is shown the agent's own live background processes (the `terminal(background=true)` registry entries this session spawned — pid, session id, command, uptime, recent output, and any `watch_patterns` / `notify_on_complete` trigger; processes started by delegated subagents are not shown, so a fan-out parent is never parked on a worker's poller) alongside the goal and the agent's response. When the agent's progress is genuinely gated on one of them, the judge returns a **`wait`** verdict instead of `continue`, and the loop **parks**: the next turns are skipped (no judge call, no continuation, no turn consumed) until the wait is satisfied — then it resumes normally with the result in hand. A pid/session wait is capped at 30 minutes; a process that never exits (a watcher, a forgotten poller) cannot park the goal indefinitely. The judge can also park on a **time** basis (`wait_for_seconds`) for backoff/cooldown waits. `/goal status` shows `⏳ Goal (parked …)` while parked.
 
 The judge picks the right kind of wait from the process's own signal:
 

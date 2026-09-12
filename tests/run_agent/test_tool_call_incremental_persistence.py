@@ -41,6 +41,12 @@ from run_agent import AIAgent
 from agent.chat_completion_helpers import interruptible_streaming_api_call
 
 
+@pytest.fixture(autouse=True)
+def _disable_background_titles(monkeypatch):
+    # Persistence assertions must not race a title worker writing to pytest capture.
+    monkeypatch.setattr("agent.title_generator.maybe_auto_title", lambda *args, **kwargs: None)
+
+
 def _make_tool_defs(*names: str) -> list:
     return [
         {

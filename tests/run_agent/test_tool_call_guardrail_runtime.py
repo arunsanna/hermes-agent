@@ -95,8 +95,9 @@ def _hard_stop_config(**overrides) -> dict:
     return cfg
 
 
-def test_gateway_platform_uses_hard_stop_default_without_cli_opt_in():
-    agent = _make_agent("web_search", platform="telegram")
+@pytest.mark.parametrize("platform", ["telegram", "acp"])
+def test_unattended_platform_uses_hard_stop_default_without_cli_opt_in(platform):
+    agent = _make_agent("web_search", platform=platform)
     args = {"query": "same"}
 
     _seed_exact_failures(agent, "web_search", args, count=5)
@@ -106,7 +107,7 @@ def test_gateway_platform_uses_hard_stop_default_without_cli_opt_in():
     assert decision.code == "repeated_exact_failure_block"
 
 
-@pytest.mark.parametrize("platform", ["desktop", "acp"])
+@pytest.mark.parametrize("platform", ["desktop", "cli"])
 def test_interactive_platforms_keep_warning_only_default(platform):
     agent = _make_agent("web_search", platform=platform)
     args = {"query": "same"}
@@ -247,7 +248,7 @@ def test_config_enabled_hard_stop_concurrent_path_does_not_submit_blocked_calls_
     assert starts == [("c-allow", "web_search", allowed_args)]
     started_events = [event for event in progress_events if event[0] == "tool.started"]
     completed_events = [event for event in progress_events if event[0] == "tool.completed"]
-    assert started_events == [("tool.started", "web_search", allowed_args, {})]
+    assert started_events == [("tool.started", "web_search", allowed_args, {"tool_call_id": "c-allow"})]
     assert len(completed_events) == 1
     assert completed_events[0][1] == "web_search"
 

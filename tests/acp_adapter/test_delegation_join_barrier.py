@@ -291,6 +291,11 @@ def _agent_message_texts(conn):
     ]
 
 
+def _materialize_empty_db_session(db, state):
+    """Correction tests start from a durable empty row, not an editor probe."""
+    db.create_session(session_id=state.session_id, source="acp")
+
+
 def _completion_event(session_id):
     return {
         "type": "async_delegation",
@@ -658,6 +663,7 @@ def _build_cancelled_durable_prompt(monkeypatch, db, correction_failures):
     manager = SessionManager(agent_factory=lambda: fake, db=db)
     acp_agent = HermesACPAgent(session_manager=manager)
     state = manager.create_session(cwd=".")
+    _materialize_empty_db_session(db, state)
     fake.session_id = state.session_id
     fake.cancel_event = state.cancel_event
     conn = _CaptureConn()
@@ -921,6 +927,7 @@ def test_crash_mid_correction_durably_sets_poison_marker_before_write(
         fake = _FakeAgent()
         manager = SessionManager(agent_factory=lambda **_kwargs: fake, db=db)
         state = manager.create_session(cwd=".")
+        _materialize_empty_db_session(db, state)
         fake.session_id = state.session_id
 
         # The turn's own incremental persistence already flushed the
@@ -1000,6 +1007,7 @@ def test_stuck_marker_on_already_corrected_session_self_heals_on_restore(
         fake = _FakeAgent()
         manager = SessionManager(agent_factory=lambda **_kwargs: fake, db=db)
         state = manager.create_session(cwd=".")
+        _materialize_empty_db_session(db, state)
         fake.session_id = state.session_id
 
         db.append_message(state.session_id, "user", content="do the required work")
@@ -1097,6 +1105,7 @@ def test_genuine_taint_that_keeps_failing_still_refuses_on_restore(tmp_path):
         fake = _FakeAgent()
         manager = SessionManager(agent_factory=lambda **_kwargs: fake, db=db)
         state = manager.create_session(cwd=".")
+        _materialize_empty_db_session(db, state)
         fake.session_id = state.session_id
 
         leaked_api_content = (
@@ -1178,6 +1187,7 @@ def test_self_heal_on_already_clean_history_is_a_no_op(tmp_path):
         fake = _FakeAgent()
         manager = SessionManager(agent_factory=lambda **_kwargs: fake, db=db)
         state = manager.create_session(cwd=".")
+        _materialize_empty_db_session(db, state)
         fake.session_id = state.session_id
 
         db.append_message(state.session_id, "user", content="do the required work")

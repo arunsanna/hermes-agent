@@ -784,7 +784,7 @@ class TestCodexToolProgressBridge:
             on_event = captured_init.get("on_event")
             if on_event:
                 on_event({"method": "item/started", "params": {"item": {
-                    "type": "commandExecution", "command": "pytest", "cwd": "/repo"}}})
+                    "id": "cmd-1", "type": "commandExecution", "command": "pytest", "cwd": "/repo"}}})
             return TurnResult(final_text="done", projected_messages=[
                 {"role": "assistant", "content": "done"}], turn_id="t1", thread_id="th1")
 
@@ -793,10 +793,10 @@ class TestCodexToolProgressBridge:
         monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
 
         agent = _make_codex_agent()
-        agent.tool_progress_callback = lambda kind, name, preview, args: events.append(
-            (kind, name, preview))
+        agent.tool_progress_callback = lambda kind, name, preview, args, **kwargs: events.append(
+            (kind, name, preview, kwargs.get("tool_call_id")))
         with patch.object(agent, "_spawn_background_review", return_value=None):
             agent.run_conversation("run the tests")
 
         assert "on_event" in captured_init and captured_init["on_event"] is not None
-        assert ("tool.started", "exec_command", "pytest") in events
+        assert ("tool.started", "exec_command", "pytest", "codex_exec_cmd-1") in events

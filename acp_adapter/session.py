@@ -655,9 +655,11 @@ class SessionManager:
         cwd_json = json.dumps(session_meta)
 
         try:
-            # Ensure the session record exists.
             existing = db.get_session(state.session_id)
             if existing is None:
+                if not state.history:
+                    # Empty editor probes stay ephemeral; copied fork history persists.
+                    return True
                 db.create_session(
                     session_id=state.session_id,
                     source="acp",

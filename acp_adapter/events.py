@@ -513,66 +513,65 @@ def make_step_cb(
     """
 
     def _step(api_call_count: int, prev_tools: Any = None) -> None:
-        if prev_tools and isinstance(prev_tools, list):
-            for tool_info in prev_tools:
-                tool_name = None
-                result = None
-                function_args = None
+        if not isinstance(prev_tools, list):
+            return
+        for tool_info in prev_tools:
+            tool_name = result = function_args = None
+            if isinstance(tool_info, dict):
+                tool_name = tool_info.get("name") or tool_info.get("function_name")
+                # Key presence, not truthiness: "", 0 and False are real results (#10845).
+                result = tool_info.get("result") if "result" in tool_info else tool_info.get("output")
+                function_args = tool_info.get("arguments") or tool_info.get("args")
+            elif isinstance(tool_info, str):
+                tool_name = tool_info
 
-                if isinstance(tool_info, dict):
-                    tool_name = tool_info.get("name") or tool_info.get("function_name")
-                    result = tool_info.get("result") or tool_info.get("output")
-                    function_args = tool_info.get("arguments") or tool_info.get("args")
-                elif isinstance(tool_info, str):
-                    tool_name = tool_info
-
-                queue = tool_call_ids.get(tool_name or "")
-                if isinstance(queue, str):
-                    queue = deque([queue])
-                    tool_call_ids[tool_name] = queue
-                if tool_name and queue:
-                    tc_id = queue.popleft()
-                    meta = tool_call_meta.pop(tc_id, {})
-                    if isinstance(function_args, str):
-                        try:
-                            function_args = json.loads(function_args)
-                        except (json.JSONDecodeError, TypeError):
-                            function_args = None
-                    if not isinstance(function_args, dict):
-                        function_args = meta.get("args")
-                    update = build_tool_complete(
-                        tc_id,
-                        tool_name,
-                        result=(
-                            result
-                            if isinstance(result, str)
-                            else json.dumps(result, ensure_ascii=False)
-                            if isinstance(result, (dict, list))
-                            else str(result)
-                            if result is not None
-                            else None
-                        ),
-                        function_args=function_args,
-                        snapshot=meta.get("snapshot"),
-                    )
-                    _send_update(conn, session_id, loop, update)
-                    if tool_name in {"todo", "todo_list"}:
-                        plan_update = _build_plan_update_from_todo_result(result)
-                        if plan_update is not None:
-                            _send_update(conn, session_id, loop, plan_update)
-                    if not queue:
-                        tool_call_ids.pop(tool_name, None)
-                elif tool_name:
-                    # No queued start for this completion: the pairing FIFO can
-                    # drift on long turns (steering/compression rewrite the
-                    # message history prev_tools is rebuilt from). Log instead
-                    # of silently dropping so wire-level completion loss is
-                    # diagnosable; flush_open_tool_calls() closes the inverse
-                    # case (started-but-never-completed) at turn end.
-                    logger.debug(
-                        "ACP completion for %r has no queued tool_call id; dropping",
-                        tool_name,
-                    )
+            queue = tool_call_ids.get(tool_name or "")
+            if isinstance(queue, str):
+                queue = deque([queue])
+                tool_call_ids[tool_name] = queue
+            if tool_name and queue:
+                tc_id = queue.popleft()
+                meta = tool_call_meta.pop(tc_id, {})
+                if isinstance(function_args, str):
+                    try:
+                        function_args = json.loads(function_args)
+                    except (json.JSONDecodeError, TypeError):
+                        function_args = None
+                if not isinstance(function_args, dict):
+                    function_args = meta.get("args")
+                update = build_tool_complete(
+                    tc_id,
+                    tool_name,
+                    result=(
+                        result
+                        if isinstance(result, str)
+                        else json.dumps(result, ensure_ascii=False)
+                        if isinstance(result, (dict, list))
+                        else str(result)
+                        if result is not None
+                        else None
+                    ),
+                    function_args=function_args,
+                    snapshot=meta.get("snapshot"),
+                )
+                _send_update(conn, session_id, loop, update)
+                if tool_name in {"todo", "todo_list"}:
+                    plan_update = _build_plan_update_from_todo_result(result)
+                    if plan_update is not None:
+                        _send_update(conn, session_id, loop, plan_update)
+                if not queue:
+                    tool_call_ids.pop(tool_name, None)
+            elif tool_name:
+                # No queued start for this completion: the pairing FIFO can
+                # drift on long turns (steering/compression rewrite the
+                # message history prev_tools is rebuilt from). Log instead
+                # of silently dropping so wire-level completion loss is
+                # diagnosable; flush_open_tool_calls() closes the inverse
+                # case (started-but-never-completed) at turn end.
+                logger.debug(
+                    "ACP completion for %r has no queued tool_call id; dropping",
+                    tool_name,
+                )
 
     return _step
 

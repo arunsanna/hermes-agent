@@ -24,6 +24,11 @@ def _agent_tool_defs(agent) -> list:
     return list(getattr(agent, "tools", None) or [])
 
 
+def agent_tool_names(agent) -> list:
+    """Names of ``agent.tools`` in wire order (unnamed entries skipped)."""
+    return [name for name in map(_def_name, _agent_tool_defs(agent)) if name]
+
+
 def _resolve_refresh_toolsets(agent, enabled_override, disabled_override):
     """Explicit reloads pass freshly-resolved toolsets (so a server just ENABLED in config is
     picked up) and the agent's selection is updated to match; automatic paths pass nothing
@@ -88,7 +93,8 @@ def refresh_agent_mcp_tools(
     rebuilt. Shared by the TUI RPC, gateway reload, late-binding thread and between-turns
     refresh: respects the toolset filter, diffs by tool NAME (a count compare misses an
     equal-size swap), re-injects the memory-provider / context-engine tools ``agent_init``
-    appends after ``get_tool_definitions``, publishes ``(tools, valid_tool_names)`` together.
+    appends after ``get_tool_definitions`` plus guarded session capabilities, and publishes
+    ``(tools, valid_tool_names)`` together.
 
     ``preserve_prefix``: for rebuilds inside a live conversation the tool array is a cached
     request prefix and any moved byte re-prefills the whole history — existing tools keep their
@@ -112,15 +118,12 @@ def refresh_agent_mcp_tools(
     new_names = {_def_name(t) for t in new_defs}
     # Post-build families re-appended on LOCALS only; live attributes untouched until publish.
     staged_engine_names = _reinject_post_build_tools(agent, new_defs, new_names)
+    _reinject_authorized_dynamic_tools(agent, new_defs, new_names)
     try:
-        from acp_adapter.orchestration import (
-            _SWITCHBOARD_MCP_TOOL_NAMES,
-            without_switchboard_tool_search_bridge,
-        )
+        from acp_adapter.orchestration import without_switchboard_tool_search_bridge
         new_defs = without_switchboard_tool_search_bridge(agent, new_defs)
         new_names = {_def_name(t) for t in new_defs}
-        if new_names == _SWITCHBOARD_MCP_TOOL_NAMES:
-            staged_engine_names = set()
+        staged_engine_names.intersection_update(new_names)
     except Exception:
         logger.debug("Switchboard final tool filtering skipped", exc_info=True)
     # Registry membership is read OUTSIDE ``_agent_tools_lock``: taking ``registry._lock``
@@ -182,6 +185,7 @@ def restore_agent_tool_prefix(agent, saved_names: list) -> bool:
     saved_defs = [d for d in map(_saved_def, saved_names) if d is not None]
     registered_names = {entry.name for entry in registry.get_all_entries()}
     merged, merged_names = _merge_preserving_prefix(saved_defs, fresh_defs, registered_names)
+    _reinject_authorized_dynamic_tools(agent, merged, merged_names)
     with _agent_tools_lock:
         if merged == fresh_defs:
             return False
@@ -196,18 +200,39 @@ def _merge_preserving_prefix(current_defs: list, new_defs: list, registered_name
     """Fold a fresh tool snapshot into a live one without moving existing bytes. Ordered by
     ``current_defs`` (the cached request prefix): a name in both keeps its slot but takes the
     fresh schema; a name only in the live list is kept if still registered (``check_fn``
-    flapped), else dropped; a name only in the fresh list is appended at the tail."""
+    flapped), else dropped; a name only in the fresh list is appended at the tail.
+
+    The bridge tools keep their BUILT entry, not the fresh one: ``tool_search``'s description
+    is derived from the session (deferred count, listing, whether ``manage_connections`` was
+    present), so a late MCP server or a ``check_fn`` flap would rewrite it every turn. Search
+    reads the live catalog at dispatch, so the stale count costs nothing."""
+    from tools.tool_search_catalog import BRIDGE_TOOL_NAMES
     fresh = {_def_name(entry): entry for entry in new_defs if _def_name(entry)}
     merged = []
     for entry in current_defs:
         name = _def_name(entry)
         replacement = fresh.pop(name, None)
-        if replacement is not None:
+        if name in BRIDGE_TOOL_NAMES:
+            merged.append(entry)
+        elif replacement is not None:
             merged.append(replacement)
         elif name and name in registered_names:
             merged.append(entry)
     merged.extend(fresh.values())
     return merged, {_def_name(t) for t in merged}
+
+
+def _reinject_authorized_dynamic_tools(agent, tools_list: list, name_set: set) -> None:
+    """``message_agent`` is injected by an auth gate, never registered, so a registry-derived
+    rebuild drops it. Scrub any stale copy from the STAGED pair and re-add it only when the live
+    gate re-authorizes, so the publisher exposes a coherent ``(tools, valid_tool_names)``."""
+    from tools.bot_mode_dm import MESSAGE_AGENT_TOOL_NAME, message_agent_authorized, message_agent_tool_schema
+
+    tools_list[:] = [entry for entry in tools_list if _def_name(entry) != MESSAGE_AGENT_TOOL_NAME]
+    name_set.discard(MESSAGE_AGENT_TOOL_NAME)
+    if message_agent_authorized(agent):
+        tools_list.append(message_agent_tool_schema())
+        name_set.add(MESSAGE_AGENT_TOOL_NAME)
 
 
 def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:

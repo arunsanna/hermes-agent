@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 from datetime import datetime, timezone
-import contextlib
 import contextvars
 import logging
 import os
@@ -432,44 +431,6 @@ def _mcp_server_config(server: McpServerStdio | McpServerHttp | McpServerSse) ->
     if isinstance(server, McpServerStdio):
         return {"command": server.command, "args": list(server.args), "env": {i.name: i.value for i in server.env}}
     return {"url": server.url, "headers": {i.name: i.value for i in server.headers}}
-
-
-def _restore_env(key: str, value: str | None) -> None:
-    if value is None:
-        os.environ.pop(key, None)
-    else:
-        os.environ[key] = value
-
-
-def _bind_guarded(stack: contextlib.ExitStack, label: str, setup: Callable[[], Callable[[], None]]) -> None:
-    """Run ``setup`` (returns its teardown) and register the teardown; failures in either half only
-    log — the turn must still run without the binding."""
-    try:
-        teardown = setup()
-    except Exception:
-        logger.debug("Could not set ACP %s", label, exc_info=True)
-        return
-
-    def _teardown() -> None:
-        try:
-            teardown()
-        except Exception:
-            logger.debug("Could not restore ACP %s", label, exc_info=True)
-
-    stack.callback(_teardown)
-
-
-def _attach_interrupted_prompt(interrupted_prompt: str, guidance: str) -> str:
-    return f"{interrupted_prompt}\n\nUser correction/guidance after interrupt: {guidance}"
-
-
-def _take_interrupted_prompt(state: SessionState) -> tuple[bool, str]:
-    """``(idle, interrupted_prompt)``; consumes the cancelled prompt only when the session is idle."""
-    with state.runtime_lock:
-        if state.is_running:
-            return False, ""
-        text, state.interrupted_prompt_text = state.interrupted_prompt_text, ""
-        return True, text
 
 
 @dataclass
@@ -1653,115 +1614,6 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
 
     # ---- Prompt (core) ------------------------------------------------------
 
-    def _rewrite_prompt_for_interrupt(
-        self, state: SessionState, user_text: str, user_content: Any, text_only: bool
-    ) -> tuple[str, Any]:
-        """Idle ``/steer`` has nothing to inject into (gateway parity): if a prompt was just
-        cancelled, replay it with the steer text as explicit correction; otherwise run the steer
-        payload as a plain prompt rather than silently queueing it as if ``/queue`` was typed.
-        Plain text after a cancel likewise keeps the cancelled request attached ("stop and
-        send" clients) so deictic follow-ups have a target."""
-        if not (text_only and isinstance(user_content, str)):
-            return user_text, user_content
-
-        if user_text.startswith("/steer"):
-            split = user_text.split(maxsplit=1)
-            steer_text = split[1].strip() if len(split) > 1 else ""
-            if not steer_text:
-                return user_text, user_content
-            idle, interrupted_prompt = _take_interrupted_prompt(state)
-            if interrupted_prompt:
-                return (_attach_interrupted_prompt(interrupted_prompt, steer_text),) * 2
-            return (steer_text, steer_text) if idle else (user_text, user_content)
-        if not user_text.startswith("/") and (interrupted_prompt := _take_interrupted_prompt(state)[1]):
-            return (_attach_interrupted_prompt(interrupted_prompt, user_text),) * 2
-        return user_text, user_content
-
-    def _claim_turn_or_queue(
-        self, state: SessionState, session_id: str, user_text: str, user_content: Any, text_only: bool
-    ) -> str | None:
-        """Mark the session running; if a turn is active, redirect it (text-only, supported
-        runtime) or queue it. Returns the client message when absorbed, else None."""
-        with state.runtime_lock:
-            if not state.is_running:
-                state.is_running = True
-                state.current_prompt_text = user_text or "[Image attachment]"
-                return None
-            if text_only and isinstance(user_content, str) and hasattr(state.agent, "redirect") and (
-                getattr(state.agent, "_supports_active_turn_redirect", False) is True
-            ):
-                try:
-                    if state.agent.redirect(user_content):
-                        return "Redirected the active turn with your correction."
-                except Exception:
-                    logger.debug("ACP active-turn redirect failed for %s", session_id, exc_info=True)
-            state.queued_prompts.append(user_text or "[Image attachment]")
-            return f"Queued for the next turn. ({len(state.queued_prompts)} queued)"
-
-    def _run_agent_turn(
-        self, *, state: SessionState, session_id: str, user_text: str, user_content: Any, conn: Any,
-        loop: asyncio.AbstractEventLoop, approval_cb: Any, edit_approval_requester: Any,
-    ) -> dict:
-        """Executor-thread body of one turn, run inside ``contextvars.copy_context()`` so
-        ContextVar writes are isolated from concurrent sessions.
-
-        Approval routing is thread-local, so it MUST be bound here, not on the loop thread.
-        Interactive routing is a ``tools.approval`` contextvar, not ``HERMES_INTERACTIVE`` in
-        os.environ, so concurrent workers can't race a global flag onto the non-interactive
-        auto-approve path (GHSA-96vc-wcxf-jjff)."""
-        agent = state.agent
-        with contextlib.ExitStack() as stack:
-            # HERMES_SESSION_KEY scopes per-session caches (interactive sudo password) to this
-            # session, not the reused thread. ``cwd`` pins what the system prompt reports as the
-            # working directory — otherwise it advertises the Hermes workspace while tools are
-            # rooted at the client's project and edits land outside it. ``cron_session=""`` masks
-            # any leaked process-global HERMES_CRON_SESSION.
-            def _session_context() -> Callable[[], None]:
-                from gateway.session_context import clear_session_vars, set_session_vars
-
-                tokens = set_session_vars(
-                    session_key=session_id, session_id=session_id, cwd=state.cwd, cron_session="",
-                )
-                return lambda: clear_session_vars(tokens)
-
-            def _approval() -> Callable[[], None]:
-                from tools import terminal_tool
-
-                previous = terminal_tool._get_approval_callback()
-                terminal_tool.set_approval_callback(approval_cb)
-                return lambda: terminal_tool.set_approval_callback(previous)
-
-            def _edit_approval() -> Callable[[], None]:
-                from acp_adapter.edit_approval import reset_edit_approval_requester, set_edit_approval_requester
-
-                token = set_edit_approval_requester(edit_approval_requester)
-                return lambda: reset_edit_approval_requester(token)
-
-            _bind_guarded(stack, "session context", _session_context)
-            if approval_cb:
-                _bind_guarded(stack, "approval callback", _approval)
-            if edit_approval_requester:
-                _bind_guarded(stack, "edit approval requester", _edit_approval)
-            stack.callback(reset_hermes_interactive_context, set_hermes_interactive_context(True))
-            # Tools tag side-effects with the ACP session (``kanban_create``); save/restore it.
-            stack.callback(_restore_env, "HERMES_SESSION_ID", os.environ.get("HERMES_SESSION_ID"))
-            os.environ["HERMES_SESSION_ID"] = session_id
-
-            # Auto-titling fires in the turn prologue; push the title now as a session-info update.
-            def _notify_title_update(_title: str, _source: str) -> None:
-                if conn:
-                    loop.call_soon_threadsafe(asyncio.create_task, self._send_session_info_update(session_id))
-
-            agent._on_session_title = _notify_title_update
-            try:
-                return agent.run_conversation(
-                    user_message=user_content, conversation_history=state.history, task_id=session_id,
-                    persist_user_message=user_text or "[Image attachment]",
-                )
-            except Exception as e:
-                logger.exception("Agent error in session %s", session_id)
-                return {"final_response": f"Error: {e}", "messages": state.history}
-
     async def prompt(
         self,
         prompt: list[
@@ -2349,7 +2201,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                     stop_reason="cancelled" if executor_cancelled else "end_turn"
                 )
 
-            if result.get("messages"):
+            if "messages" in result and isinstance(result["messages"], list):
                 state.history = result["messages"]
 
             joined_completed_ids: set[str] = set()
@@ -2538,7 +2390,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                                 continuation,
                                 continuation,
                             )
-                            if result.get("messages"):
+                            if "messages" in result and isinstance(result["messages"], list):
                                 state.history = result["messages"]
                             pending = running_for_session(session_id, turn_start_ts)
 
@@ -2824,7 +2676,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                             INTERRUPT_WAITING_FOR_MODEL_PREFIX
                         )
                     )
-                    if result.get("messages"):
+                    if "messages" in result and isinstance(result["messages"], list):
                         # Persist only after the terminal winner sanitizes the
                         # turn, and keep the commit serialized with final delivery.
                         self.session_manager.save_session(session_id)
