@@ -27,17 +27,11 @@ from acp.schema import (
 )
 
 from acp_adapter.auth import TERMINAL_SETUP_AUTH_METHOD_ID, build_auth_methods, detect_provider
-from acp_adapter.commands import (
-    HERMES_VERSION, RunPromptAfterCommand, SlashCommandsMixin, _estimate_tokens, _get_goal_manager,
-)
+from acp_adapter.commands import RunPromptAfterCommand, SlashCommandsMixin, _estimate_tokens, _get_goal_manager
 from acp_adapter.content import PromptBlock, _content_blocks_to_openai_user_content, _extract_text
 from acp_adapter.events import (
-    _build_plan_update_from_todo_result,
-    flush_open_tool_calls,
-    make_message_cb,
-    make_step_cb,
-    make_thinking_cb,
-    make_tool_progress_cb,
+    AssistantMessageIdAllocator, _build_plan_update_from_todo_result, _send_update, flush_open_tool_calls,
+    make_message_cb, make_step_cb, make_thinking_cb, make_tool_progress_cb,
 )
 from acp_adapter.model_catalog import build_model_state, encode_model_choice
 from acp_adapter.permissions import make_approval_callback
@@ -433,6 +427,10 @@ def _mcp_server_config(server: McpServerStdio | McpServerHttp | McpServerSse) ->
     return {"url": server.url, "headers": {i.name: i.value for i in server.headers}}
 
 
+class ModelRejected(ValueError):
+    """``switch_model`` refused the requested model (no provider can serve it)."""
+
+
 @dataclass
 class _TurnCallbacks:
     """Per-turn ACP streaming callbacks; all None when no client is connected."""
@@ -444,6 +442,8 @@ class _TurnCallbacks:
     approval_cb: Any = None
     edit_approval_requester: Any = None
     streamed: bool = False
+    tool_call_ids: Any = None
+    tool_call_meta: Any = None
 
 
 class HermesACPAgent(SlashCommandsMixin, acp.Agent):
@@ -458,7 +458,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         "accept_edits": (
             "workspace_session",
             "Accept Edits",
-            "Auto-allow workspace and /tmp edits; still asks for sensitive paths.",
+            "Auto-allow workspace and temp-dir edits; still asks for sensitive paths.",
         ),
         "dont_ask": (
             "session", "Don't Ask", "Auto-allow file edits for this session except sensitive paths."
@@ -606,10 +606,11 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         cancelled turn, a post-barrier exception, or an exception from the
         initial executor dispatch itself — must call this exactly once after
         freeing `is_running`, so a queued follow-up never sits stuck (Phase 0
-        / stop-p0-brief.md P0.1, HOLE 2)."""
+        / stop-p0-brief.md P0.1, HOLE 2). Also reached from the slash path
+        after a state-mutating command releases ``command_op``."""
         while True:
             with state.runtime_lock:
-                if not state.queued_prompts:
+                if state.is_running or state.command_op or not state.queued_prompts:
                     break
                 next_prompt = state.queued_prompts.pop(0)
             if conn:
@@ -792,27 +793,6 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         choice = encode_model_choice(provider, model)
         return SessionModelState(available_models=[ModelInfo(model_id=choice, name=model)], current_model_id=choice)
 
-    @staticmethod
-    def _resolve_model_selection(raw_model: str, current_provider: str) -> tuple[str, str]:
-        """Resolve ``provider:model`` input into the provider and normalized model id."""
-        target_provider, new_model = current_provider, raw_model.strip()
-        try:
-            from hermes_cli.models import detect_provider_for_model, parse_model_input
-
-            raw_selection = new_model
-            target_provider, new_model = parse_model_input(raw_selection, current_provider)
-            # ``parse_model_input`` strips a recognized ``provider:`` prefix.
-            # That explicit choice is authoritative even when it names the
-            # current provider; auto-detection must not remap the model.
-            has_explicit_provider = new_model != raw_selection
-            if not has_explicit_provider and target_provider == current_provider:
-                detected = detect_provider_for_model(new_model, current_provider)
-                if detected:
-                    target_provider, new_model = detected
-        except Exception:
-            logger.debug("Provider detection failed, using model as-is", exc_info=True)
-        return target_provider, new_model
-
     def _commit_model_switch(self, state: SessionState, *, model: str, new_agent: Any) -> None:
         """Persist a replacement before retiring the previous live agent."""
         previous_model, previous_agent = state.model, state.agent
@@ -829,17 +809,41 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         self, state: SessionState, raw_model: str, *, keep_endpoint: bool = False
     ) -> tuple[str | None, str, str]:
         """Rebuild the session agent on a new model -> (old provider, new provider, model).
-        ``keep_endpoint`` carries base_url/api_mode over when the provider is unchanged."""
+
+        Resolution goes through ``hermes_cli.model_switch.switch_model`` seeded with the live
+        agent route — the same catalog/alias/credential validation as CLI/gateway/TUI ``/model``
+        — so ACP never hands the session a model no provider can serve. ``provider:model`` picker
+        ids become ``--provider``. ACP never persists. ``keep_endpoint`` carries base_url/api_mode
+        over when the provider is unchanged."""
+        from hermes_cli.config import get_compatible_custom_providers, load_config
+        from hermes_cli.model_switch import switch_model
+        from hermes_cli.models import parse_model_input
+
         current_provider = getattr(state.agent, "provider", None)
-        target_provider, new_model = self._resolve_model_selection(raw_model, current_provider or "openrouter")
+        explicit_provider, model_input = parse_model_input(raw_model, "")
+        cfg = load_config()
+        result = switch_model(
+            raw_input=model_input, explicit_provider=explicit_provider,
+            current_provider=current_provider or "openrouter", current_model=str(state.model or ""),
+            current_base_url=str(getattr(state.agent, "base_url", "") or ""),
+            current_api_key=str(getattr(state.agent, "api_key", "") or ""),
+            user_providers=cfg.get("providers") if isinstance(cfg.get("providers"), dict) else {},
+            custom_providers=get_compatible_custom_providers(cfg))
+        if not result.success:
+            raise ModelRejected(result.error_message or f"Cannot switch to {raw_model}")
+        target_provider, new_model = result.target_provider, result.new_model
         endpoint: dict[str, Any] = {}
         if keep_endpoint and not (current_provider and target_provider != current_provider):
             endpoint = {
                 "base_url": getattr(state.agent, "base_url", None), "api_mode": getattr(state.agent, "api_mode", None)
             }
+        # ACP-provided MCP servers live only on the running agent's toolsets (``_register_session_mcp_servers``);
+        # a rebuild that re-derived them from config would silently drop every session MCP tool (#42719).
         new_agent = self.session_manager._make_agent(
             session_id=state.session_id, cwd=state.cwd, model=new_model,
             requested_provider=target_provider, **endpoint,
+            enabled_toolsets=getattr(state.agent, "enabled_toolsets", None),
+            disabled_toolsets=getattr(state.agent, "disabled_toolsets", None),
         )
         self._commit_model_switch(state, model=new_model, new_agent=new_agent)
         return current_provider, target_provider, new_model
@@ -1083,12 +1087,20 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             False,
         )
         try:
-            from tools.mcp_tool import (
+            from agent.runtime_cwd import set_session_cwd
+            from tools.mcp_tool_discovery import (
                 register_mcp_servers,
                 registered_mcp_server_matches_config,
             )
 
-            await asyncio.to_thread(register_mcp_servers, config_map)
+            def _register_pinned() -> None:
+                # new_session/load_session run outside the per-turn cwd pin; the session's
+                # logical cwd is the default stdio child cwd (tools/mcp_tool_transport.py::
+                # _run_stdio), so pin it here before registering (#021a4bfa9b upstream).
+                set_session_cwd(getattr(state, "cwd", None))
+                register_mcp_servers(config_map)
+
+            await asyncio.to_thread(_register_pinned)  # to_thread already runs in a copied context
             if "switchboard_orch" in config_map:
                 trusted = await asyncio.to_thread(
                     registered_mcp_server_matches_config,
@@ -1284,6 +1296,8 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         self, protocol_version: int | None = None, client_capabilities: ClientCapabilities | None = None,
         client_info: Implementation | None = None, **kwargs: Any,
     ) -> InitializeResponse:
+        from hermes_cli.version_info import get_version_info
+
         auth_methods = build_auth_methods()
         logger.info(
             "Initialize from %s (protocol v%s)", client_info.name if client_info else "unknown",
@@ -1292,7 +1306,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
 
         return InitializeResponse(
             protocol_version=acp.PROTOCOL_VERSION,
-            agent_info=Implementation(name="hermes-agent", version=HERMES_VERSION),
+            agent_info=Implementation(name="hermes-agent", version=get_version_info().base_version),
             agent_capabilities=AgentCapabilities(
                 load_session=True,
                 prompt_capabilities=PromptCapabilities(image=True),
@@ -1413,24 +1427,22 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             "field_meta": self._session_meta(state),
         }
 
+    async def _attach_session_mcp(self, state: SessionState, mcp_servers: list | None, log: str, *log_args) -> None:
+        await self._register_session_mcp_servers(state, mcp_servers)
+        self._schedule_mcp_late_refresh(state)
+        logger.info(log, *log_args)
+
     async def new_session(
         self,
         cwd: str,
         mcp_servers: list | None = None,
         **kwargs: Any,
     ) -> NewSessionResponse:
-        state = self.session_manager.create_session(cwd=cwd)
-        await self._register_session_mcp_servers(state, mcp_servers)
-        self._schedule_mcp_late_refresh(state)
-        logger.info("New session %s (cwd=%s)", state.session_id, cwd)
-        self._schedule_available_commands_update(state.session_id)
-        self._schedule_usage_update(state)
-        return NewSessionResponse(
-            session_id=state.session_id,
-            models=self._build_model_state(state),
-            modes=self._session_modes(state),
-            field_meta=self._session_meta(state),
-        )
+        # Agent construction (config, memory-provider import, SessionDB) is slow and fully
+        # blocking; inline it froze the loop serving every JSON-RPC request (#58083).
+        state = await asyncio.to_thread(self.session_manager.create_session, cwd=cwd)
+        await self._attach_session_mcp(state, mcp_servers, "New session %s (cwd=%s)", state.session_id, cwd)
+        return NewSessionResponse(session_id=state.session_id, **await self._session_response_fields(state))
 
     async def load_session(
         self,
@@ -1440,44 +1452,12 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         **kwargs: Any,
     ) -> LoadSessionResponse | None:
         self._guard_first_bind(session_id, "session/load")
-        state = self.session_manager.update_cwd(session_id, cwd)
+        state = await asyncio.to_thread(self.session_manager.update_cwd, session_id, cwd)
         if state is None:
             logger.warning("load_session: session %s not found", session_id)
             return None
-        await self._register_session_mcp_servers(state, mcp_servers)
-        self._schedule_mcp_late_refresh(state)
-        logger.info("Loaded session %s", session_id)
-        # Per ACP spec, `session/load` must stream the prior conversation back
-        # to the client via `session/update` notifications BEFORE responding,
-        # so the client receives the full transcript within the load request's
-        # lifetime. Awaiting the replay here matches Codex / Claude Code /
-        # OpenCode / Pi and the Zed client (which registers the session-update
-        # routing entry before awaiting the loadSession RPC specifically so
-        # in-call history replay updates can find the thread). Deferring this
-        # via `loop.call_soon` (as we did briefly in May 2026) broke every
-        # spec-compliant ACP client that measures notifications synchronously
-        # against the load response — see #12285 follow-up.
-        try:
-            await self._replay_session_history(state)
-        except Exception:
-            # Replay is best-effort — a corrupted or unexpected message shape
-            # must not turn a successful session/load into a JSON-RPC error
-            # response. Per-notification failures are already caught inside
-            # ``_replay_session_history``; this outer guard covers anything
-            # raised by the helpers themselves before reaching ``_send``.
-            logger.warning(
-                "ACP history replay raised during session/load for %s — "
-                "load will still succeed, partial transcript may be missing",
-                session_id,
-                exc_info=True,
-            )
-        self._schedule_available_commands_update(session_id)
-        self._schedule_usage_update(state)
-        return LoadSessionResponse(
-            models=self._build_model_state(state),
-            modes=self._session_modes(state),
-            field_meta=self._session_meta(state),
-        )
+        await self._attach_session_mcp(state, mcp_servers, "Loaded session %s", session_id)
+        return LoadSessionResponse(**await self._session_response_fields(state, "load"))
 
     async def resume_session(
         self,
@@ -1487,36 +1467,18 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         **kwargs: Any,
     ) -> ResumeSessionResponse:
         self._guard_first_bind(session_id, "session/resume")
-        state = self.session_manager.update_cwd(session_id, cwd)
+        state = await asyncio.to_thread(self.session_manager.update_cwd, session_id, cwd)
         if state is None:
             logger.warning("resume_session: session %s not found, creating new", session_id)
-            state = self.session_manager.create_session(cwd=cwd)
-        await self._register_session_mcp_servers(state, mcp_servers)
-        self._schedule_mcp_late_refresh(state)
-        logger.info("Resumed session %s", state.session_id)
-        # See `load_session` above for the spec rationale — replay must
-        # complete before the response so clients receive the full transcript
-        # within the request's lifetime.
-        try:
-            await self._replay_session_history(state)
-        except Exception:
-            logger.warning(
-                "ACP history replay raised during session/resume for %s — "
-                "resume will still succeed, partial transcript may be missing",
-                state.session_id,
-                exc_info=True,
-            )
-        self._schedule_available_commands_update(state.session_id)
-        self._schedule_usage_update(state)
-        return ResumeSessionResponse(
-            models=self._build_model_state(state),
-            modes=self._session_modes(state),
-            field_meta=self._session_meta(state),
-        )
+            state = await asyncio.to_thread(self.session_manager.create_session, cwd=cwd)
+        await self._attach_session_mcp(state, mcp_servers, "Resumed session %s", state.session_id)
+        return ResumeSessionResponse(**await self._session_response_fields(state, "resume"))
 
     async def cancel(self, session_id: str, **kwargs: Any) -> None:
         self._guard_owned_session(session_id, "session/cancel")
-        state = self.session_manager.get_session(session_id)
+        # get_session restores a not-in-memory id from the DB (full AIAgent build) and waits
+        # on the restore lock — off the loop, like new/load/resume/fork (#58083).
+        state = await asyncio.to_thread(self.session_manager.get_session, session_id)
         if state and state.cancel_event:
             async with state.turn_terminal_lock:
                 with state.runtime_lock:
@@ -1549,6 +1511,12 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                     try:
                         if getattr(state, "agent", None):
                             request_hard_interrupt(state.agent)
+                            # Background delegations are detached from the turn's fan-out; they end with the cancel.
+                            from tools.async_delegation import interrupt_for_session
+                            interrupt_for_session(
+                                parent_session_id=str(getattr(state.agent, "session_id", "") or ""),
+                                reason="acp_cancel",
+                            )
                     except Exception:
                         logger.debug(
                             "Failed to interrupt ACP session %s",
@@ -1572,7 +1540,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 "orchestration session"
             )
         self._guard_owned_session(session_id, "session/fork")
-        state = self.session_manager.fork_session(session_id, cwd=cwd)
+        state = await asyncio.to_thread(self.session_manager.fork_session, session_id, cwd=cwd)
         new_id = state.session_id if state else ""
         if state is not None:
             await self._register_session_mcp_servers(state, mcp_servers)
@@ -1614,18 +1582,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
 
     # ---- Prompt (core) ------------------------------------------------------
 
-    async def prompt(
-        self,
-        prompt: list[
-            TextContentBlock
-            | ImageContentBlock
-            | AudioContentBlock
-            | ResourceContentBlock
-            | EmbeddedResourceContentBlock
-        ],
-        session_id: str,
-        **kwargs: Any,
-    ) -> PromptResponse:
+    async def prompt(self, prompt: list[PromptBlock], session_id: str, **kwargs: Any) -> PromptResponse:
         """Run Hermes on the user's prompt and stream events back to the editor."""
         # ``session/prompt`` cannot establish ownership: doing so would let an
         # arbitrary prompt restore a stranger's durable session. Retain the
@@ -1637,7 +1594,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             return PromptResponse(stop_reason="refusal")
         self._guard_owned_session(session_id, "session/prompt")
         try:
-            state = self.session_manager.get_session(session_id)
+            state = await asyncio.to_thread(self.session_manager.get_session, session_id)
         except UnsafeSessionTranscriptError as exc:
             logger.error("prompt refused: %s", exc)
             if self._conn:
@@ -1740,7 +1697,9 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         # send the whole multimodal prompt to the agent instead of treating it as
         # an ACP command.
         if text_only_prompt and isinstance(user_content, str) and user_text.startswith("/"):
-            response_text = self._handle_slash_command(user_text, state)
+            # Off the loop: /model validates through switch_model (network I/O) and /compress
+            # calls the LLM; handlers are sync and hold no loop-bound state.
+            response_text = await asyncio.to_thread(self._handle_slash_command, user_text, state)
             if isinstance(response_text, RunPromptAfterCommand):
                 # e.g. /goal <text>, /goal resume, /skill <name>: emit the notice, then fall
                 # through into the normal turn path below with the sentinel's prompt_text as
@@ -1755,6 +1714,8 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                     update = acp.update_agent_message_text(response_text)
                     await self._conn.session_update(session_id, update)
                     await self._send_usage_update(state)
+                # A mutating command held command_op; prompts that arrived mid-op are queued.
+                await self._drain_queued_prompts(state, session_id, self._conn)
                 return PromptResponse(stop_reason="end_turn")
 
         # If the client sends another regular text prompt while this ACP session
@@ -1769,9 +1730,11 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         queued_depth: int | None = None
         async with state.turn_terminal_lock:
             with state.runtime_lock:
-                if state.is_running:
+                # A state-mutating command (command_op) has no live turn to redirect into.
+                if state.is_running or state.command_op:
                     if (
-                        text_only_prompt
+                        state.is_running
+                        and text_only_prompt
                         and isinstance(user_content, str)
                         and getattr(
                             state.agent,
@@ -1841,6 +1804,9 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         edit_approval_requester = None
 
         if conn:
+            # Shared with the step callback so a runtime that projects
+            # ``tool.completed`` closes each call once, not twice.
+            turn_state: dict[str, Any] = {}
             tool_progress_cb = make_tool_progress_cb(
                 conn,
                 session_id,
@@ -1848,10 +1814,16 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 tool_call_ids,
                 tool_call_meta,
                 edit_approval_policy_getter=lambda: self._edit_approval_policy_for_state(state),
+                turn_state=turn_state,
             )
-            reasoning_cb = make_thinking_cb(conn, session_id, loop)
+            # Per-session allocator: a new turn must never reuse a previous turn's
+            # assistant messageId (ACP clients replace the bubble with that id).
+            if state.message_ids is None:
+                state.message_ids = AssistantMessageIdAllocator()
+            state.message_ids.close()  # new turn -> next chunk opens a fresh id
+            reasoning_cb = make_thinking_cb(conn, session_id, loop, state.message_ids)
             base_step_cb = make_step_cb(
-                conn, session_id, loop, tool_call_ids, tool_call_meta
+                conn, session_id, loop, tool_call_ids, tool_call_meta, turn_state
             )
 
             def step_cb(api_call_count: int, prev_tools: Any = None) -> None:
@@ -1876,7 +1848,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                         if tool_call_id:
                             delegation_tool_calls[delegation_id] = tool_call_id
                 base_step_cb(api_call_count, prev_tools)
-            message_cb = make_message_cb(conn, session_id, loop)
+            message_cb = make_message_cb(conn, session_id, loop, state.message_ids)
 
             def stream_delta_cb(text: str) -> None:
                 nonlocal streamed_message
@@ -1884,7 +1856,9 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                     streamed_message = True
                 message_cb(text)
 
-            approval_cb = make_approval_callback(conn.request_permission, loop, session_id)
+            # Closes the synthetic permission-request bubble once the user has answered.
+            send_update = lambda update: _send_update(conn, session_id, loop, update)  # noqa: E731
+            approval_cb = make_approval_callback(conn.request_permission, loop, session_id, send_update=send_update)
             try:
                 from acp_adapter.edit_approval import make_acp_edit_approval_requester
 
@@ -1893,6 +1867,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                     loop,
                     session_id,
                     auto_approve_getter=lambda: self._edit_approval_policy_for_state(state),
+                    send_update=send_update,
                 )
             except Exception:
                 logger.debug("Could not create ACP edit approval requester", exc_info=True)
@@ -2148,6 +2123,14 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                         clear_session_vars(session_tokens)
                     except Exception:
                         logger.debug("Could not clear ACP session context", exc_info=True)
+                # Still on the executor thread: _send_update blocks on the loop here (unlike
+                # the post-executor flush below, which only schedules a task on the loop
+                # thread), so flushing now lands the update before the PromptResponse.
+                if conn:
+                    try:
+                        flush_open_tool_calls(conn, session_id, loop, tool_call_ids, tool_call_meta)
+                    except Exception:
+                        logger.debug("Could not flush open ACP tool calls for %s", session_id, exc_info=True)
 
         while True:
             streamed_message = False
@@ -2693,6 +2676,14 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                         # Deliver the final response when streaming did not already
                         # send it, or when a plugin transformed it afterwards.
                         update = acp.update_agent_message_text(final_response)
+                        if state.message_ids is not None:
+                            # A plugin-rewritten reply replaces the streamed bubble (same id); an
+                            # unstreamed final response opens its own.
+                            if streamed_message and result.get("response_transformed"):
+                                update.message_id = state.message_ids.last() or state.message_ids.current()
+                            else:
+                                update.message_id = state.message_ids.current()
+                            state.message_ids.close()
                         await conn.session_update(session_id, update)
 
                     terminal_winner = state.turn_terminal_winner
@@ -2992,29 +2983,48 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
 
     # ---- Session settings (ACP protocol methods) -----------------------------
 
-    def _cmd_version(self, args: str, state: SessionState) -> str:
-        """Show the Hermes version together with the active Git identity."""
-        try:
-            from hermes_cli.banner import get_git_build_identity
-
-            identity = get_git_build_identity()
-        except Exception:
-            identity = None
-        suffix = f" · {identity}" if identity else ""
-        return f"Hermes Agent v{HERMES_VERSION}{suffix}"
-
     async def set_session_model(
         self, model_id: str, session_id: str, **kwargs: Any
     ) -> SetSessionModelResponse | None:
         """Switch the model for a session (called by ACP protocol)."""
         self._guard_owned_session(session_id, "session/set_model")
-        state = self.session_manager.get_session(session_id)
-        if state:
+        state = await asyncio.to_thread(self.session_manager.get_session, session_id)
+        if state is None:
+            logger.warning("Session %s: model switch requested for missing session", session_id)
+            return None
+        # The picker swaps state.agent wholesale; mid-turn that strands the running agent and
+        # makes the turn emit a spurious compression-rotation update. Same exclusion as
+        # the /model slash command.
+        with state.runtime_lock:
+            if state.is_running or state.command_op:
+                raise acp.RequestError(-32603, "Session is busy; switch models while the session is idle")
+            state.command_op = True
+        try:
+            from hermes_cli.config import get_compatible_custom_providers, load_config
+            from hermes_cli.model_switch import switch_model
+            from hermes_cli.models import parse_model_input
+
             current_provider = getattr(state.agent, "provider", None)
-            requested_provider, resolved_model = self._resolve_model_selection(
-                model_id,
-                current_provider or "openrouter",
-            )
+            explicit_provider, model_input = parse_model_input(model_id, "")
+            cfg = load_config()
+            # switch_model() does synchronous network I/O (models.dev, custom-endpoint probes,
+            # ~10 s cold) — off the loop, like the gateway, so other ACP sessions keep flowing.
+            result = await asyncio.to_thread(
+                switch_model,
+                raw_input=model_input, explicit_provider=explicit_provider,
+                current_provider=current_provider or "openrouter", current_model=str(state.model or ""),
+                current_base_url=str(getattr(state.agent, "base_url", "") or ""),
+                current_api_key=str(getattr(state.agent, "api_key", "") or ""),
+                user_providers=cfg.get("providers") if isinstance(cfg.get("providers"), dict) else {},
+                custom_providers=get_compatible_custom_providers(cfg))
+            if not result.success:
+                # A model no provider can serve is a bad ``modelId`` param (-32602), not an agent
+                # internal error (-32603): the client attributes it to the request, not to Hermes (#72439).
+                from acp.exceptions import RequestError
+                raise RequestError.invalid_params(
+                    {"details": result.error_message or f"Cannot switch to {model_id}"}
+                )
+            requested_provider, resolved_model = result.target_provider, result.new_model
             provider_changed = bool(current_provider and requested_provider != current_provider)
             current_base_url = None if provider_changed else getattr(state.agent, "base_url", None)
             current_api_mode = None if provider_changed else getattr(state.agent, "api_mode", None)
@@ -3030,26 +3040,29 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 _dispose_replaced_agent(new_agent)
                 raise RuntimeError("Failed to restore ACP MCP servers for model switch")
             self._commit_model_switch(state, model=resolved_model, new_agent=new_agent)
-            logger.info(
-                "Session %s: model switched to %s via provider %s",
-                session_id,
-                resolved_model,
-                requested_provider,
-            )
-            # The caller's model-switch acknowledgement must describe the
-            # replacement agent, not the pre-switch snapshot.  In managed
-            # Switchboard mode this is the evidence that the trusted MCP
-            # surface survived the mandatory rebuild.
-            return SetSessionModelResponse(_meta=self._session_meta(state))
-        logger.warning("Session %s: model switch requested for missing session", session_id)
-        return None
+        finally:
+            with state.runtime_lock:
+                state.command_op = False
+            # Drain AFTER this response is queued, never inside it: a prompt that arrived
+            # mid-switch would otherwise run a whole turn before the client sees the
+            # (possibly failed) switch result.
+            self._schedule_soon(lambda: self._drain_queued_prompts(state, session_id, self._conn))
+        logger.info(
+            "Session %s: model switched to %s via provider %s",
+            session_id, resolved_model, requested_provider,
+        )
+        # The caller's model-switch acknowledgement must describe the
+        # replacement agent, not the pre-switch snapshot.  In managed
+        # Switchboard mode this is the evidence that the trusted MCP
+        # surface survived the mandatory rebuild.
+        return SetSessionModelResponse(_meta=self._session_meta(state))
 
     async def set_session_mode(
         self, mode_id: str, session_id: str, **kwargs: Any
     ) -> SetSessionModeResponse | None:
         """Persist the editor-requested mode so ACP clients do not fail on mode switches."""
         self._guard_owned_session(session_id, "session/set_mode")
-        state = self.session_manager.get_session(session_id)
+        state = await asyncio.to_thread(self.session_manager.get_session, session_id)
         if state is None:
             logger.warning("Session %s: mode switch requested for missing session", session_id)
             return None
@@ -3066,7 +3079,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
     ) -> SetSessionConfigOptionResponse | None:
         """Accept ACP config option updates even when Hermes has no typed ACP config surface yet."""
         self._guard_owned_session(session_id, "session/set_config_option")
-        state = self.session_manager.get_session(session_id)
+        state = await asyncio.to_thread(self.session_manager.get_session, session_id)
         if state is None:
             logger.warning("Session %s: config update requested for missing session", session_id)
             return None

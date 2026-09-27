@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import threading
+import uuid
 from collections import deque
 from typing import Any, Callable, Deque, Dict
 
@@ -19,9 +20,12 @@ import acp
 from acp.schema import AgentPlanUpdate, PlanEntry
 
 from .tools import (
+    _json_loads_maybe,
     _text as _tool_text,
+    build_tool_abandoned,
     build_tool_complete,
     build_tool_start,
+    coerce_tool_args,
     make_tool_call_id,
 )
 
@@ -173,6 +177,36 @@ def _send_update(
 # Tool progress callback
 # ------------------------------------------------------------------
 
+def _upgrade_queue(tool_call_ids: Dict[str, Deque[str]], name: str) -> Deque[str] | None:
+    """Fetch the per-tool FIFO of pending call IDs, upgrading a legacy bare-string entry in place."""
+    queue = tool_call_ids.get(name)
+    if isinstance(queue, str):
+        queue = tool_call_ids[name] = deque([queue])
+    return queue
+
+
+def flush_open_tool_calls(
+    conn: acp.Client, session_id: str, loop: asyncio.AbstractEventLoop, tool_call_ids: Dict[str, Deque[str]],
+    tool_call_meta: Dict[str, Dict[str, Any]],
+) -> int:
+    """Close every tool call still open at the end of a turn, and report how many there were.
+
+    A tool blocked by scope, guardrail or an editor permission prompt never
+    projects ``tool.completed``, so without this its bubble stays ``in_progress``
+    forever and clients read the turn as one that never ran a tool."""
+    open_calls = [(name, list(queue)) for name, queue in list(tool_call_ids.items()) if queue]
+    flushed = 0
+    for name, ids in open_calls:
+        for tc_id in ids:
+            tool_call_meta.pop(tc_id, None)
+            _send_update(conn, session_id, loop, build_tool_abandoned(tc_id, name))
+            flushed += 1
+        tool_call_ids.pop(name, None)
+    if flushed:
+        logger.debug("Flushed %d ACP tool call(s) left open at turn end", flushed)
+    return flushed
+
+
 def make_tool_progress_cb(
     conn: acp.Client,
     session_id: str,
@@ -180,6 +214,7 @@ def make_tool_progress_cb(
     tool_call_ids: Dict[str, Deque[str]],
     tool_call_meta: Dict[str, Dict[str, Any]],
     edit_approval_policy_getter: Callable[[], tuple[str, str | None]] | None = None,
+    turn_state: Dict[str, Any] | None = None,
 ) -> Callable:
     """Create a ``tool_progress_callback`` for AIAgent.
 
@@ -191,6 +226,8 @@ def make_tool_progress_cb(
     ordinary ``tool.completed`` events by their stable tool-call ID. The FIFO
     remains as a compatibility fallback for producers without stable IDs and
     for ``delegate_task``, whose completion has separate background semantics.
+    ``turn_state["saw_completion"]`` stands the step-callback fallback down
+    once a completion has been handled here.
     """
 
     # Per-child delegate_task subagent calls (subagent_id -> ACP tool call id)
@@ -377,11 +414,15 @@ def make_tool_progress_cb(
         if isinstance(event_type, str) and event_type.startswith("subagent."):
             _handle_subagent_event(event_type, name, preview, kwargs)
             return
-        if event_type == "tool.completed" and name != "delegate_task":
-            queue = tool_call_ids.get(name or "")
-            if isinstance(queue, str):
-                queue = deque([queue])
-                tool_call_ids[name] = queue
+        if event_type == "tool.completed" and name:
+            if turn_state is not None:
+                turn_state["saw_completion"] = True
+            # delegate_task's completion has separate background/async dispatch-card
+            # semantics (see tools.py's build_async_background_completion); it never
+            # closes through this immediate fast path.
+            if name == "delegate_task":
+                return
+            queue = _upgrade_queue(tool_call_ids, name)
             source_id = str(kwargs.get("tool_call_id") or "").strip()
             tc_id = None
             if queue:
@@ -399,12 +440,14 @@ def make_tool_progress_cb(
             meta = tool_call_meta.get(tc_id, {})
             result = kwargs.get("result")
             try:
+                # The executor's verdict: a cancelled/errored tool may return plain text the heuristic misses.
                 update = build_tool_complete(
                     tc_id,
                     name,
                     result=result,
                     function_args=meta.get("args"),
                     snapshot=meta.get("snapshot"),
+                    is_error=bool(kwargs.get("is_error")),
                 )
             except Exception:
                 # Leave the call tracked so the end-turn flush can still close
@@ -475,23 +518,78 @@ def make_tool_progress_cb(
 
 
 # ------------------------------------------------------------------
-# Thinking callback
+# Assistant message identity
 # ------------------------------------------------------------------
 
+
+class AssistantMessageIdAllocator:
+    """Allocates stable per-message ids for streamed assistant chunks.
+
+    ACP clients group streamed ``agent_message_chunk`` / ``agent_thought_chunk``
+    deltas into one assistant reply by ``messageId`` and use a NEW id to start
+    the next reply (root-reply replacement semantics). Without ids, a client
+    that replaces "the current assistant message" on each chunk collapses
+    separate autonomous turns into one bubble.
+
+    One allocator lives per ACP session; a contiguous run of deltas shares
+    ``current()`` and ``close()`` marks the message finished so the next delta
+    allocates a fresh id. Ids are UUID4 strings because the ACP schema requires
+    UUID-format message ids, and a fresh UUID can never collide with an earlier
+    turn's id.
+    """
+
+    def __init__(self) -> None:
+        self._active: str | None = None
+        self._last: str | None = None
+
+    def current(self) -> str:
+        """Return the active message id, allocating one if none is open."""
+        if self._active is None:
+            self._active = self._last = str(uuid.uuid4())
+        return self._active
+
+    def last(self) -> str | None:
+        """Return the most recently allocated id (open or closed)."""
+        return self._last
+
+    def close(self) -> None:
+        """End the active message; the next chunk starts a new id."""
+        self._active = None
+
+
+def _make_text_cb(
+    conn: acp.Client, session_id: str, loop: asyncio.AbstractEventLoop, wrap: Callable[[str], Any],
+    message_ids: AssistantMessageIdAllocator | None = None,
+) -> Callable:
+    # ``None`` is the flush sentinel Hermes core sends between assistant messages
+    # (before tool execution / at end of stream): it closes the active messageId so
+    # the next delta opens a new bubble instead of merging into the previous one.
+    def _cb(text: str | None) -> None:
+        if text:
+            update = wrap(text)
+            if message_ids is not None:
+                update.message_id = message_ids.current()
+            _send_update(conn, session_id, loop, update)
+        elif text is None and message_ids is not None:
+            message_ids.close()
+
+    return _cb
+
+
 def make_thinking_cb(
-    conn: acp.Client,
-    session_id: str,
-    loop: asyncio.AbstractEventLoop,
+    conn: acp.Client, session_id: str, loop: asyncio.AbstractEventLoop,
+    message_ids: AssistantMessageIdAllocator | None = None,
 ) -> Callable:
     """Create a ``thinking_callback`` for AIAgent."""
+    return _make_text_cb(conn, session_id, loop, acp.update_agent_thought_text, message_ids)
 
-    def _thinking(text: str) -> None:
-        if not text:
-            return
-        update = acp.update_agent_thought_text(text)
-        _send_update(conn, session_id, loop, update)
 
-    return _thinking
+def make_message_cb(
+    conn: acp.Client, session_id: str, loop: asyncio.AbstractEventLoop,
+    message_ids: AssistantMessageIdAllocator | None = None,
+) -> Callable:
+    """Create a callback that streams agent response text to the editor."""
+    return _make_text_cb(conn, session_id, loop, acp.update_agent_message_text, message_ids)
 
 
 # ------------------------------------------------------------------
@@ -504,6 +602,7 @@ def make_step_cb(
     loop: asyncio.AbstractEventLoop,
     tool_call_ids: Dict[str, Deque[str]],
     tool_call_meta: Dict[str, Dict[str, Any]],
+    turn_state: Dict[str, Any] | None = None,
 ) -> Callable:
     """Create a ``step_callback`` for AIAgent.
 
@@ -525,109 +624,50 @@ def make_step_cb(
             elif isinstance(tool_info, str):
                 tool_name = tool_info
 
-            queue = tool_call_ids.get(tool_name or "")
-            if isinstance(queue, str):
-                queue = deque([queue])
-                tool_call_ids[tool_name] = queue
-            if tool_name and queue:
-                tc_id = queue.popleft()
-                meta = tool_call_meta.pop(tc_id, {})
-                if isinstance(function_args, str):
-                    try:
-                        function_args = json.loads(function_args)
-                    except (json.JSONDecodeError, TypeError):
-                        function_args = None
-                if not isinstance(function_args, dict):
-                    function_args = meta.get("args")
-                update = build_tool_complete(
-                    tc_id,
-                    tool_name,
-                    result=(
-                        result
-                        if isinstance(result, str)
-                        else json.dumps(result, ensure_ascii=False)
-                        if isinstance(result, (dict, list))
-                        else str(result)
-                        if result is not None
-                        else None
-                    ),
-                    function_args=function_args,
-                    snapshot=meta.get("snapshot"),
-                )
-                _send_update(conn, session_id, loop, update)
-                if tool_name in {"todo", "todo_list"}:
-                    plan_update = _build_plan_update_from_todo_result(result)
-                    if plan_update is not None:
-                        _send_update(conn, session_id, loop, plan_update)
-                if not queue:
-                    tool_call_ids.pop(tool_name, None)
-            elif tool_name:
-                # No queued start for this completion: the pairing FIFO can
-                # drift on long turns (steering/compression rewrite the
-                # message history prev_tools is rebuilt from). Log instead
-                # of silently dropping so wire-level completion loss is
-                # diagnosable; flush_open_tool_calls() closes the inverse
-                # case (started-but-never-completed) at turn end.
-                logger.debug(
-                    "ACP completion for %r has no queued tool_call id; dropping",
-                    tool_name,
-                )
+            if not tool_name:
+                continue
+            # ``tool.completed`` already closed this call with its own result;
+            # this callback is the fallback for runtimes that never project one.
+            if not (turn_state or {}).get("saw_completion"):
+                queue = _upgrade_queue(tool_call_ids, tool_name)
+                if queue:
+                    tc_id = queue.popleft()
+                    meta = tool_call_meta.pop(tc_id, {})
+                    # ``prev_tools`` carries the wire ``arguments`` JSON *string*; the content
+                    # builders index it as a dict, so an uncoerced string raised inside this
+                    # (swallowed) callback and the bubble never closed.
+                    update = build_tool_complete(
+                        tc_id,
+                        tool_name,
+                        result=(
+                            result
+                            if isinstance(result, str)
+                            else json.dumps(result, ensure_ascii=False)
+                            if isinstance(result, (dict, list))
+                            else str(result)
+                            if result is not None
+                            else None
+                        ),
+                        function_args=coerce_tool_args(function_args) if function_args else meta.get("args"),
+                        snapshot=meta.get("snapshot"),
+                    )
+                    _send_update(conn, session_id, loop, update)
+                    if not queue:
+                        tool_call_ids.pop(tool_name, None)
+                else:
+                    # No queued start for this completion: the pairing FIFO can
+                    # drift on long turns (steering/compression rewrite the
+                    # message history prev_tools is rebuilt from). Log instead
+                    # of silently dropping so wire-level completion loss is
+                    # diagnosable; flush_open_tool_calls() closes the inverse
+                    # case (started-but-never-completed) at turn end.
+                    logger.debug(
+                        "ACP completion for %r has no queued tool_call id; dropping",
+                        tool_name,
+                    )
+            if tool_name in {"todo", "todo_list"}:
+                plan_update = _build_plan_update_from_todo_result(result)
+                if plan_update is not None:
+                    _send_update(conn, session_id, loop, plan_update)
 
     return _step
-
-
-def flush_open_tool_calls(
-    conn: acp.Client,
-    session_id: str,
-    loop: asyncio.AbstractEventLoop,
-    tool_call_ids: Dict[str, Deque[str]],
-    tool_call_meta: Dict[str, Dict[str, Any]],
-) -> int:
-    """Close every tool call that never received a completion this turn.
-
-    The name-keyed FIFO pairing in ``make_step_cb`` loses completions on long
-    turns (live evidence 2026-07-19: 61 tool_call starts vs 22 updates in one
-    session), leaving clients with stuck in-progress items. Called at the end
-    of a prompt turn so the wire always converges; results are unknown by then,
-    so frames carry status=completed with no content.
-    """
-    flushed = 0
-    for tool_name in list(tool_call_ids.keys()):
-        queue = tool_call_ids.pop(tool_name)
-        if isinstance(queue, str):
-            queue = deque([queue])
-        while queue:
-            tc_id = queue.popleft()
-            meta = tool_call_meta.pop(tc_id, {})
-            update = build_tool_complete(
-                tc_id,
-                tool_name,
-                result=None,
-                function_args=meta.get("args"),
-                snapshot=meta.get("snapshot"),
-            )
-            _send_update(conn, session_id, loop, update)
-            flushed += 1
-    if flushed:
-        logger.debug("Flushed %d unclosed ACP tool call(s) at turn end", flushed)
-    return flushed
-
-
-# ------------------------------------------------------------------
-# Agent message callback
-# ------------------------------------------------------------------
-
-def make_message_cb(
-    conn: acp.Client,
-    session_id: str,
-    loop: asyncio.AbstractEventLoop,
-) -> Callable:
-    """Create a callback that streams agent response text to the editor."""
-
-    def _message(text: str) -> None:
-        if not text:
-            return
-        update = acp.update_agent_message_text(text)
-        _send_update(conn, session_id, loop, update)
-
-    return _message

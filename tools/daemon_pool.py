@@ -24,11 +24,11 @@ class DaemonThreadPoolExecutor(ThreadPoolExecutor):
     """ThreadPoolExecutor variant whose workers do not block process exit."""
 
     def submit(self, fn, /, *args, **kwargs):
-        """Submit a callable, propagating the caller's contextvars. Stdlib only does
-        this from 3.14; on 3.11-3.13 a bare worker starts with an EMPTY Context and
-        drops profile secret scope / HERMES_HOME override — under the multiplexed
-        gateway a credential read then fails closed with ``UnscopedSecretError``.
-        Unconditional: on 3.14+ ``ctx.run`` re-applies the same context (no-op)."""
+        """Keep each task in its caller's profile scope, even on a reused worker.
+
+        Thread-start context cannot track later submissions from other profiles
+        (#54937). The stdlib worker context manages initialization, not contextvars.
+        """
         ctx = copy_context()
 
         def _run_with_context(*call_args, **call_kwargs):
@@ -36,38 +36,35 @@ class DaemonThreadPoolExecutor(ThreadPoolExecutor):
         return super().submit(_run_with_context, *args, **kwargs)
 
     def _adjust_thread_count(self) -> None:
-        # Mirrors CPython's implementation (3.8–3.14) with two changes:
+        # Mirrors CPython's implementation with two changes:
         # daemon=True and no _threads_queues registration.
         if self._idle_semaphore.acquire(timeout=0):
             return
 
         def weakref_cb(_, q=self._work_queue):
             q.put(None)
-
         num_threads = len(self._threads)
         if num_threads < self._max_workers:
             thread_name = "%s_%d" % (self._thread_name_prefix or self, num_threads)
-            # Python 3.14 refactored ThreadPoolExecutor: _worker now takes
-            # (executor_ref, worker_context, work_queue) and __init__ no longer
-            # stores _initializer/_initargs (they live in the worker context).
+            executor_ref = weakref.ref(self, weakref_cb)
             if hasattr(self, "_create_worker_context"):
+                # Python 3.14 replaced _initializer/_initargs with a factory
+                # that supplies the worker's initializer context.
                 worker_args = (
-                    weakref.ref(self, weakref_cb),
+                    executor_ref,
                     self._create_worker_context(),
                     self._work_queue,
                 )
             else:
                 worker_args = (
-                    weakref.ref(self, weakref_cb),
+                    executor_ref,
                     self._work_queue,
                     self._initializer,
                     self._initargs,
                 )
             t = threading.Thread(
-                name=thread_name,
-                target=_worker,
+                name=thread_name, target=_worker, daemon=True,
                 args=worker_args,
-                daemon=True,
             )
             t.start()
             self._threads.add(t)

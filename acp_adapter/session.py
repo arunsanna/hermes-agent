@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -189,17 +190,9 @@ def _expand_acp_enabled_toolsets(
     mcp_server_names: List[str] | None = None,
 ) -> List[str]:
     """Return ACP toolsets plus explicit MCP server toolsets for this session."""
-    expanded: List[str] = []
-    for name in list(toolsets or ["hermes-acp"]):
-        if name and name not in expanded:
-            expanded.append(name)
-
-    for server_name in list(mcp_server_names or []):
-        toolset_name = f"mcp-{server_name}"
-        if server_name and toolset_name not in expanded:
-            expanded.append(toolset_name)
-
-    return expanded
+    names = [n for n in (["hermes-acp"] if toolsets is None else toolsets) if n]
+    names += [f"mcp-{s}" for s in (mcp_server_names or []) if s]
+    return list(dict.fromkeys(names))
 
 
 def _clear_task_cwd(task_id: str) -> None:
@@ -224,6 +217,11 @@ class SessionState:
     history: List[Dict[str, Any]] = field(default_factory=list)
     cancel_event: Any = None  # threading.Event
     is_running: bool = False
+    # A state-mutating slash command (/reset, /compress, /model) is in flight. Turn claims
+    # must queue behind it: /compress's LLM call and /model's agent rebuild take seconds, so
+    # a bare is_running check in the slash thread would leave a check-then-act window where
+    # a prompt claims the turn mid-mutation.
+    command_op: bool = False
     queued_prompts: List[str] = field(default_factory=list)
     runtime_lock: Any = field(default_factory=Lock)
     turn_terminal_lock: Any = field(default_factory=asyncio.Lock)
@@ -233,6 +231,9 @@ class SessionState:
     transcript_correction_poisoned: bool = False
     transcript_correction_poison_persisted: bool | None = None
     goal_manager: Any = None  # hermes_cli.goals.GoalManager, lazily built (see commands._get_goal_manager)
+    # Per-session allocator for ACP assistant messageIds (lazily created by
+    # the server so streamed chunks group into distinct assistant replies).
+    message_ids: Any = None
 
 
 class OwnedSessions:
@@ -346,8 +347,12 @@ class SessionManager:
         """
         self._sessions: Dict[str, SessionState] = {}
         self._lock = Lock()
+        # Serializes DB restores: session construction runs off the event loop, so two
+        # overlapping session/load for one id must share a single agent build.
+        self._restore_lock = Lock()
         self._agent_factory = agent_factory
         self._db_instance = db  # None → lazy-init on first use
+        self._cwd_backfilled = False
         self._owned_sessions = OwnedSessions()
 
     @property
@@ -359,23 +364,11 @@ class SessionManager:
 
     def create_session(self, cwd: str = ".") -> SessionState:
         """Create a new session with a unique ID and a fresh AIAgent."""
-        import threading
-
         cwd = _translate_acp_cwd(cwd)
         session_id = str(uuid.uuid4())
         agent = self._make_agent(session_id=session_id, cwd=cwd)
-        state = SessionState(
-            session_id=session_id,
-            agent=agent,
-            cwd=cwd,
-            model=getattr(agent, "model", "") or "",
-            cancel_event=threading.Event(),
-        )
-        with self._lock:
-            self._sessions[session_id] = state
         self._owned_sessions.add(session_id)
-        _register_task_cwd(session_id, cwd)
-        self._persist(state)
+        state = self._install_state(session_id, agent, cwd, getattr(agent, "model", "") or "", [])
         logger.info("Created ACP session %s (cwd=%s)", session_id, cwd)
         return state
 
@@ -390,8 +383,13 @@ class SessionManager:
         if state is not None:
             self._raise_if_transcript_poisoned(state)
             return state
-        # Attempt to restore from database.
-        return self._restore(session_id)
+        with self._restore_lock:
+            with self._lock:
+                state = self._sessions.get(session_id)  # a concurrent restore may have installed it
+            if state is not None:
+                self._raise_if_transcript_poisoned(state)
+                return state
+            return self._restore(session_id)
 
     def peek_session(self, session_id: str) -> Optional[SessionState]:
         """Return *session_id* only if it is already resident in THIS process.
@@ -424,8 +422,6 @@ class SessionManager:
 
     def fork_session(self, session_id: str, cwd: str = ".") -> Optional[SessionState]:
         """Deep-copy a session's history into a new session."""
-        import threading
-
         from acp_adapter.orchestration import requested_orchestration_mode
 
         if requested_orchestration_mode() is not None:
@@ -446,19 +442,9 @@ class SessionManager:
             cwd=cwd,
             model=original.model or None,
         )
-        state = SessionState(
-            session_id=new_id,
-            agent=agent,
-            cwd=cwd,
-            model=getattr(agent, "model", original.model) or original.model,
-            history=copy.deepcopy(original.history),
-            cancel_event=threading.Event(),
-        )
-        with self._lock:
-            self._sessions[new_id] = state
+        model = getattr(agent, "model", original.model) or original.model
         self._owned_sessions.add(new_id)
-        _register_task_cwd(new_id, cwd)
-        self._persist(state)
+        state = self._install_state(new_id, agent, cwd, model, copy.deepcopy(original.history))
         logger.info("Forked ACP session %s -> %s", session_id, new_id)
         return state
 
@@ -545,6 +531,11 @@ class SessionManager:
         state.cwd = cwd
         _register_task_cwd(session_id, cwd)
         self._persist(state)
+        # Promote the authoritative column and claim an ordering generation, the
+        # same contract tui_gateway/session_workdir.py uses: a git probe may only
+        # publish while its generation is still current, so a slow probe for a
+        # previous workspace cannot overwrite a newer claim (A -> B -> A).
+        self._schedule_git_metadata(state, self._claim_cwd_generation(state))
         return state
 
     def cleanup(self) -> None:
@@ -599,29 +590,71 @@ class SessionManager:
         state.transcript_correction_poison_persisted = None
         return True
 
+    def end_all_sessions(self, end_reason: str = "acp_disconnect") -> int:
+        """Stamp ``ended_at`` on every live session (#118216).
+
+        ACP v0.9 has no per-session destroy, so the stdio shutdown that ends
+        this process is the session end: the client that drove the
+        conversation is gone. Without this writer, source='acp' rows keep
+        ``ended_at`` NULL forever and the ended-session guard shared by
+        prune/archive (``hermes_state_maintenance``) can never reach them.
+        A later load/resume reopens the row (see ``_restore``), the same
+        contract the TUI gateway's resume path uses. Best-effort: teardown
+        must never raise. Returns the number of sessions ended.
+        """
+        db = self._get_db()
+        if db is None:
+            return 0
+        with self._lock:
+            session_ids = list(self._sessions.keys())
+        ended = 0
+        for session_id in session_ids:
+            try:
+                db.end_session(session_id, end_reason)
+                ended += 1
+            except Exception:
+                logger.debug("Failed to end ACP session %s", session_id, exc_info=True)
+        if ended:
+            logger.info("Ended %d ACP session(s) on shutdown (%s)", ended, end_reason)
+        return ended
+
     # ---- persistence via SessionDB ------------------------------------------
 
+    def _install_state(self, session_id: str, agent: Any, cwd: str, model: str,
+                       history: List[Dict[str, Any]], *, persist: bool = True) -> SessionState:
+        """Build a SessionState, register it in memory, bind its cwd for tools, optionally persist."""
+        state = SessionState(session_id=session_id, agent=agent, cwd=cwd, model=model,
+                             history=history, cancel_event=threading.Event())
+        with self._lock:
+            self._sessions[session_id] = state
+        _register_task_cwd(session_id, cwd)
+        if persist:
+            self._persist(state)
+        return state
+
     def _get_db(self):
-        """Lazily initialise and return the SessionDB instance.
-
-        Returns ``None`` if the DB is unavailable (e.g. import error in a
-        minimal test environment).
-
-        Note: we resolve ``HERMES_HOME`` dynamically rather than relying on
-        the module-level ``DEFAULT_DB_PATH`` constant, because that constant
-        is evaluated at import time and won't reflect env-var changes made
-        later (e.g. by the test fixture ``_isolate_hermes_home``).
-        """
-        if self._db_instance is not None:
-            return self._db_instance
-        try:
-            from hermes_state import SessionDB
-            hermes_home = get_hermes_home()
-            self._db_instance = SessionDB(db_path=hermes_home / "state.db")
-            return self._db_instance
-        except Exception:
-            logger.debug("SessionDB unavailable for ACP persistence", exc_info=True)
-            return None
+        """Lazily acquire the process-shared SessionDB; ``None`` if unavailable (e.g. import
+        error in a minimal test env). ``HERMES_HOME`` is resolved here, not via the import-time
+        ``DEFAULT_DB_PATH``, so test fixtures that change the env var later are honoured. The
+        registry handle is the one in-process tools (delegation, session_search, goals) also
+        acquire, so the ACP server holds ONE writer on state.db instead of two (#100896)."""
+        if self._db_instance is None:
+            try:
+                from hermes_state_registry import acquire
+                self._db_instance = acquire(get_hermes_home() / "state.db")
+            except Exception:
+                logger.debug("SessionDB unavailable for ACP persistence", exc_info=True)
+        if self._db_instance is not None and not self._cwd_backfilled:
+            # Rows minted before the adapter wrote the cwd column still carry the workspace
+            # in model_config; one idempotent UPDATE per process repairs them (#115705).
+            self._cwd_backfilled = True
+            try:
+                repaired = self._db_instance.backfill_acp_session_cwd()
+                if repaired:
+                    logger.info("Backfilled cwd for %d ACP session(s) from model_config", repaired)
+            except Exception:
+                logger.debug("ACP session cwd backfill failed", exc_info=True)
+        return self._db_instance
 
     def _persist(
         self,
@@ -665,10 +698,27 @@ class SessionManager:
                     source="acp",
                     model=model_str,
                     model_config=session_meta,
+                    cwd=state.cwd or None,
                 )
             else:
                 # Update model_config (contains cwd) if changed.
-                db.update_session_meta(state.session_id, cwd_json, model_str)
+                try:
+                    db.update_session_meta(state.session_id, cwd_json, model_str)
+                except Exception:
+                    if not persist_history:
+                        # Metadata-only writes carry the transcript-poison marker;
+                        # a lost write must fail closed, not report persisted.
+                        raise
+                    logger.debug("Failed to update ACP session metadata", exc_info=True)
+                # The create branch above is not the live path: an agent that owns
+                # persistence to this same DB flushes the transcript incrementally,
+                # so the row already exists by the time we get here.
+                # update_session_meta touches only model_config/model, so without
+                # this promotion the column stays NULL for the whole session and
+                # Desktop files it as unassigned. Claiming a generation keeps the
+                # A -> B -> A ordering contract shared with update_cwd().
+                if state.cwd:
+                    self._schedule_git_metadata(state, self._claim_cwd_generation(state))
 
             if not persist_history:
                 return True
@@ -799,10 +849,52 @@ class SessionManager:
         )
         return safe_history
 
+    def _claim_cwd_generation(self, state: SessionState) -> Optional[int]:
+        """Write the cwd column and return its new git-metadata generation.
+
+        Returns None when the row does not exist yet (a contentless session is
+        deliberately ephemeral until it has history) or the DB is unavailable.
+        """
+        db = self._get_db()
+        if db is None or not state.cwd:
+            return None
+        try:
+            return db.update_session_cwd(state.session_id, state.cwd)
+        except Exception:
+            logger.debug("Failed to persist ACP session cwd column for %s",
+                         state.session_id, exc_info=True)
+            return None
+
+    def _schedule_git_metadata(self, state: SessionState, generation: Optional[int]) -> None:
+        """Probe git off the critical path and publish under ``generation``.
+
+        ``session/new`` is on the editor's interactive path; ``git rev-parse``
+        on a cold or networked filesystem is not something to put in front of
+        the user. The generation guard in ``publish_session_git_metadata``
+        means a slow probe for a previous workspace is dropped rather than
+        applied to the new one.
+        """
+        if not generation or not state.cwd:
+            return
+
+        session_id, cwd = state.session_id, state.cwd
+
+        def _run() -> None:
+            try:
+                from tui_gateway import git_probe
+                branch, root = git_probe.branch(cwd), git_probe.common_repo_root(cwd)
+                if not (branch or root):
+                    return
+                db = self._get_db()
+                if db is not None:
+                    db.publish_session_git_metadata(session_id, cwd, generation, branch, root)
+            except Exception:
+                logger.debug("Failed to publish ACP git metadata for %s", session_id, exc_info=True)
+
+        threading.Thread(target=_run, name=f"acp-git-meta-{session_id[:8]}", daemon=True).start()
+
     def _restore(self, session_id: str) -> Optional[SessionState]:
         """Load a session from the database into memory, recreating the AIAgent."""
-        import threading
-
         db = self._get_db()
         if db is None:
             return None
@@ -819,6 +911,15 @@ class SessionManager:
         # Only restore ACP sessions.
         if row.get("source") != "acp":
             return None
+
+        # A previous adapter process stamped the row ended at its stdio
+        # shutdown (#118216); resuming the conversation reopens it, the same
+        # contract the TUI gateway's cold-resume path uses.
+        if row.get("ended_at") is not None:
+            try:
+                db.reopen_session(session_id)
+            except Exception:
+                logger.debug("Failed to reopen ACP session %s", session_id, exc_info=True)
 
         # Extract cwd/provider metadata from model_config. Reading this is
         # safe even for a poisoned session — it is routing/identity data,
@@ -880,17 +981,8 @@ class SessionManager:
             logger.warning("Failed to recreate agent for ACP session %s", session_id, exc_info=True)
             return None
 
-        state = SessionState(
-            session_id=session_id,
-            agent=agent,
-            cwd=cwd,
-            model=model or getattr(agent, "model", "") or "",
-            history=history,
-            cancel_event=threading.Event(),
-        )
-        with self._lock:
-            self._sessions[session_id] = state
-        _register_task_cwd(session_id, cwd)
+        state = self._install_state(session_id, agent, cwd, model or getattr(agent, "model", "") or "",
+                                    history, persist=False)
         logger.info("Restored ACP session %s from DB (%d messages)", session_id, len(history))
         return state
 
@@ -912,23 +1004,20 @@ class SessionManager:
 
     # ---- internal -----------------------------------------------------------
 
-    def _make_agent(
-        self,
-        *,
-        session_id: str,
-        cwd: str,
-        model: str | None = None,
-        requested_provider: str | None = None,
-        base_url: str | None = None,
-        api_mode: str | None = None,
-    ):
+    def _make_agent(self, *, session_id: str, cwd: str, model: str | None = None,
+                    requested_provider: str | None = None, base_url: str | None = None, api_mode: str | None = None,
+                    enabled_toolsets: list[str] | None = None, disabled_toolsets: list[str] | None = None):
+        """``enabled_toolsets``/``disabled_toolsets`` carry a live session's toolsets into a rebuild; ``None`` derives
+        them from config (fresh session)."""
         if self._agent_factory is not None:
             return self._agent_factory()
 
         from run_agent import AIAgent
+        from agent.skill_utils import parse_config_string_list
         from hermes_cli.config import load_config
         from hermes_cli.runtime_provider import resolve_runtime_provider
-        from hermes_constants import parse_reasoning_effort
+        from hermes_cli.tools_config import _get_platform_tools, enabled_mcp_server_names
+        from hermes_constants import parse_reasoning_effort, resolve_reasoning_config
 
         config = load_config()
         max_iterations = _resolve_acp_max_iterations(config)
@@ -946,32 +1035,38 @@ class SessionManager:
         elif isinstance(model_cfg, str) and model_cfg.strip():
             default_model = model_cfg.strip()
 
-        from acp_adapter.orchestration import without_reserved_switchboard_mcp
+        if enabled_toolsets is None:
+            # The same per-platform resolver as the gateway/cron/api_server: platform_toolsets.acp wins, else
+            # hermes-acp; its MCP half (every enabled server, a listed-name allowlist, or none for ``no_mcp``)
+            # comes back as bare server names, which ACP keys as ``mcp-<server>`` like its session servers.
+            from acp_adapter.orchestration import without_reserved_switchboard_mcp
 
-        configured_mcp_servers = [
-            name
-            for name, cfg in without_reserved_switchboard_mcp(
-                config.get("mcp_servers")
-            ).items()
-            if not isinstance(cfg, dict) or cfg.get("enabled", True) is not False
-        ]
-        agent_cfg = config.get("agent")
-        configured_reasoning_effort = (
-            str(agent_cfg.get("reasoning_effort") or "")
-            if isinstance(agent_cfg, dict)
-            else ""
-        )
+            # A managed bridge process's reserved MCP server may only enter through ACP session/new,
+            # never through this config-driven discovery path — filter it out of the resolver's view.
+            tools_config = config
+            if config.get("mcp_servers"):
+                tools_config = dict(config)
+                tools_config["mcp_servers"] = without_reserved_switchboard_mcp(config.get("mcp_servers"))
+            resolved = _get_platform_tools(tools_config, "acp")
+            mcp_servers = resolved & enabled_mcp_server_names(tools_config)
+            enabled_toolsets = _expand_acp_enabled_toolsets(sorted(resolved - mcp_servers), sorted(mcp_servers))
+
         session_reasoning_effort = (
             os.environ.get("HERMES_SESSION_REASONING_EFFORT") or ""
         ).strip().lower()
-        requested_reasoning_effort = (
-            session_reasoning_effort or configured_reasoning_effort
-        ).strip().lower()
-        reasoning_config = (
-            {"enabled": True, "effort": requested_reasoning_effort}
-            if requested_reasoning_effort in {"max", "ultra"}
-            else parse_reasoning_effort(requested_reasoning_effort)
-        )
+        if session_reasoning_effort:
+            # Switchboard-injected per-session override wins over config: it is set on the
+            # dedicated bridge process's environment and cannot be expressed in config.yaml.
+            reasoning_config = (
+                {"enabled": True, "effort": session_reasoning_effort}
+                if session_reasoning_effort in {"max", "ultra"}
+                else parse_reasoning_effort(session_reasoning_effort)
+            )
+        else:
+            # Same chokepoint as the CLI/gateway/TUI/cron: without it ``agent.reasoning_effort: none`` never
+            # reaches an ACP session and the transport applies its default effort (a 400 on non-reasoning
+            # models). Resolved against the session's model so per-model overrides apply.
+            reasoning_config = resolve_reasoning_config(config, model or default_model)
         effective_reasoning_effort = (
             str(reasoning_config.get("effort") or "").lower()
             if isinstance(reasoning_config, dict)
@@ -980,14 +1075,15 @@ class SessionManager:
 
         kwargs = {
             "platform": "acp",
-            "enabled_toolsets": _expand_acp_enabled_toolsets(
-                ["hermes-acp"],
-                mcp_server_names=configured_mcp_servers,
-            ),
             "quiet_mode": True,
             "session_id": session_id,
             "session_db": self._get_db(),
+            "enabled_toolsets": list(enabled_toolsets),
+            # agent.disabled_toolsets is subtracted at tool granularity by the agent, as on the CLI/gateway/cron.
+            "disabled_toolsets": (list(disabled_toolsets) if disabled_toolsets is not None
+                                  else parse_config_string_list((config.get("agent") or {}).get("disabled_toolsets")) or None),
             "model": model or default_model,
+            "cwd": cwd,
             "max_iterations": max_iterations,
             "reasoning_config": reasoning_config,
         }
@@ -1000,8 +1096,10 @@ class SessionManager:
 
         apply_orchestration_tool_policy(kwargs)
 
+        resolve_error: Exception | None = None
         try:
-            runtime = resolve_runtime_provider(requested=requested_provider or config_provider)
+            runtime = resolve_runtime_provider(
+                requested=requested_provider or config_provider, target_model=(model or default_model) or None)
             runtime_provider = runtime.get("provider")
             runtime_api_mode = api_mode or runtime.get("api_mode")
             if (
@@ -1015,11 +1113,13 @@ class SessionManager:
                     "api_mode": runtime_api_mode,
                     "base_url": base_url or runtime.get("base_url"),
                     "api_key": runtime.get("api_key"),
+                    "credential_pool": runtime.get("credential_pool"),
                     "command": runtime.get("command"),
                     "args": list(runtime.get("args") or []),
                 }
             )
-        except Exception:
+        except Exception as exc:
+            resolve_error = exc
             logger.debug("ACP session falling back to default provider resolution", exc_info=True)
 
         _register_task_cwd(session_id, cwd)
@@ -1047,11 +1147,15 @@ class SessionManager:
         except Exception:
             logger.debug("ACP: bounded MCP discovery wait failed", exc_info=True)
 
-        agent = AIAgent(**kwargs)
-        # Codex app-server sessions are spawned lazily on the first turn. Stamp
-        # the ACP workspace onto the agent so the Codex runtime starts from the
-        # editor/session cwd instead of the Hermes daemon's process cwd.
-        agent.session_cwd = cwd
+        try:
+            agent = AIAgent(**kwargs)
+        except Exception as exc:
+            # The bare-AIAgent fallback dies with "No LLM provider configured. Run `hermes setup`" on a
+            # machine that is configured and was working a call earlier; the swallowed resolution
+            # failure (revoked OAuth, disabled provider, ...) is the actionable error (#91090).
+            if resolve_error is not None:
+                raise resolve_error from exc
+            raise
         # ACP stdio transport requires stdout to remain protocol-only JSON-RPC.
         # Route any incidental human-readable agent output to stderr instead.
         agent._print_fn = _acp_stderr_print
