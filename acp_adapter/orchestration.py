@@ -116,7 +116,7 @@ def without_switchboard_tool_search_bridge(
 def _switchboard_parent_tool_names() -> set[str]:
     """Read the discovery-backed approved MCP allowlist without startup coupling."""
     try:
-        from tools.mcp_tool import (
+        from tools.mcp_tool_registration import (
             get_switchboard_parent_read_only_tool_names,
             get_switchboard_parent_tool_names,
         )
