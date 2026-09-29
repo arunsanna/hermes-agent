@@ -149,7 +149,13 @@ def test_acp_refusal_closes_the_turn_and_is_not_replayed_into_the_next_prompt(ac
     provider, prompt, conversation_rows, db, sid, conn, server = acp
 
     provider.script = [{"finish_reason": "content_filter", "content": _REFUSAL_DETAIL}]
-    prompt(_REFUSED)
+    # Switchboard reports provider failures through JSON-RPC, not assistant prose.
+    from acp.exceptions import RequestError
+
+    with pytest.raises(RequestError, match="safety filter") as refused:
+        prompt(_REFUSED)
+    assert refused.value.code == -32001
+    assert _REFUSAL_DETAIL in str(refused.value)
 
     rows = conversation_rows()
     assert [r[0] for r in rows] == ["user", "assistant"], rows

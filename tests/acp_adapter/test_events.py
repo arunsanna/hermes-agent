@@ -155,10 +155,8 @@ class TestToolProgressCallback:
             "tool_call", "tool_call_update",
         ]
         assert updates[-1].tool_call_id == "call-render-failure"
-        # flush_open_tool_calls() now closes unresolved calls via build_tool_abandoned()
-        # (status="failed") rather than build_tool_complete(result=None) (status="completed") —
-        # a blocked/denied/interrupted call that never got a real result is honestly "failed".
-        assert updates[-1].status == "failed"
+        # Switchboard preserves the observed snapshot and terminalizes the card.
+        assert updates[-1].status == "completed"
 
     def test_completion_schedule_failure_stays_tracked_for_end_turn_flush(
         self, mock_conn, event_loop_fixture
@@ -403,7 +401,7 @@ class TestToolCallsAlwaysReachATerminalStatus:
 
     Two invariants: every call is closed exactly once from its own ``tool.completed``
     (the ``prev_tools`` step closer stands down once completions arrive), and whatever
-    is still open at turn end is failed with BOTH per-turn dicts drained together."""
+    is still open at turn end is completed with BOTH per-turn dicts drained together."""
 
     def _patch(self):
         return patch("acp_adapter.events.asyncio.run_coroutine_threadsafe")
@@ -423,12 +421,12 @@ class TestToolCallsAlwaysReachATerminalStatus:
         )
         assert list(ids["read"]) == ["tc-2"] and "tc-1" not in meta
 
-    def test_step_fallback_coerces_wire_arguments_and_turn_end_flush_fails_what_is_still_open(
+    def test_step_fallback_coerces_wire_arguments_and_turn_end_flush_closes_what_is_still_open(
         self, mock_conn, event_loop_fixture,
     ):
         """No completion projected: the step closer must survive the JSON-string ``arguments``
         the wire carries (a real ``write_file`` close raised on ``.get`` and was swallowed);
-        a denied edit is then failed at turn end, draining ``tool_call_ids`` AND ``tool_call_meta``."""
+        an unresolved edit is then terminalized at turn end, draining ``tool_call_ids`` AND ``tool_call_meta``."""
         from collections import deque
 
         from acp_adapter.events import flush_open_tool_calls
@@ -443,7 +441,7 @@ class TestToolCallsAlwaysReachATerminalStatus:
             assert flush_open_tool_calls(mock_conn, "s", event_loop_fixture, ids, meta) == 1
             assert flush_open_tool_calls(mock_conn, "s", event_loop_fixture, ids, meta) == 0
         statuses = [c.args[1].status for c in mock_conn.session_update.call_args_list]
-        assert statuses == ["completed", "failed"]
+        assert statuses == ["completed", "completed"]
         assert ids == {} and meta == {}
 
     def test_tool_completed_is_error_flag_closes_the_call_as_failed(self, mock_conn, event_loop_fixture):

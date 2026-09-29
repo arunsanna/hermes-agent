@@ -202,6 +202,7 @@ def test_mcp_schema_normalization_keeps_properties_map_as_property_schemas():
         "type": "object",
         "additionalProperties": True,
         "properties": {},
+        "required": [],
     }
 
 class TestLoadMCPConfig:

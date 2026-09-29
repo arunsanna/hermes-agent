@@ -1,79 +1,52 @@
-"""Mid-tail failure in _finish_turn must not wedge the session running (#115588).
+"""A mid-tail transport failure releases the real prompt lifecycle and drains its queue."""
 
-An exception in the _finish_turn tail (persist/provenance/final-text sends)
-used to skip the bare is_running=False release, leaving the session wedged
-running and queued prompts stranded. The tail must release is_running /
-current_prompt_text in a finally and still drain the queue.
-"""
-
-from __future__ import annotations
-
-import asyncio
-import threading
 from types import SimpleNamespace
 
 import pytest
 
+from acp.schema import TextContentBlock
 from acp_adapter.server import HermesACPAgent
-from acp_adapter.session import SessionState
+from acp_adapter.session import SessionManager
 
 
-class _BoomConn:
-    """Fails the final-text session_update once (transient mid-tail failure)."""
+@pytest.mark.asyncio
+async def test_finish_turn_mid_tail_failure_releases_and_drains(monkeypatch):
+    runs = []
 
-    def __init__(self) -> None:
-        self.calls = 0
+    def run_conversation(**kwargs):
+        runs.append(kwargs["user_message"])
+        return {"final_response": "done", "messages": []}
 
-    async def session_update(self, session_id, update):
-        self.calls += 1
-        if self.calls == 1:
-            raise RuntimeError("mid-tail boom")
-
-
-async def _noop_coro(*args, **kwargs):
-    return None
-
-
-def _make_server():
-    server = HermesACPAgent.__new__(HermesACPAgent)
-    server.session_manager = SimpleNamespace(save_session=lambda sid: None)
-    server._conn = None
-    drained = []
-
-    async def fake_prompt(*, prompt, session_id, **kwargs):
-        from acp.schema import PromptResponse
-
-        drained.append(([getattr(b, "text", None) for b in prompt], session_id))
-        return PromptResponse(stop_reason="end_turn")
-
-    server.prompt = fake_prompt  # type: ignore[method-assign]
-    server._send_usage_update = _noop_coro  # type: ignore[method-assign]
-    return server, drained
-
-
-def _running_state() -> SessionState:
-    return SessionState(
-        session_id="s1",
-        agent=SimpleNamespace(session_id="h1"),
-        history=[],
-        cancel_event=None,
-        is_running=True,
-        queued_prompts=["queued-one"],
-        runtime_lock=threading.Lock(),
-        current_prompt_text="hello",
+    agent = SimpleNamespace(
+        session_id="h1", model="m", run_conversation=run_conversation,
+        _required_delegation_launching=False,
+        _has_unconsumed_required_delegations=lambda: False,
     )
+    manager = SessionManager(agent_factory=lambda: agent)
+    server = HermesACPAgent(session_manager=manager)
+    state = manager.create_session(cwd=".")
+    monkeypatch.setattr(manager, "save_session", lambda sid: None)
+    monkeypatch.setattr(server, "_ensure_delegation_watcher", lambda loop: None)
+    monkeypatch.setattr("tools.async_delegation.running_for_session", lambda *a: [])
 
+    class BoomConn:
+        calls = 0
 
-def test_finish_turn_mid_tail_failure_releases_and_drains():
-    server, drained = _make_server()
-    state = _running_state()
-    conn = _BoomConn()
-    result = {"final_response": "done", "messages": []}
+        async def request_permission(self, *args, **kwargs):
+            raise AssertionError("no tool approval expected")
 
+        async def session_update(self, session_id, update):
+            self.calls += 1
+            if self.calls == 1:
+                # A prompt accepted during final delivery must drain even if delivery fails.
+                state.queued_prompts.append("queued-one")
+                raise RuntimeError("mid-tail boom")
+
+    server._conn = BoomConn()
     with pytest.raises(RuntimeError, match="mid-tail boom"):
-        asyncio.run(server._finish_turn(state, "s1", conn, result, "h1", False))
+        await server.prompt([TextContentBlock(type="text", text="hello")], state.session_id)
 
     assert state.is_running is False
     assert state.current_prompt_text == ""
     assert state.queued_prompts == []
-    assert drained == [(["queued-one"], "s1")]
+    assert runs == ["hello", "queued-one"]

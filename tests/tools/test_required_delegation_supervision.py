@@ -1302,7 +1302,7 @@ def test_stream_and_interim_sinks_stay_closed_until_terminal_result_consumed():
         lambda message: message.get("content", "")
     )
     owner._interim_text_was_delivered = lambda text: False
-    owner._interim_content_was_streamed = lambda text: False
+    owner._interim_content_fully_streamed = lambda text: False
     owner._record_delivered_interim_text = lambda text: None
     owner._extract_codex_interim_visible_parts = lambda message: []
 
@@ -1395,7 +1395,7 @@ def test_acp_provisional_gate_buffers_commentary_and_nonstreaming_interim():
     owner._interim_assistant_visible_text = (
         lambda message: message.get("content", "")
     )
-    owner._interim_content_was_streamed = lambda _text: False
+    owner._interim_content_fully_streamed = lambda _text: False
     owner._fire_streamed_codex_commentary = (
         lambda text: AIAgent._fire_streamed_codex_commentary(owner, text)
     )
@@ -1438,6 +1438,7 @@ def test_acp_reasoning_stays_live_during_required_supervision():
     delivered = []
     owner = _owner()
     owner.reasoning_callback = delivered.append
+    owner._call_quietly = AIAgent._call_quietly
     owner._stream_writer_superseded = lambda: False
     owner._has_unconsumed_required_delegations = lambda: True
     owner._acp_provisional_stream_active = True

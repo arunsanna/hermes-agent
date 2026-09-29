@@ -67,6 +67,8 @@ async def test_handlers_restore_unknown_sessions_off_the_loop(call):
         return None
 
     manager._restore = slow_restore
+    # This process previously bound the now-evicted session; foreign IDs stay forbidden.
+    manager.owned_sessions.add("gone")
     server = HermesACPAgent(session_manager=manager)
     ticks = 0
     done = asyncio.Event()

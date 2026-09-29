@@ -23,6 +23,12 @@ class Agent(StatusOutputMixin):
         self._print_fn = lambda *a, **k: self.printed.append(" ".join(map(str, a)))
         self.status_callback = lambda k, t: self.observed.append((k, t))
 
+    def _finish_acp_provisional_stream(self, **kwargs):
+        pass
+
+    def _has_unconsumed_required_delegations(self):
+        return False
+
     def _has_stream_consumers(self):
         return False
 
@@ -54,7 +60,7 @@ def test_outer_loop_diagnostic_preserves_verdict_and_trace(policy, local, capsys
         except RuntimeError as exc:
             verdict = handle_outer_loop_error(agent, e=exc, _outer_error_count=0,
                 api_call_count=1, messages=[], conversation_history=[],
-                _turn_exit_reason=None, failed=False, final_response="")
+                _turn_exit_reason=None, failed=False, final_response="", interrupted=False)
     output = capsys.readouterr().out + "\n".join(agent.printed)
     assert ("raw engine diagnostic detail" in output) is not policy
     assert verdict.action == "break"

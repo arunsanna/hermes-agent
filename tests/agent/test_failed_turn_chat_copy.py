@@ -174,7 +174,7 @@ def test_outer_loop_error_copy_has_no_apology_and_routes_to_gateway_layer():
     except TypeError as exc:
         verdict = handle_outer_loop_error(
             agent, e=exc, _outer_error_count=7, api_call_count=2, messages=[], conversation_history=None,
-            _turn_exit_reason="unknown", failed=False, final_response=None,
+            _turn_exit_reason="unknown", failed=False, final_response=None, interrupted=False,
         )
     assert verdict.action == "break" and verdict.failed is True
     text = verdict.final_response
@@ -198,7 +198,7 @@ def test_interpreter_shutdown_copy_substitutes_the_real_session_id():
     verdict = handle_outer_loop_error(
         agent, e=RuntimeError("cannot schedule new futures after interpreter shutdown"),
         _outer_error_count=0, api_call_count=1, messages=[], conversation_history=None,
-        _turn_exit_reason="unknown", failed=False, final_response=None,
+        _turn_exit_reason="unknown", failed=False, final_response=None, interrupted=False,
     )
     assert "hermes --resume 20260914_abc" in verdict.final_response
     assert "<session-id>" not in verdict.final_response

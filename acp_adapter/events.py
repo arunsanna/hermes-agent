@@ -14,6 +14,7 @@ import os
 import threading
 import uuid
 from collections import deque
+from contextvars import ContextVar
 from typing import Any, Callable, Deque, Dict
 
 import acp
@@ -22,7 +23,6 @@ from acp.schema import AgentPlanUpdate, PlanEntry
 from .tools import (
     _json_loads_maybe,
     _text as _tool_text,
-    build_tool_abandoned,
     build_tool_complete,
     build_tool_start,
     coerce_tool_args,
@@ -30,6 +30,9 @@ from .tools import (
 )
 
 logger = logging.getLogger(__name__)
+
+# A turn awaits its scheduled writes after leaving the worker, never under child locks.
+_pending_turn_updates: ContextVar[list[Any] | None] = ContextVar("acp_turn_updates", default=None)
 
 
 def _subagent_updates_enabled() -> bool:
@@ -147,6 +150,8 @@ def _send_update(
                 logger.debug("Failed to send ACP update", exc_info=True)
 
         task.add_done_callback(_observe_task)
+        if (pending := _pending_turn_updates.get()) is not None:
+            pending.append(task)
         return True
 
     # Worker-thread callbacks must also stay nonblocking. Some lifecycle
@@ -170,6 +175,8 @@ def _send_update(
             logger.debug("Failed to send ACP update", exc_info=True)
 
     future.add_done_callback(_observe_future)
+    if (pending := _pending_turn_updates.get()) is not None:
+        pending.append(future)
     return True
 
 
@@ -193,13 +200,25 @@ def flush_open_tool_calls(
 
     A tool blocked by scope, guardrail or an editor permission prompt never
     projects ``tool.completed``, so without this its bubble stays ``in_progress``
-    forever and clients read the turn as one that never ran a tool."""
+    forever and clients read the turn as one that never ran a tool.
+
+    Upstream 12d7b4ab9c fails still-open calls (``build_tool_abandoned``); our
+    Switchboard subagent-visibility contract flushes them ``completed`` with the
+    observed result snapshot (counted starts == counted terminal frames, no
+    content pretending to be a result) — test_subagent_visibility.py pins this.
+    """
     open_calls = [(name, list(queue)) for name, queue in list(tool_call_ids.items()) if queue]
     flushed = 0
     for name, ids in open_calls:
         for tc_id in ids:
-            tool_call_meta.pop(tc_id, None)
-            _send_update(conn, session_id, loop, build_tool_abandoned(tc_id, name))
+            meta = tool_call_meta.pop(tc_id, {})
+            _send_update(
+                conn, session_id, loop,
+                build_tool_complete(
+                    tc_id, name, result=None,
+                    function_args=meta.get("args"), snapshot=meta.get("snapshot"),
+                ),
+            )
             flushed += 1
         tool_call_ids.pop(name, None)
     if flushed:

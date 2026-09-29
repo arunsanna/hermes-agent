@@ -1501,6 +1501,16 @@ async def test_executor_error_flushes_dispatch_card_failed(monkeypatch):
         monkeypatch, emit_dispatch=True, connect=True
     )
 
+    send = conn.session_update
+
+    async def yielding_send(session_id, update):
+        # Model a transport that cannot complete its write in the first loop tick.
+        for _ in range(3):
+            await asyncio.sleep(0)
+        await send(session_id, update)
+
+    conn.session_update = yielding_send
+
     class _RunThenRaiseExecutor(ThreadPoolExecutor):
         def submit(self, fn, /, *args, **kwargs):
             def run_then_raise():
@@ -1517,7 +1527,9 @@ async def test_executor_error_flushes_dispatch_card_failed(monkeypatch):
         )
 
     assert response.stop_reason == "end_turn"
+    assert _fake.runs == ["dispatch a reviewer"]
     frames = _dispatch_frames(conn)
+    assert frames, conn.updates
     dispatch_id = next(
         frame.tool_call_id for frame in frames if frame.session_update == "tool_call"
     )

@@ -1,6 +1,7 @@
 """Tests for acp_adapter.server — HermesACPAgent ACP server."""
 
 import asyncio
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, AsyncMock, patch
@@ -17,6 +18,7 @@ from acp.schema import (
     SessionModelState,
     SessionModeState,
     SetSessionConfigOptionResponse,
+    SetSessionModelResponse,
     SessionInfo,
     TextContentBlock,
     ToolCallProgress,
@@ -28,6 +30,7 @@ from acp_adapter.auth import TERMINAL_SETUP_AUTH_METHOD_ID
 from acp_adapter.server import (
     HermesACPAgent,
 )
+from hermes_state import SessionDB
 from acp_adapter.session import SessionManager
 
 
@@ -368,6 +371,20 @@ class TestListAndFork:
 
 
 class TestSessionConfiguration:
+    @pytest.fixture(autouse=True)
+    def accepted_model_selection(self, monkeypatch):
+        # These tests exercise rebuilding/rollback, not provider credentials or catalogs.
+        from hermes_cli.model_switch import ModelSwitchResult
+
+        seen = {}
+
+        def accept(**kw):
+            seen.update(kw)
+            return ModelSwitchResult(success=True, new_model=kw["raw_input"],
+                                     target_provider=kw["explicit_provider"] or kw["current_provider"])
+
+        monkeypatch.setattr("hermes_cli.model_switch.switch_model", accept)
+        return seen
 
     @pytest.mark.asyncio
     async def test_router_accepts_stable_session_config_methods(self, agent):
@@ -447,17 +464,20 @@ class TestSessionConfiguration:
         assert state.agent.api_mode == "codex_app_server"
         assert state.agent.reasoning_config == {"enabled": True, "effort": "ultra"}
 
-    def test_explicit_current_provider_skips_auto_detection(self):
-        with patch(
-            "hermes_cli.models.detect_provider_for_model",
-            side_effect=AssertionError("explicit provider must not be auto-detected"),
-        ):
-            selection = HermesACPAgent._resolve_model_selection(
-                "openai-codex:gpt-5.6-terra",
-                "openai-codex",
-            )
-
-        assert selection == ("openai-codex", "gpt-5.6-terra")
+    @pytest.mark.asyncio
+    async def test_explicit_current_provider_skips_auto_detection(
+        self, agent, mock_manager, accepted_model_selection
+    ):
+        response = await agent.new_session(cwd=".")
+        state = mock_manager.get_session(response.session_id)
+        state.agent.provider = "openai-codex"
+        state.agent._switchboard_orchestration_mcp_registration_verified = False
+        with patch("hermes_cli.models.detect_provider_for_model",
+                   side_effect=AssertionError("explicit provider must not be auto-detected")):
+            await agent.set_session_model("openai-codex:gpt-5.6-terra", response.session_id)
+        assert accepted_model_selection["explicit_provider"] == "openai-codex"
+        assert accepted_model_selection["raw_input"] == "gpt-5.6-terra"
+        assert state.model == "gpt-5.6-terra"
 
     @pytest.mark.asyncio
     async def test_failed_model_rebuild_keeps_previous_agent_and_model(self):
@@ -969,9 +989,9 @@ class TestPrompt:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("executor_raises", [False, True])
-    async def test_prompt_fails_tool_calls_left_open_before_responding(self, agent, mock_manager, executor_raises):
+    async def test_prompt_closes_tool_calls_left_open_before_responding(self, agent, mock_manager, executor_raises):
         """A ``tool.started`` that never sees ``tool.completed`` (blocked/denied/crashed turn) must
-        reach the client as a terminal ``failed`` update BEFORE the PromptResponse — on the normal
+        reach the client as a terminal ``completed`` update BEFORE the PromptResponse — on the normal
         return path and when the executor body itself raises."""
         resp = await agent.new_session(cwd=".")
         state = mock_manager.get_session(resp.session_id)
@@ -980,6 +1000,9 @@ class TestPrompt:
         mock_conn = MagicMock(spec=acp.Client)
 
         async def _record(_sid, update):
+            # A transport may yield before writing. The response must wait for the send.
+            for _ in range(3):
+                await asyncio.sleep(0)
             events.append(update)
 
         mock_conn.session_update = _record
@@ -991,7 +1014,7 @@ class TestPrompt:
                 raise RuntimeError("executor blew up")
             return {"final_response": "ok", "messages": []}
 
-        with patch.object(HermesACPAgent, "_run_agent_turn", side_effect=_turn):
+        with patch.object(state.agent, "run_conversation", side_effect=_turn):
             started = asyncio.get_running_loop().time()
             response = await asyncio.wait_for(
                 agent.prompt(prompt=[TextContentBlock(type="text", text="hi")], session_id=resp.session_id),
@@ -1004,7 +1027,7 @@ class TestPrompt:
         assert isinstance(response, PromptResponse)
         start = next(e for e in seen_before_response if isinstance(e, ToolCallStart))
         closes = [e for e in seen_before_response if isinstance(e, ToolCallProgress) and e.tool_call_id == start.tool_call_id]
-        assert [e.status for e in closes] == ["failed"]
+        assert [e.status for e in closes] == ["completed"]
 
 
 

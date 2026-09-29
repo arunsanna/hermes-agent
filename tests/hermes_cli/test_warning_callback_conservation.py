@@ -12,7 +12,7 @@ class Agent(StatusOutputMixin):
     suppress_status_output = True
     platform = "cli"
 
-    def _touch_activity(self, *args):
+    def _touch_activity(self, *args, **kwargs):
         pass
 
 

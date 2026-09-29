@@ -65,6 +65,7 @@ def emitted_event_names() -> set[str]:
     names.update(_CHILD_DELTA_EVENTS.values())
     for src in (REPO / "tools").glob("delegate_tool*.py"):
         names.update(_SUBAGENT_RELAY.findall(_read(src)))
+    names.discard("subagent.heartbeat")  # supervision-only; the child relay never emits it on the wire
     names.discard("subagent.text")  # mirrored into the watch window as message.delta, never emitted
     from tools.registry import _tool_module_candidates
 
@@ -89,3 +90,18 @@ def test_catalog_covers_the_whole_wire():
     from tui_gateway.contracts import registry
 
     registry.assert_complete(server._methods, emitted_event_names(), sent_server_requests())
+
+
+@pytest.mark.parametrize("platform", ["cli", "acp"])
+def test_supervision_heartbeat_is_not_a_gateway_wire_event(platform):
+    from types import SimpleNamespace
+    from tools.delegate_tool_progress import _build_child_progress_callback
+
+    frames = []
+    parent = SimpleNamespace(platform=platform, _delegate_depth=0,
+                             tool_progress_callback=lambda *a, **kw: frames.append((a, kw)))
+    relay = _build_child_progress_callback(0, "goal", parent, subagent_id="child")
+    relay("subagent.heartbeat", preview="alive", meaningful=False)
+    assert frames == []
+    relay("subagent.start", preview="goal")
+    assert frames[0][0][0] == "subagent.start"

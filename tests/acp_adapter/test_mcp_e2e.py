@@ -59,7 +59,8 @@ class TestMcpRegistrationE2E:
     """Full flow: session with MCP servers → prompt with tool calls → ACP events."""
 
     @pytest.mark.asyncio
-    async def test_session_with_mcp_servers_registers_tools(self, acp_agent, mock_manager):
+    @pytest.mark.parametrize("enabled_toolsets", [[], ["file"]])
+    async def test_session_with_mcp_servers_registers_tools(self, acp_agent, mock_manager, enabled_toolsets):
         """new_session with mcpServers converts them to Hermes config and registers."""
         servers = [
             McpServerStdio(
@@ -75,6 +76,14 @@ class TestMcpRegistrationE2E:
             ),
         ]
 
+        factory = mock_manager._agent_factory
+
+        def configured_agent():
+            agent = factory()
+            agent.enabled_toolsets = enabled_toolsets
+            return agent
+
+        mock_manager._agent_factory = configured_agent
         registered_configs = {}
 
         def mock_register(config_map):
@@ -107,6 +116,9 @@ class TestMcpRegistrationE2E:
         api_cfg = registered_configs["test-api"]
         assert api_cfg["url"] == "https://api.example.com/mcp"
         assert api_cfg["headers"] == {"Authorization": "Bearer tok123"}
+
+        # MCP refresh preserves an explicitly empty/narrowed base surface.
+        assert state.agent.enabled_toolsets == enabled_toolsets + ["mcp-test-fs", "mcp-test-api"]
 
         # Verify agent tool surface was refreshed
         assert state.agent.tools == fake_tools

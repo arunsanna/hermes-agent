@@ -90,7 +90,7 @@ def test_operator_callbacks_keep_diagnostics_and_logs(tmp_path, monkeypatch, cap
         {} if suppress is None else {"display": {"suppress_warning_notifications": suppress}}))
     agent = Emitter()
     agent._print_fn = lambda *a, **k: None
-    agent._touch_activity = lambda *a: None
+    agent._touch_activity = lambda *a, **kw: None
     seen = []
     def record(*args):
         seen.append(args)

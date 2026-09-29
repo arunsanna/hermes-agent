@@ -30,6 +30,7 @@ from acp_adapter.auth import TERMINAL_SETUP_AUTH_METHOD_ID, build_auth_methods, 
 from acp_adapter.commands import RunPromptAfterCommand, SlashCommandsMixin, _estimate_tokens, _get_goal_manager
 from acp_adapter.content import PromptBlock, _content_blocks_to_openai_user_content, _extract_text
 from acp_adapter.events import (
+    _pending_turn_updates,
     AssistantMessageIdAllocator, _build_plan_update_from_todo_result, _send_update, flush_open_tool_calls,
     make_message_cb, make_step_cb, make_thinking_cb, make_tool_progress_cb,
 )
@@ -144,10 +145,14 @@ def _sanitize_failed_turn_history(
     from agent.conversation_loop import (
         _sanitize_required_assistant_candidate,
     )
+    from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND
 
     output = sanitized[:start]
     for message in sanitized[start:]:
         if message.get("role") != "assistant":
+            output.append(message)
+            continue
+        if message.get("display_kind") == FAILED_TURN_DISPLAY_KIND:
             output.append(message)
             continue
         _sanitize_required_assistant_candidate(message)
@@ -1130,7 +1135,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             from agent.memory_manager import inject_memory_provider_tools
 
             enabled_toolsets = _expand_acp_enabled_toolsets(
-                getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"],
+                getattr(state.agent, "enabled_toolsets", None),
                 mcp_server_names=list(config_map),
             )
             state.agent.enabled_toolsets = enabled_toolsets
@@ -1343,6 +1348,16 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             if not await self._send(state.session_id, update, fail_msg="Failed to replay ACP history for session %s"):
                 return
 
+    def _owned_sessions_gate(self) -> OwnedSessions | None:
+        """This manager's ownership gate, or None when it does no ownership tracking.
+
+        The real ``SessionManager`` always carries :class:`OwnedSessions` and every
+        refusal below stays strict for it (Switchboard -32001 contract). Test stubs
+        and embedders that hand the agent a bare manager without the attribute keep
+        the pre-guard behavior instead of crashing on the protocol boundary.
+        """
+        return getattr(self.session_manager, "owned_sessions", None)
+
     def _guard_owned_session(self, session_id: str, method: str) -> None:
         """Refuse *session_id* unless it belongs to this process's owned set.
 
@@ -1353,8 +1368,8 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         those two are the legitimate ways an unbound process binds to an
         existing id in the first place.
         """
-        owned = self.session_manager.owned_sessions
-        if owned.is_owned(session_id):
+        owned = self._owned_sessions_gate()
+        if owned is None or owned.is_owned(session_id):
             return
         primary = owned.primary_id
         logger.warning(
@@ -1378,7 +1393,9 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         calls to either method fall through to the same ownership check as
         every other protocol handler.
         """
-        owned = self.session_manager.owned_sessions
+        owned = self._owned_sessions_gate()
+        if owned is None:
+            return
         denial = owned.check_first_bind(session_id)
         if denial is None:
             return
@@ -1476,9 +1493,14 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
 
     async def cancel(self, session_id: str, **kwargs: Any) -> None:
         self._guard_owned_session(session_id, "session/cancel")
-        # get_session restores a not-in-memory id from the DB (full AIAgent build) and waits
-        # on the restore lock — off the loop, like new/load/resume/fork (#58083).
-        state = await asyncio.to_thread(self.session_manager.get_session, session_id)
+        # Resident sessions need no executor hop; a not-in-memory id restores
+        # from the DB (full AIAgent build) off the loop, like new/load/resume/fork
+        # (#58083). The resident fast path also keeps cancel() off
+        # ``loop.run_in_executor`` while a turn's executor dispatch is pending —
+        # the STOP path must never queue behind the turn it is stopping.
+        state = self.session_manager.peek_session(session_id)
+        if state is None:
+            state = await asyncio.to_thread(self.session_manager.get_session, session_id)
         if state and state.cancel_event:
             async with state.turn_terminal_lock:
                 with state.runtime_lock:
@@ -1589,12 +1611,17 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         # ACP refusal response for a process that has not bound any session
         # yet, though. Once this process owns a session, every unowned id is
         # still rejected by the cross-session guard below.
-        if self.session_manager.owned_sessions.primary_id is None:
+        gate = self._owned_sessions_gate()
+        if gate is not None and gate.primary_id is None:
             logger.error("prompt: session %s not found", session_id)
             return PromptResponse(stop_reason="refusal")
         self._guard_owned_session(session_id, "session/prompt")
+        # Resident lookup is nonblocking, but must still enforce transcript safety.
         try:
-            state = await asyncio.to_thread(self.session_manager.get_session, session_id)
+            if self.session_manager.peek_session(session_id) is not None:
+                state = self.session_manager.get_session(session_id)
+            else:
+                state = await asyncio.to_thread(self.session_manager.get_session, session_id)
         except UnsafeSessionTranscriptError as exc:
             logger.error("prompt refused: %s", exc)
             if self._conn:
@@ -1906,6 +1933,17 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         edit_approval_token = None
         previous_session_id = None
 
+        pending_updates: list[Any] = []
+
+        async def _drain_turn_updates() -> None:
+            updates = list(pending_updates)
+            pending_updates.clear()
+            if updates:
+                await asyncio.gather(
+                    *(asyncio.wrap_future(update) for update in updates),
+                    return_exceptions=True,
+                )
+
         def _run_agent(
             run_user_content=user_content,
             persist_user_message=user_text or "[Image attachment]",
@@ -1976,6 +2014,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                     )
 
             agent._on_session_title = _notify_title_update
+            update_token = _pending_turn_updates.set(pending_updates)
             try:
                 result = agent.run_conversation(
                     user_message=run_user_content,
@@ -2123,14 +2162,14 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                         clear_session_vars(session_tokens)
                     except Exception:
                         logger.debug("Could not clear ACP session context", exc_info=True)
-                # Still on the executor thread: _send_update blocks on the loop here (unlike
-                # the post-executor flush below, which only schedules a task on the loop
-                # thread), so flushing now lands the update before the PromptResponse.
+                # Queue terminal frames on the worker; the async caller awaits their
+                # delivery before responding, without blocking child/STOP callback locks.
                 if conn:
                     try:
                         flush_open_tool_calls(conn, session_id, loop, tool_call_ids, tool_call_meta)
                     except Exception:
                         logger.debug("Could not flush open ACP tool calls for %s", session_id, exc_info=True)
+                _pending_turn_updates.reset(update_token)
 
         while True:
             streamed_message = False
@@ -2155,6 +2194,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 )
             except Exception:
                 logger.exception("Executor error for session %s", session_id)
+                await _drain_turn_updates()
                 async with state.turn_terminal_lock:
                     executor_cancelled = bool(
                         state.turn_terminal_winner == "cancelled"
@@ -2184,6 +2224,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                     stop_reason="cancelled" if executor_cancelled else "end_turn"
                 )
 
+            await _drain_turn_updates()
             if "messages" in result and isinstance(result["messages"], list):
                 state.history = result["messages"]
 
@@ -2373,6 +2414,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                                 continuation,
                                 continuation,
                             )
+                            await _drain_turn_updates()
                             if "messages" in result and isinstance(result["messages"], list):
                                 state.history = result["messages"]
                             pending = running_for_session(session_id, turn_start_ts)

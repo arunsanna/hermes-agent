@@ -1237,6 +1237,8 @@ class AIAgent(
             self._acp_provisional_stream_buffer = []
         self._current_streamed_assistant_text = ""
         self._stream_visible_text_started = False
+        self._native_reasoning_streamed = False
+        self._stream_reasoning_hooks_enabled = None
 
     def _record_streamed_assistant_text(self, text: str) -> None:
         """Accumulate only visible text from the current, non-superseded stream."""
@@ -1299,6 +1301,9 @@ class AIAgent(
             think_scrubber = getattr(self, "_stream_think_scrubber", None)
             context_scrubber = getattr(self, "_stream_context_scrubber", None)
             text = think_scrubber.feed(text) if think_scrubber is not None else self._strip_think_blocks(text or "")
+            hidden = think_scrubber.last_hidden if think_scrubber is not None else ""
+            if hidden and not getattr(self, "_native_reasoning_streamed", False):
+                self._fire_reasoning_delta(hidden, inline=True)
             text = context_scrubber.feed(text) if context_scrubber is not None else sanitize_context(text)
             if (
                 not prepended_break
@@ -1311,32 +1316,11 @@ class AIAgent(
         self._stream_visible_text_started = True
         self._deliver_scrubbed_stream_delta(text)
 
-    def _fire_reasoning_delta(self, text: str) -> None:
+    def _fire_reasoning_delta(self, text: str, *, inline: bool = False) -> None:
         """Keep reasoning activity live while required children are supervised."""
         if isinstance(text, str) and text:
             self._touch_activity("receiving assistant reasoning", meaningful=True)
-        if self._stream_writer_superseded():
-            self._note_dropped_stream_writer("_fire_reasoning_delta")
-            return
-        callback = getattr(self, "reasoning_callback", None)
-        if callback is not None:
-            try:
-                callback(text)
-            except Exception:
-                pass
-        try:
-            from agent.plugin_stream_hooks import stream_reasoning_deltas_enabled
-
-            if stream_reasoning_deltas_enabled():
-                StreamDeliveryMixin._enqueue_stream_hook(
-                    self,
-                    "on_stream_delta",
-                    label="reasoning on_stream_delta",
-                    delta=text,
-                    kind="reasoning",
-                )
-        except Exception:
-            logger.debug("reasoning on_stream_delta plugin hook enqueue failed", exc_info=True)
+        StreamDeliveryMixin._fire_reasoning_delta(self, text, inline=inline)
 
     def _fire_tool_gen_started(self, tool_name: str) -> None:
         """Mark streamed tool-argument generation as meaningful activity."""
@@ -1399,7 +1383,7 @@ class AIAgent(
         )
         if not visible or visible == "(empty)" or self._interim_text_was_delivered(visible):
             return
-        already_streamed = self._interim_content_was_streamed(visible)
+        already_streamed = self._interim_content_fully_streamed(visible)
         StreamDeliveryMixin._enqueue_stream_hook(
             self,
             "on_interim_message",

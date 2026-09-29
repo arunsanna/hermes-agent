@@ -359,7 +359,7 @@ class _ChildProgressRelay:
                         or winning_status
                     )
         if event_type == "subagent.heartbeat" and not descendant:
-            return
+            return preview, kwargs
         meaningful = (
             (
                 event_type in {

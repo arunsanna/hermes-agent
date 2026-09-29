@@ -1320,7 +1320,10 @@ def test_required_dispatch_processing_error_observes_child_and_clears_latch(
     finally:
         ad._reset_for_tests()
 
-    assert result["completed"] is True
+    # Upstream classifies an error near the iteration limit as a failed turn.
+    assert result["completed"] is False
+    assert result["failed"] is True
+    assert result["failure_reason"] == "loop_error"
     assert "local post-dispatch failure" in result["final_response"]
     wait_results = [
         message for message in result["messages"]

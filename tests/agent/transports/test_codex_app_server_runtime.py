@@ -311,10 +311,12 @@ class TestSpawnEnvIsolation:
         )
         assert "sandbox_workspace_write.network_access=false" in cmd
         assert all("danger" not in part for part in cmd)
-        assert 'mcp_servers.hermes-mcp.env.HERMES_KANBAN_TASK="t_smoke"' in cmd
-        assert 'mcp_servers.hermes-mcp.env.HERMES_DELEGATED_CHILD_CONTEXT=""' in cmd
+        assert f'mcp_servers.{cas.HERMES_TOOLS_MCP_SERVER_NAME}.env.HERMES_KANBAN_TASK="t_smoke"' in cmd
+        assert f'mcp_servers.{cas.HERMES_TOOLS_MCP_SERVER_NAME}.env.HERMES_DELEGATED_CHILD_CONTEXT=""' in cmd
         assert "HERMES_KANBAN_TASK" not in captured["env"]
-        assert captured["env"]["HERMES_DELEGATED_CHILD_CONTEXT"] == "1"
+        from hermes_cli.kanban_db import kanban_home
+
+        assert captured["env"]["HERMES_DELEGATED_CHILD_CONTEXT"] == str(kanban_home())
 
 
 class TestSpawnEnvSecretStripping:

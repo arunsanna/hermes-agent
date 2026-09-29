@@ -640,7 +640,7 @@ def finalize_turn(
         # earlier seam transformed; the normal text turn already did this before its flush and
         # gets the recorded outcome back. Either way the tail close below writes the text the
         # user will see, never the raw model text (#44239).
-        if final_response and not interrupted:
+        if final_response and not interrupted and _turn_exit_reason != "direct_tool_response":
             final_response, _, _ = apply_llm_output_transform(agent, final_response, turn_id=turn_id, logger=logger)
         _close_transcript_tail(agent, messages, final_response, interrupted, _recovered_from_stream)
         if not interrupted and not failed:

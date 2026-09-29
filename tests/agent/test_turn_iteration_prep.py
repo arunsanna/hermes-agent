@@ -69,6 +69,7 @@ def test_restart_refunds_are_bounded_per_turn(flag):
 def _interrupted_agent(tool_interrupt_reason):
     agent = SimpleNamespace(
         _interrupt_requested=True, _tool_interrupt_reason=tool_interrupt_reason, quiet_mode=True,
+        _finish_acp_provisional_stream=lambda **kw: None,
         _drain_pending_redirect=lambda: None, _checkpoint_mgr=SimpleNamespace(new_turn=lambda: None),
     )
     return begin_iteration(
