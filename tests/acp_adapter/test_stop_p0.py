@@ -5,6 +5,7 @@ See docs/plans/stop-p0-brief.md for the full rationale and verified anchors.
 """
 
 import asyncio
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -547,11 +548,23 @@ async def test_initial_executor_exception_drains_queued_prompts(monkeypatch):
     INITIAL executor call (server.py ~L1808) only fires for failures in the
     executor plumbing itself (context copy, executor scheduling, etc.), not
     agent errors. Reproduce that by making `contextvars.copy_context()` blow
-    up before `run_in_executor` is even scheduled."""
-    acp_agent, state, fake, _conn = _make_prompt_agent(monkeypatch)
+    up before `run_in_executor` is even scheduled.
 
-    def _boom(*_args, **_kwargs):
-        raise RuntimeError("boom in initial executor scheduling")
+    ``prompt()`` also restores ``state`` itself via ``asyncio.to_thread`` (off
+    the loop, #58083) and the event loop's own bookkeeping (timer handles for
+    the keepalive task, etc.) calls the same shared ``contextvars.copy_context``
+    internally -- fail only the one call made directly by ``prompt()``'s own
+    frame to wrap the turn's executor dispatch, identified by its caller."""
+    acp_agent, state, fake, _conn = _make_prompt_agent(monkeypatch)
+    import contextvars as _contextvars
+
+    real_copy_context = _contextvars.copy_context
+
+    def _boom(*args, **kwargs):
+        caller = sys._getframe(1)
+        if caller.f_code.co_filename.endswith("acp_adapter/server.py") and caller.f_code.co_name == "prompt":
+            raise RuntimeError("boom in initial executor scheduling")
+        return real_copy_context(*args, **kwargs)
 
     monkeypatch.setattr("acp_adapter.server.contextvars.copy_context", _boom)
     state.queued_prompts.append("queued during initial crash")
@@ -573,13 +586,22 @@ async def test_initial_executor_exception_drains_queued_prompts(monkeypatch):
 @pytest.mark.asyncio
 async def test_stop_wins_initial_executor_scheduling_exception(monkeypatch):
     """A STOP claimed while executor dispatch is pending stays authoritative
-    when that scheduling future later raises."""
+    when that scheduling future later raises.
+
+    ``prompt()`` also restores ``state`` itself via ``asyncio.to_thread`` (off
+    the loop, #58083), which is itself implemented on top of
+    ``loop.run_in_executor(None, ...)`` (default executor) -- let that call
+    run for real and only intercept the later one ``prompt()`` makes with its
+    own explicit executor to dispatch the turn."""
     acp_agent, state, fake, _conn = _make_prompt_agent(monkeypatch)
     loop = asyncio.get_running_loop()
+    real_run_in_executor = loop.run_in_executor
     scheduled = asyncio.Event()
     scheduling_future = loop.create_future()
 
-    def _failing_run_in_executor(*_args, **_kwargs):
+    def _failing_run_in_executor(executor, *args, **kwargs):
+        if executor is None:  # asyncio.to_thread's own default-executor call
+            return real_run_in_executor(executor, *args, **kwargs)
         scheduled.set()
         return scheduling_future
 

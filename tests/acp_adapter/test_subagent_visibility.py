@@ -407,7 +407,10 @@ def test_flush_open_tool_calls_closes_started_tools(sent):
     finals = sent[2:]
     assert len(finals) == 2
     assert all(u.session_update == "tool_call_update" for u in finals)
-    assert all(u.status == "completed" for u in finals)
+    # flush_open_tool_calls() now closes unresolved calls via build_tool_abandoned()
+    # (status="failed") rather than build_tool_complete(result=None) (status="completed") —
+    # a blocked/denied/interrupted call that never got a real result is honestly "failed".
+    assert all(u.status == "failed" for u in finals)
 
 
 def test_flush_with_nothing_open_is_noop(sent):
