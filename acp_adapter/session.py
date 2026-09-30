@@ -363,23 +363,11 @@ class SessionManager:
 
     def create_session(self, cwd: str = ".") -> SessionState:
         """Create a new session with a unique ID and a fresh AIAgent."""
-        import threading
-
         cwd = _translate_acp_cwd(cwd)
         session_id = str(uuid.uuid4())
         agent = self._make_agent(session_id=session_id, cwd=cwd)
-        state = SessionState(
-            session_id=session_id,
-            agent=agent,
-            cwd=cwd,
-            model=getattr(agent, "model", "") or "",
-            cancel_event=threading.Event(),
-        )
-        with self._lock:
-            self._sessions[session_id] = state
         self._owned_sessions.add(session_id)
-        _register_task_cwd(session_id, cwd)
-        self._persist(state)
+        state = self._install_state(session_id, agent, cwd, getattr(agent, "model", "") or "", [])
         logger.info("Created ACP session %s (cwd=%s)", session_id, cwd)
         return state
 
@@ -433,8 +421,6 @@ class SessionManager:
 
     def fork_session(self, session_id: str, cwd: str = ".") -> Optional[SessionState]:
         """Deep-copy a session's history into a new session."""
-        import threading
-
         from acp_adapter.orchestration import requested_orchestration_mode
 
         if requested_orchestration_mode() is not None:
@@ -455,19 +441,9 @@ class SessionManager:
             cwd=cwd,
             model=original.model or None,
         )
-        state = SessionState(
-            session_id=new_id,
-            agent=agent,
-            cwd=cwd,
-            model=getattr(agent, "model", original.model) or original.model,
-            history=copy.deepcopy(original.history),
-            cancel_event=threading.Event(),
-        )
-        with self._lock:
-            self._sessions[new_id] = state
+        model = getattr(agent, "model", original.model) or original.model
         self._owned_sessions.add(new_id)
-        _register_task_cwd(new_id, cwd)
-        self._persist(state)
+        state = self._install_state(new_id, agent, cwd, model, copy.deepcopy(original.history))
         logger.info("Forked ACP session %s -> %s", session_id, new_id)
         return state
 
@@ -615,6 +591,20 @@ class SessionManager:
 
     # ---- persistence via SessionDB ------------------------------------------
 
+    def _install_state(self, session_id: str, agent: Any, cwd: str, model: str,
+                       history: List[Dict[str, Any]], *, persist: bool = True) -> SessionState:
+        """Build a SessionState, register it in memory, bind its cwd for tools, optionally persist."""
+        import threading
+
+        state = SessionState(session_id=session_id, agent=agent, cwd=cwd, model=model,
+                             history=history, cancel_event=threading.Event())
+        with self._lock:
+            self._sessions[session_id] = state
+        _register_task_cwd(session_id, cwd)
+        if persist:
+            self._persist(state)
+        return state
+
     def _get_db(self):
         """Lazily acquire the process-shared SessionDB; ``None`` if unavailable (e.g. import
         error in a minimal test env). ``HERMES_HOME`` is resolved here, not via the import-time
@@ -688,6 +678,10 @@ class SessionManager:
                 try:
                     db.update_session_meta(state.session_id, cwd_json, model_str)
                 except Exception:
+                    if not persist_history:
+                        # Metadata-only writes carry the transcript-poison marker;
+                        # a lost write must fail closed, not report persisted.
+                        raise
                     logger.debug("Failed to update ACP session metadata", exc_info=True)
                 # The create branch above is not the live path: an agent that owns
                 # persistence to this same DB flushes the transcript incrementally,
@@ -876,8 +870,6 @@ class SessionManager:
 
     def _restore(self, session_id: str) -> Optional[SessionState]:
         """Load a session from the database into memory, recreating the AIAgent."""
-        import threading
-
         db = self._get_db()
         if db is None:
             return None
@@ -955,17 +947,8 @@ class SessionManager:
             logger.warning("Failed to recreate agent for ACP session %s", session_id, exc_info=True)
             return None
 
-        state = SessionState(
-            session_id=session_id,
-            agent=agent,
-            cwd=cwd,
-            model=model or getattr(agent, "model", "") or "",
-            history=history,
-            cancel_event=threading.Event(),
-        )
-        with self._lock:
-            self._sessions[session_id] = state
-        _register_task_cwd(session_id, cwd)
+        state = self._install_state(session_id, agent, cwd, model or getattr(agent, "model", "") or "",
+                                    history, persist=False)
         logger.info("Restored ACP session %s from DB (%d messages)", session_id, len(history))
         return state
 
