@@ -10,7 +10,6 @@ thread while the event loop lives on the main thread).
 import asyncio
 import json
 import logging
-import os
 import threading
 import uuid
 from collections import deque
@@ -38,14 +37,26 @@ _pending_turn_updates: ContextVar[list[Any] | None] = ContextVar("acp_turn_updat
 def _subagent_updates_enabled() -> bool:
     """Per-child subagent ACP emission gate (default on).
 
-    Set ``HERMES_ACP_SUBAGENT_UPDATES=0`` to fall back to the legacy
-    behaviour (one opaque delegate_task tool call, no per-child frames).
+    Resolved from config.yaml ``acp.subagent_updates`` (profile-aware via
+    ``load_config``). False falls back to the legacy behaviour (one opaque
+    delegate_task tool call, no per-child frames).
     """
-    return os.environ.get("HERMES_ACP_SUBAGENT_UPDATES", "1").strip().lower() not in {
-        "0",
-        "false",
-        "off",
-    }
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
+    except Exception:
+        return True
+    acp_cfg = cfg.get("acp") if isinstance(cfg, dict) else None
+    raw = acp_cfg.get("subagent_updates") if isinstance(acp_cfg, dict) else None
+    if raw is None:
+        return True
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return raw != 0
+    if isinstance(raw, str):
+        return raw.strip().lower() not in {"0", "false", "off", "no"}
+    return True
 
 
 def _json_loads_maybe_prefix(value: str) -> Any:

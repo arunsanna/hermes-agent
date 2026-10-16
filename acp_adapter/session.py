@@ -159,13 +159,7 @@ def _resolve_acp_max_iterations(config: Dict[str, Any]) -> int:
             return fallback
 
     configured_value = _parse(configured, default, "acp.max_iterations")
-    env_value = os.environ.get("HERMES_ACP_MAX_ITERATIONS")
-    effective = (
-        _parse(env_value, configured_value, "HERMES_ACP_MAX_ITERATIONS")
-        if env_value is not None
-        else configured_value
-    )
-    return sys.maxsize if effective <= 0 else effective
+    return sys.maxsize if configured_value <= 0 else configured_value
 
 
 def _register_task_cwd(task_id: str, cwd: str) -> None:

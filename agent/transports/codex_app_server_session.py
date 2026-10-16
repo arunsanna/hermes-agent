@@ -212,6 +212,25 @@ def _extract_thread_id(result: dict) -> Optional[str]:
     return thread_obj.get("id") or thread_obj.get("sessionId") or result.get("sessionId") or result.get("threadId")
 
 
+def _resolve_terminal_security_mode() -> str:
+    """Codex permission-profile selector (default ``"auto"``).
+
+    Resolved from config.yaml ``terminal.security_mode`` (profile-aware via
+    ``load_config``).
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
+    except Exception:
+        return "auto"
+    term_cfg = cfg.get("terminal") if isinstance(cfg, dict) else None
+    raw = term_cfg.get("security_mode") if isinstance(term_cfg, dict) else None
+    if raw is None:
+        return "auto"
+    text = str(raw).strip()
+    return text or "auto"
+
+
 class CodexAppServerSession:
     """One Codex thread per Hermes session, lifetime owned by AIAgent. Not thread-safe: one caller at a time."""
 
@@ -253,7 +272,7 @@ class CodexAppServerSession:
         self._history_seed = history_seed
         self._permission_profile = (
             permission_profile or _HERMES_TO_CODEX_PERMISSION_PROFILE.get(
-                os.environ.get("HERMES_TERMINAL_SECURITY_MODE", "auto"),
+                _resolve_terminal_security_mode(),
                 "workspace-write",
             )
         )

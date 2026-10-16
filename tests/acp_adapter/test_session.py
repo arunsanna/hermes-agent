@@ -63,11 +63,11 @@ class TestCreateSession:
 
 
     @pytest.mark.parametrize(
-        ("config_value", "env_value", "expected"),
-        [(None, None, 150), (91, None, 91), (91, "37", 37), (0, None, sys.maxsize)],
+        ("config_value", "expected"),
+        [(None, 150), (91, 91), ("37", 37), (0, sys.maxsize)],
     )
-    def test_acp_agent_max_iterations_uses_default_and_environment(
-        self, monkeypatch, config_value, env_value, expected
+    def test_acp_agent_max_iterations_uses_config(
+        self, monkeypatch, config_value, expected
     ):
         class FakeAgent:
             model = "fake-model"
@@ -90,10 +90,6 @@ class TestCreateSession:
             },
         )
         monkeypatch.setattr("acp_adapter.session._register_task_cwd", lambda task_id, cwd: None)
-        if env_value is None:
-            monkeypatch.delenv("HERMES_ACP_MAX_ITERATIONS", raising=False)
-        else:
-            monkeypatch.setenv("HERMES_ACP_MAX_ITERATIONS", env_value)
 
         state = SessionManager(db=None).create_session(cwd="/tmp/project")
 

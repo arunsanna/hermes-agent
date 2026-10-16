@@ -302,6 +302,10 @@ DEFAULT_CONFIG = {
     "terminal": {
         "backend": "local",
         "modal_mode": "auto",
+        # Codex app-server permission-profile selector (default "auto" -> Codex
+        # "workspace-write"). "approval-required" -> "read-only-with-approval",
+        # "unrestricted"/"yolo" -> "full-access"; anything else -> "workspace-write".
+        "security_mode": "auto",
         # Remote-backend connection-class failures (SSH host unreachable, Docker daemon down):
         # "warn" = structured degraded tool result with reason + retry hint; "fail" = raise error +
         # traceback.
@@ -559,10 +563,17 @@ DEFAULT_CONFIG = {
     # max_line_length: per-line cap in read_file's line-numbered view (chars).
     "tool_output": {"max_bytes": 50000, "max_lines": 2000, "max_line_length": 2000},
 
-    # ACP runs unattended over stdio. HERMES_ACP_MAX_ITERATIONS overrides this per process;
-    # values <= 0 mean unlimited.
+    # ACP runs unattended over stdio.
     "acp": {
+        # Per-turn iteration cap; values <= 0 mean unlimited.
         "max_iterations": 150,
+        # Per-child subagent ACP emission gate (default on). False falls back to the
+        # legacy behaviour (one opaque delegate_task tool call, no per-child frames).
+        "subagent_updates": True,
+        # Background-delegation completion watcher (default on). False leaves
+        # ``delegate_task(background=true)`` results that finish after their turn
+        # ended unconsumed by the ACP process.
+        "background_completions": True,
     },
 
     # Tool loop guardrails nudge models that repeat failed/non-progressing tool calls. Soft warnings

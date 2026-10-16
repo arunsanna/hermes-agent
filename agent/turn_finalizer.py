@@ -94,10 +94,15 @@ def _drop_verification_continuation_scaffolding(messages) -> None:
 
 
 def _hook_timeout_s() -> float:
-    """Per-callback timeout for response-gating lifecycle hooks."""
+    """Per-callback timeout for response-gating lifecycle hooks.
+
+    Resolved from config.yaml ``plugins.hook_callback_timeout`` (default 30s) —
+    the same persisted setting that bounds every other plugin hook callback.
+    """
     try:
-        return float(os.environ.get("HERMES_HOOK_TIMEOUT_S", "30"))
-    except (TypeError, ValueError):
+        from hermes_cli.plugins import _resolve_hook_callback_timeout
+        return _resolve_hook_callback_timeout()
+    except Exception:
         return 30.0
 
 

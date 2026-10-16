@@ -375,7 +375,10 @@ def test_supervision_stop_before_child_start_tombstones_late_start(sent):
 
 
 def test_subagent_updates_flag_off_suppresses_frames(sent, monkeypatch):
-    monkeypatch.setenv("HERMES_ACP_SUBAGENT_UPDATES", "0")
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"acp": {"subagent_updates": False}},
+    )
     cb, _ids, _meta = make_progress_cb()
     cb("subagent.start", None, "goal", None, subagent_id="sub-4")
     cb("subagent.complete", None, "done", None, subagent_id="sub-4", status="completed")

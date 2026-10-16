@@ -114,6 +114,30 @@ def _turn_keepalive_settings() -> tuple[float, float]:
         pass
     return interval, max_silent
 
+def _background_completions_enabled() -> bool:
+    """Background-delegation completion watcher gate (default on).
+
+    Resolved from config.yaml ``acp.background_completions`` (profile-aware
+    via ``load_config``).
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
+    except Exception:
+        return True
+    acp_cfg = cfg.get("acp") if isinstance(cfg, dict) else None
+    raw = acp_cfg.get("background_completions") if isinstance(acp_cfg, dict) else None
+    if raw is None:
+        return True
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return raw != 0
+    if isinstance(raw, str):
+        return raw.strip().lower() not in {"0", "false", "off", "no"}
+    return True
+
+
 # JSON-RPC 2.0 reserves -32000..-32099 for implementation-defined server
 # errors (acp.exceptions.RequestError already uses -32000 for auth_required
 # and -32002 for resource_not_found). This is the cross-session ownership
@@ -482,11 +506,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         """Start the completion watcher once, on the running loop."""
         if self._delegation_watcher_task is not None:
             return
-        if os.environ.get("HERMES_ACP_BACKGROUND_COMPLETIONS", "1").strip().lower() in {
-            "0",
-            "false",
-            "off",
-        }:
+        if not _background_completions_enabled():
             return
         self._delegation_watcher_task = loop.create_task(self._async_delegation_watcher())
 
