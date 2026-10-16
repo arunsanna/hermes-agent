@@ -803,7 +803,13 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
 
     def _build_model_state(self, state: SessionState) -> SessionModelState | None:
         """Authenticated providers + models, from the shared Hermes inventory (same substrate
-        as ``hermes model``/TUI/dashboard) so the selector isn't just the current curated list."""
+        as ``hermes model``/TUI/dashboard) so the selector isn't just the current curated list.
+
+        HAF-004: this runs inside session/new+load+resume responses, so it must stay a
+        cache-only read (see ``acp_adapter.model_catalog.build_model_state`` contract:
+        hit serves cache, miss serves curated/declared, error serves current-model-only
+        — never blocks on unselected-provider discovery). Live catalog work belongs to
+        explicit ``session/set_model`` (off-loop) or post-response background warming."""
         model = str(state.model or getattr(state.agent, "model", "") or "").strip()
         provider = getattr(state.agent, "provider", None) or detect_provider() or "openrouter"
         try:

@@ -20,15 +20,22 @@ def _named_custom_provider_catalogs() -> list[tuple[str, str, list[tuple[str, st
     """``(slug, label, [(model_id, description), ...])`` for named endpoints (v12 ``providers:``
     and legacy ``custom_providers:``), which canonical provider enumeration never lists.
 
-    Models = the entry's declared models, refreshed from the live ``/models`` listing when a
-    credential exists and ``discover_models`` isn't disabled; declared models survive a failed
-    discovery (some endpoints have no ``/models`` route). Slugs use the ``custom:<name>`` shape
-    ``parse_model_input``/``resolve_runtime_provider`` resolve, so choice ids round-trip."""
+    HAF-004 cache-only read path: models = the entry's declared models plus the shared disk
+    cache (same fingerprint key the live ``/models`` discovery admits, so a previously warmed
+    catalog is served as-is). This function NEVER probes the network: a session/new+load turn
+    must not wait on unselected-provider discovery. Declared models survive a cold/missed
+    cache (some endpoints have no ``/models`` route); a cold cache with no declared models
+    drops the endpoint here and the caller falls back to the exact current-model row. Live
+    discovery happens only on an explicit user action (``session/set_model`` validates live)
+    or the shared SWR daemon that revalidates a served-stale entry after the response.
+    Slugs use the ``custom:<name>`` shape ``parse_model_input``/``resolve_runtime_provider``
+    resolve, so choice ids round-trip."""
     try:
         from hermes_cli.config import (get_compatible_custom_providers, is_provider_enabled, load_config)
         from hermes_cli.model_switch import _declared_model_ids, _entry_models_discovered, _models_config_is_allowlist
-        from hermes_cli.model_switch_providers import _NativePickerModelList, _fetch_picker_live_models
+        from hermes_cli.model_switch_providers import _NativePickerModelList
         from hermes_cli.model_switch_providers import _discover_flag
+        from hermes_cli.models import cached_fetch_api_models
         from hermes_cli.models_local import should_use_ollama_native_catalog
         from hermes_cli.providers import custom_provider_slug
     except ImportError:
@@ -74,11 +81,20 @@ def _named_custom_provider_catalogs() -> list[tuple[str, str, list[tuple[str, st
 
         model_ids = list(declared)
         live = None
-        if _discover_flag(entry) and (api_key or is_native_ollama):
+        # An allowlist-shaped ``models:`` pins a native catalog row to the declared set —
+        # same precedence the live path gave via ``preserve_native_models``.
+        pinned_native = is_native_ollama and _models_config_is_allowlist(
+            models_cfg, _entry_models_discovered(entry))
+        if _discover_flag(entry) and (api_key or is_native_ollama) and not pinned_native:
             try:
-                live = _fetch_picker_live_models(
-                    api_key, base_url, provider_key if is_native_ollama and is_ollama_key else "custom",
-                    _models_config_is_allowlist(models_cfg, _entry_models_discovered(entry)),
+                # Cache-only: same key the live discovery admits
+                # (``cached_fetch_api_models`` fingerprint over api_key/api_mode/headers),
+                # so warmed catalogs — including native Ollama ones — are served with no
+                # round-trip. Stale entries are served now and revalidated on the shared
+                # SWR daemon after this response; a cold miss yields None (declared
+                # models above are the floor) and never touches the network.
+                live = cached_fetch_api_models(
+                    api_key, base_url, cache_only=True,
                     headers=native_headers, timeout=1.5, api_mode=entry.get("api_mode"),
                 )
             except Exception:
@@ -237,21 +253,40 @@ class _ModelCatalog:
 
 def build_model_state(model: str, provider: str, base_url: str) -> SessionModelState | None:
     """Picker state from the shared inventory + named endpoints; ``None`` when nothing is listable
-    (caller falls back to a single current-model row). Raises on inventory failure."""
+    (caller falls back to a single current-model row). Never raises: any inventory failure maps
+    to ``None`` so the session path still returns the exact current-model row.
+
+    HAF-004 first-turn cache contract — this function never waits on the network:
+    - hit: fresh same-credential disk-cache rows are served as-is (canonical providers via
+      ``non_blocking_catalogs``, named endpoints via the ``cache_only`` custom-endpoint read).
+    - stale: an entry past TTL but inside the stale window is served now; the shared SWR
+      helper revalidates on a daemon thread for the next open.
+    - miss (cold/no cache): canonical providers fall back to the curated snapshot, named
+      endpoints to their config-declared models; the exact current model is always inserted,
+      so its choice id round-trips with no re-routing.
+    - error: ``None`` (caller emits the current-model-only row). Never blocks, never raises.
+    Live discovery happens only on explicit refresh (``session/set_model`` validates live
+    off the loop) or the background SWR warm after this response.
+    """
     from hermes_cli.inventory import build_models_payload, load_picker_context
     from hermes_cli.models import normalize_provider, provider_label
 
-    normalized_provider = normalize_provider(provider)
-    context = load_picker_context().with_overrides(
-        current_provider=normalized_provider, current_model=model, current_base_url=base_url,
-    )
-    payload = build_models_payload(
-        context, explicit_only=True, include_unconfigured=False, picker_hints=False,
-        canonical_order=True, pricing=False, capabilities=False, refresh=False,
-        probe_custom_providers=False, probe_current_custom_provider=False, max_models=ACP_MAX_MODELS_PER_PROVIDER,
-    )
+    try:
+        normalized_provider = normalize_provider(provider)
+        context = load_picker_context().with_overrides(
+            current_provider=normalized_provider, current_model=model, current_base_url=base_url,
+        )
+        payload = build_models_payload(
+            context, explicit_only=True, include_unconfigured=False, picker_hints=False,
+            canonical_order=True, pricing=False, capabilities=False, refresh=False,
+            probe_custom_providers=False, probe_current_custom_provider=False,
+            non_blocking_catalogs=True, max_models=ACP_MAX_MODELS_PER_PROVIDER,
+        )
 
-    named_catalogs = _named_custom_provider_catalogs()
+        named_catalogs = _named_custom_provider_catalogs()
+    except Exception:
+        logger.debug("ACP model state unavailable; falling back to current model", exc_info=True)
+        return None
     named_slugs = {str(slug).strip().lower() for slug, _label, _models in named_catalogs}
     current_choice_provider = str(provider or "").strip().lower()
     current_base = base_url.strip().rstrip("/").lower()
