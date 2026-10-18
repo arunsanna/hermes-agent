@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 from rich.console import Console
 
-import hermes_cli.banner as banner
+from hermes_cli import banner
 import model_tools
 import tools.mcp_tool_discovery
 
@@ -35,29 +35,20 @@ def test_cprint_falls_back_to_plain_print_when_prompt_toolkit_has_no_console(cap
 
     assert capsys.readouterr().out == "fallback text\n"
 
-def test_empty_model_shows_the_free_tier_route_when_it_carries_inference(tmp_path, monkeypatch):
-    """The banner prints before credentials resolve, so ``model`` is empty on a fresh install. On the
-    free tier the route is known locally (identity on disk + tier on): the banner shows its model.
-    When nothing resolves the red "no model configured" line stays."""
+def test_empty_model_shows_no_model_configured(tmp_path, monkeypatch):
+    """The banner prints before credentials resolve; with no model it says so rather than guessing."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     (tmp_path / ".hermes").mkdir()
-    import hermes_cli.anon_auth as anon_auth
-
-    def render(carries: bool) -> str:
-        with (
-            patch.object(model_tools, "check_tool_availability", return_value=([], [])),
-            patch.object(banner, "get_available_skills", return_value={}),
-            patch.object(banner, "get_update_result", return_value=None),
-            patch.object(tools.mcp_tool_discovery, "get_mcp_status", return_value=[]),
-            patch.object(anon_auth, "guest_carries_inference", return_value=carries),
-        ):
-            console = Console(record=True, force_terminal=False, color_system=None, width=160)
-            banner.build_welcome_banner(console=console, model="", cwd="/tmp/project", tools=[],
-                                        enabled_toolsets=[], provider="auto")
-        return console.export_text()
-
-    assert "welcome" in render(True) and "no model configured" not in render(True)
-    assert "no model configured" in render(False)
+    with (
+        patch.object(model_tools, "check_tool_availability", return_value=([], [])),
+        patch.object(banner, "get_available_skills", return_value={}),
+        patch.object(banner, "get_update_result", return_value=None),
+        patch.object(tools.mcp_tool_discovery, "get_mcp_status", return_value=[]),
+    ):
+        console = Console(record=True, force_terminal=False, color_system=None, width=160)
+        banner.build_welcome_banner(console=console, model="", cwd="/tmp/project", tools=[],
+                                    enabled_toolsets=[], provider="auto")
+    assert "no model configured" in console.export_text()
 
 
 def test_build_welcome_banner_does_not_center_pad_hero_art():
@@ -90,3 +81,25 @@ def test_baked_banner_uses_live_identity(monkeypatch):
 
     monkeypatch.setattr(version_info, "get_code_identity", lambda: {"short_sha": "a1b2c3d4"})
     assert banner._baked_banner_state() == {"upstream": "a1b2c3d4", "local": "a1b2c3d4", "ahead": 0}
+
+
+def test_git_build_identity_tracks_checkout_and_dirty_state(tmp_path):
+    import subprocess
+
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "-b", "runtime", str(repo)], check=True, capture_output=True)
+    tracked = repo / "tracked.txt"
+    tracked.write_text("before\n")
+    subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+         "commit", "-m", "initial"],
+        check=True, capture_output=True,
+    )
+    sha = subprocess.check_output(
+        ["git", "-C", str(repo), "rev-parse", "--short=10", "HEAD"], text=True,
+    ).strip()
+
+    assert banner.get_git_build_identity(repo) == f"{sha} @ runtime"
+    tracked.write_text("after\n")
+    assert banner.get_git_build_identity(repo) == f"{sha}-dirty @ runtime"

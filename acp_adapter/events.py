@@ -195,7 +195,7 @@ def _send_update(
 # Tool progress callback
 # ------------------------------------------------------------------
 
-def _upgrade_queue(tool_call_ids: Dict[str, Deque[str]], name: str) -> Deque[str] | None:
+def _upgrade_queue(tool_call_ids: dict[str, deque[str]], name: str) -> deque[str] | None:
     """Fetch the per-tool FIFO of pending call IDs, upgrading a legacy bare-string entry in place."""
     queue = tool_call_ids.get(name)
     if isinstance(queue, str):
@@ -203,9 +203,28 @@ def _upgrade_queue(tool_call_ids: Dict[str, Deque[str]], name: str) -> Deque[str
     return queue
 
 
+def close_tool_call(
+    conn: acp.Client, session_id: str, loop: asyncio.AbstractEventLoop, tool_call_ids: dict[str, deque[str]],
+    tool_call_meta: dict[str, dict[str, Any]], name: str, result: Any = None, is_error: bool = False,
+) -> str | None:
+    """Close the oldest open ACP tool call for ``name``; returns its id, or None when none is open."""
+    queue = _upgrade_queue(tool_call_ids, name)
+    if not queue:
+        return None
+    tc_id = queue.popleft()
+    meta = tool_call_meta.pop(tc_id, {})
+    _send_update(conn, session_id, loop, build_tool_complete(
+        tc_id, name, result=str(result) if result is not None else None,
+        function_args=meta.get("args"), snapshot=meta.get("snapshot"), is_error=is_error,
+    ))
+    if not queue:
+        tool_call_ids.pop(name, None)
+    return tc_id
+
+
 def flush_open_tool_calls(
-    conn: acp.Client, session_id: str, loop: asyncio.AbstractEventLoop, tool_call_ids: Dict[str, Deque[str]],
-    tool_call_meta: Dict[str, Dict[str, Any]],
+    conn: acp.Client, session_id: str, loop: asyncio.AbstractEventLoop, tool_call_ids: dict[str, deque[str]],
+    tool_call_meta: dict[str, dict[str, Any]],
 ) -> int:
     """Close every tool call still open at the end of a turn, and report how many there were.
 
@@ -244,7 +263,7 @@ def make_tool_progress_cb(
     tool_call_ids: Dict[str, Deque[str]],
     tool_call_meta: Dict[str, Dict[str, Any]],
     edit_approval_policy_getter: Callable[[], tuple[str, str | None]] | None = None,
-    turn_state: Dict[str, Any] | None = None,
+    turn_state: dict[str, Any] | None = None,
 ) -> Callable:
     """Create a ``tool_progress_callback`` for AIAgent.
 
