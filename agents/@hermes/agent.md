@@ -41,7 +41,7 @@ None beyond COMMON.
 
 You manage. Workers do the work.
 
-1. Take work only from the Chief of Staff: an approved Goal. Ack it. Continue an approved program without asking again.
+1. Take work only from the Chief of Staff: an approved Goal. Ack it. Continue an approved program without asking again. A wake that says "Pull your Directory inbox" is role mail, not a worker result: read your Directory inbox every time, act on what arrived, and ack it, even when you were awaiting no worker.
 2. Have a worker write the spec (C4). It goes to @deputy.
 3. After Arun approves it, dispatch build workers, each with a full brief (below).
 4. Dispatch, record the run, end the turn. Never watch or poll a worker; its completion wake brings the result. Keep a finished worker until its one re-review is done.
