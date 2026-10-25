@@ -6,8 +6,13 @@ import pytest
 from acp_adapter import entry
 
 
-def test_main_enables_unstable_protocol(monkeypatch):
+@pytest.mark.parametrize("failure", [None, KeyboardInterrupt, RuntimeError])
+def test_main_enables_unstable_protocol(monkeypatch, failure):
     calls = {}
+    ended = []
+    from acp_adapter.session import SessionManager
+    monkeypatch.setattr(SessionManager, "end_all_sessions", lambda self: ended.append(self))
+    monkeypatch.setattr(SessionManager, "cleanup", lambda self: pytest.fail("entry must not delete sessions"))
 
     async def fake_run_agent(agent, **kwargs):
         from acp_adapter.server import HermesACPAgent
@@ -15,13 +20,21 @@ def test_main_enables_unstable_protocol(monkeypatch):
         assert isinstance(agent, HermesACPAgent)
         assert agent.session_manager is not None
         calls["kwargs"] = kwargs
+        if failure is not None:
+            raise failure("proof transport exit")
 
     monkeypatch.setattr(entry, "_setup_logging", lambda: None)
     monkeypatch.setattr(entry, "_load_env", lambda: None)
     monkeypatch.setattr(acp, "run_agent", fake_run_agent)
 
-    entry.main([])
+    if failure is RuntimeError:
+        with pytest.raises(SystemExit) as error:
+            entry.main([])
+        assert error.value.code == 1
+    else:
+        entry.main([])
 
+    assert len(ended) == 1
     assert calls["kwargs"]["use_unstable_protocol"] is True
 
 
