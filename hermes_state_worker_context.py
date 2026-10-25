@@ -101,3 +101,26 @@ def worker_rewrite_tool_result(db, conn, session_id, payload):
          db._encode_content(payload['expected_content'])),
     )
     return {'value': changed.rowcount > 0}
+
+
+def worker_append_atomic(db, conn, session_id, payload):
+    """Insert fresh rows without transcript repair or caller annotations, in this receipt."""
+    from hermes_state_runtime import _MESSAGE_FIELDS
+
+    if set(payload) != {'messages'}:
+        raise RuntimeStoreError('invalid_params')
+    messages = payload['messages']
+    if not isinstance(messages, list) or len(messages) > 1000:
+        raise RuntimeStoreError('invalid_params')
+    for message in messages:
+        if (not isinstance(message, dict) or set(message) - _MESSAGE_FIELDS
+                or message.get('role') not in ('user', 'assistant', 'system', 'tool')):
+            raise RuntimeStoreError('invalid_params')
+        if '_row_id' in message and not conn.execute(
+                'SELECT 1 FROM messages WHERE id=? AND session_id=?',
+                (message['_row_id'], session_id)).fetchone():
+            raise RuntimeStoreError('permission_denied')
+    pending = [dict(message) for message in messages]
+    count, tool_calls = db._insert_message_rows(conn, session_id, pending)
+    db._bump_session_counters(conn, session_id, count, tool_calls, unit=False)
+    return {'count': count}

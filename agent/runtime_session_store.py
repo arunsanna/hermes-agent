@@ -371,8 +371,15 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
         return result['count']
 
     def append_messages_atomic(self, session_id, messages):
-        # transcript.append already inserts the whole protocol group in the owner receipt transaction.
-        return self.append_messages_batch(session_id, [dict(message) for message in messages])
+        self._session(session_id)
+        if not messages:
+            return 0
+        from hermes_state_runtime import _MESSAGE_FIELDS
+
+        # Local turn bookkeeping is not part of the closed persistence payload.
+        pending = [{key: value for key, value in message.items() if key in _MESSAGE_FIELDS}
+                   for message in messages]
+        return self._apply('transcript.append_atomic', {'messages': pending})['count']
 
     def rewrite_message_content(self, session_id, tool_call_id, content, *, expected_content):
         self._session(session_id)

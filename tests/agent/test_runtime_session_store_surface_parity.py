@@ -87,19 +87,26 @@ def worker_store(tmp_path):
     try:
         yield db, store, calls
     finally:
-        store.close()
-        db.close()
+        try:
+            if store.failure:
+                with pytest.raises(WorkerPersistenceError, match=re.escape(store.failure)):
+                    store.close()
+            else:
+                store.close()
+        finally:
+            db.close()
 
 
 def test_atomic_observation_rolls_back_and_replays_without_mutating_input(worker_store, monkeypatch):
     db, store, calls = worker_store
     db.append_messages_batch('s', [{'role': 'user', 'content': 'question'}])
     pair = [
-        {'role': 'assistant', 'content': None, 'tool_calls': [
+        {'role': 'assistant', 'content': None, '_required_delegation_observation': True, 'tool_calls': [
             {'id': 'required', 'type': 'function', 'function': {'name': 'observe', 'arguments': '{}'}}]},
-        {'role': 'tool', 'tool_call_id': 'required', 'content': 'observed'},
+        {'role': 'tool', 'tool_call_id': 'required', 'content': 'observed', '_required_delegation_observation': True},
     ]
     original = copy.deepcopy(pair)
+    before = db.get_session('s')
 
     def fail_after_insert(*args, **kwargs):
         raise RuntimeError('injected before owner commit')
@@ -110,6 +117,9 @@ def test_atomic_observation_rolls_back_and_replays_without_mutating_input(worker
             store.append_messages_atomic('s', pair)
     assert [m['role'] for m in db.get_messages('s')] == ['user']
     assert pair == original
+    after = db.get_session('s')
+    assert (after['message_count'], after['runtime_revision']) == (before['message_count'], before['runtime_revision'])
+    assert db._read_all('SELECT sequence FROM worker_receipts') == []
     assert store.retry_pending()[0]['count'] == 2
     assert [m['role'] for m in db.get_messages('s')] == ['user', 'assistant', 'tool']
     assert pair == original
@@ -148,3 +158,76 @@ def test_tool_result_cas_is_owned_active_and_receipt_idempotent(worker_store):
     db.append_message('s', 'user', 'pixels', tool_call_id='not-tool')
     assert store.rewrite_message_content('s', 'not-tool', 'stub', expected_content='pixels') is False
     assert db.get_messages('s')[-1]['content'] == 'pixels'
+
+
+def test_atomic_append_inserts_owned_row_snapshots_and_replays_lost_ack(worker_store):
+    db, store, calls = worker_store
+    db.append_messages_atomic('s', [{'role': 'user', 'content': 'original'}])
+    row_id = db._read_all("SELECT id FROM messages WHERE session_id='s'")[0][0]
+    group = [{'role': 'user', 'content': 'original', '_row_id': row_id,
+              '_required_delegation_observation': True}]
+    original = copy.deepcopy(group)
+    rpc = store.rpc
+    lost = []
+
+    def lose_first_ack(method, **params):
+        result = rpc(method, **params)
+        if not lost:
+            lost.append(True)
+            raise TimeoutError('lost committed acknowledgement')
+        return result
+
+    store.rpc = lose_first_ack
+    with pytest.raises(TimeoutError, match='lost committed acknowledgement'):
+        store.append_messages_atomic('s', group)
+    assert len(db.get_messages('s')) == 2
+    assert group == original
+    assert store.retry_pending()[0]['count'] == 1
+    assert len(db.get_messages('s')) == 2
+    assert group == original
+    with pytest.raises(RuntimeStoreError, match='admission_conflict'):
+        mutate_worker_execution(db, **dict(calls[-1], payload={'messages': []}))
+    with pytest.raises(RuntimeStoreError):
+        mutate_worker_execution(db, **dict(calls[-1], generation=99))
+
+
+def test_cas_preserves_collisions_and_replays_success_after_a_later_writer(worker_store):
+    db, store, calls = worker_store
+    db.append_messages_atomic('s', [
+        {'role': 'tool', 'tool_call_id': 'collision', 'content': content, 'api_content': 'pixels'}
+        for content in ['same', 'different', 'same']
+    ])
+    before = db.get_session('s')['runtime_revision']
+    assert store.rewrite_message_content('s', 'collision', 'stub', expected_content='wrong') is False
+    assert db.get_session('s')['runtime_revision'] == before
+    assert store.rewrite_message_content('s', 'collision', 'stub', expected_content='same') is True
+    receipt = calls[-1]
+    rows = db._read_all("SELECT content,api_content FROM messages WHERE session_id='s' ORDER BY id")
+    assert [tuple(row) for row in rows] == [('stub', None), ('different', 'pixels'), ('stub', None)]
+    db._execute_write(lambda conn: conn.execute("UPDATE messages SET content='later' WHERE content='stub'"))
+    assert mutate_worker_execution(db, **receipt) == {'value': True}
+    assert [row[0] for row in db._read_all("SELECT content FROM messages WHERE session_id='s' ORDER BY id")] == [
+        'later', 'different', 'later']
+    before = db.get_session('s')['runtime_revision']
+    assert store.rewrite_message_content('s', 'collision', 'stale', expected_content='same') is False
+    assert db.get_session('s')['runtime_revision'] == before
+    bad = dict(calls[-1], sequence=calls[-1]['sequence'] + 1,
+               payload=dict(calls[-1]['payload'], session_id='other'))
+    with pytest.raises(RuntimeStoreError, match='invalid_params'):
+        mutate_worker_execution(db, **bad)
+
+
+@pytest.mark.parametrize('bad_row', [
+    {'role': 'invalid', 'content': 'bad'},
+    {'role': 'tool', 'content': 'foreign'},
+])
+def test_atomic_append_rejects_the_whole_invalid_or_foreign_group(worker_store, bad_row):
+    db, store, _calls = worker_store
+    if bad_row['role'] == 'tool':
+        db.append_message('other', 'tool', 'foreign')
+        bad_row = dict(bad_row, _row_id=db._read_all("SELECT id FROM messages WHERE session_id='other'")[0][0])
+    with pytest.raises(RuntimeStoreError):
+        store.append_messages_atomic('s', [{'role': 'user', 'content': 'first'}, bad_row])
+    assert db.get_messages('s') == []
+    assert db.get_session('s')['message_count'] == 0
+    assert db._read_all('SELECT sequence FROM worker_receipts') == []
