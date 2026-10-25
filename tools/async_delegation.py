@@ -2704,6 +2704,8 @@ def _dispatch_required_batch(
         ),
     }
     with _records_lock:
+        if any((field, record[field]) in _refused_by for field in _FENCED_FIELDS):
+            return {"status": "rejected", "error": "This session was closed (exit or /new): no new background work."}
         running = sum(1 for item in _records.values() if item.get("status") in _LIVE_DELEGATION_STATES)
         if running >= max_async_children:
             return {
@@ -2715,7 +2717,6 @@ def _dispatch_required_batch(
             }
         _records[delegation_id] = record
     executor = _get_executor(max_async_children)
-
     def _worker() -> None:
         combined: Dict[str, Any] = {}
         status = "error"
@@ -2737,7 +2738,6 @@ def _dispatch_required_batch(
             status = "error"
         finally:
             _finalize_batch(delegation_id, combined, status)
-
     try:
         executor.submit(propagate_context_to_thread(_worker))
     except Exception as exc:  # pragma: no cover

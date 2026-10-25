@@ -19,6 +19,11 @@ Layers under test:
 import json
 import queue
 import time
+from types import SimpleNamespace
+
+import pytest
+
+from tools import async_delegation as ad
 
 from tools.process_registry import ProcessRegistry
 
@@ -105,3 +110,34 @@ def test_owns_event_callback_beats_restored_flag():
 
     assert len(results) == 1
     assert reg.completion_queue.empty()
+
+
+@pytest.fixture
+def _admission_registry():
+    ad._reset_for_tests()
+    yield
+    ad._reset_for_tests()
+
+
+@pytest.mark.parametrize('fence', ['session_key', 'parent_session_id'])
+def test_required_admission_obeys_closed_session_fences_and_reopens(monkeypatch, fence, _admission_registry):
+    submitted = []
+    ran = []
+    executor = SimpleNamespace(submit=lambda fn: submitted.append(fn))
+    monkeypatch.setattr(ad, '_get_executor', lambda *_args: executor)
+    monkeypatch.setattr(ad, '_ensure_stale_monitor', lambda: None)
+    selectors = {'session_key': 'closed'} if fence == 'session_key' else {'parent_session_ids': ['parent']}
+    ad.refuse_for_session('closing-owner', **selectors)
+    kwargs = dict(goals=['bounded work'], context=None, toolsets=None, role='leaf', model=None,
+                  session_key='closed', parent_session_id='parent', required=True,
+                  runner=lambda: ran.append(True), max_async_children=3)
+    result = ad.dispatch_async_delegation_batch(**kwargs)
+    assert result == {'status': 'rejected', 'error': 'This session was closed (exit or /new): no new background work.'}
+    assert submitted == []
+    assert ad.active_count() == 0
+    assert ran == []
+    ad.allow_for_session('closing-owner')
+    reopened = ad.dispatch_async_delegation_batch(**kwargs)
+    assert reopened['status'] == 'dispatched'
+    assert len(submitted) == 1
+    assert ran == []
