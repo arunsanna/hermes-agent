@@ -91,7 +91,14 @@ def test_stale_verdict_collects_a_result_that_lands_within_the_grace_window(monk
     """The wedge: verdict fires while the worker is mid-unwind; the real result must win."""
     child = _Child("grace")
     _fast_watchdog(monkeypatch, grace=1.0)
-    timer = _finish_soon(child, 0.15)  # after the verdict (~0.02s), well inside the grace
+    # Anchor completion to the verdict: cold child setup can outlast a wall-clock timer.
+    def finish_after_stop():
+        child.interrupted.wait(timeout=5)
+        child.release.set()
+
+    timer = threading.Timer(0, finish_after_stop)
+    timer.daemon = True
+    timer.start()
     try:
         entry = delegate_tool._run_single_child(0, "review", child=child, parent_agent=_parent())
     finally:
