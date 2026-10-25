@@ -56,6 +56,9 @@ class _Batch:
     group: Optional[str] = None
     unit_id: Optional[str] = None  # the async registry id this unit runs under (``<call_id>-k`` for split calls)
     live_home: Any = None  # explicit profile home for transcripts/manifest (#91996); None = ambient resolve
+    # Result entries of tasks their backend refused (no child): joined into a sync result, listed in a background
+    # call's dispatch payload. Units carved for async dispatch never carry them.
+    refused: list = field(default_factory=list)
 
     def owner_kwargs(self) -> dict[str, Any]:
         """Steer/stop authority of the originating session, passed to every child run."""
@@ -328,6 +331,9 @@ def _execute_and_aggregate(batch: _Batch, *, honor_parent_interrupt: bool = True
                 batch.live_writers[_idx].finalize(entry)
             if _idx < len(batch.live_paths):
                 entry["live_transcript"] = batch.live_paths[_idx]
+    if batch.refused:
+        results.extend(batch.refused)
+        results.sort(key=lambda r: r["task_index"])
     update_manifest_statuses(batch.live_deleg_id, results, home=batch.live_home)
     finish_delegation_unit(batch.task_list, results, background=not honor_parent_interrupt)
 
@@ -365,17 +371,22 @@ def _run_sync_with_note(batch: _Batch, reason: str) -> str:
         result["note"] = _SYNC_FALLBACK_NOTES[reason]
     return json.dumps(result, ensure_ascii=False)
 
-def _resolve_async_wake_sid(origin_wake_sid: str, origin_session_history_delivery: bool = False) -> Optional[str]:
+def _resolve_async_wake_sid(
+    origin_wake_sid: str, origin_session_history_delivery: bool = False, oneshot_session: bool = False,
+) -> Optional[str]:
     """Detached result target: empty for push, a resumable API id, or None for inline.
 
     API completion only persists a row; this does not authorize a model wake. The
-    continuation must read that row, not an authoritative caller-owned snapshot."""
+    continuation must read that row, not an authoritative caller-owned snapshot.
+    *oneshot_session*: the parent's tools[] froze the one-shot ``delegate_task`` ("joined in this call", no
+    list/steer/stop) for the whole session, so a later interactive turn (``chat -q`` then ``--resume``) joins too."""
     from gateway.session_context import get_session_env
 
-    # Finite chat owns no later turn to consume a detached result. Reuse its
-    # approval/lifecycle marker without disabling terminal notify completions:
-    # those have their own bounded exit linger and durable result receipts.
-    if get_session_env("HERMES_SINGLE_QUERY_SESSION") == "1":
+    # Finite consumers need the result in this tool round. Owner admission scope
+    # wins over legacy standalone launch markers, without changing terminal delivery.
+    from gateway.session_finite import finite_turn_required
+    finite = finite_turn_required()
+    if oneshot_session or finite is True or (finite is None and get_session_env("HERMES_SINGLE_QUERY_SESSION") == "1"):
         return None
 
     try:
@@ -471,7 +482,7 @@ _BACKGROUND_NOTES = {
 def _dispatched_payload(batch: _Batch, units: List[tuple[_Batch, str]]) -> dict:
     """Model-facing handle for an accepted background call, including every async unit."""
     goals = [t["goal"] for t in batch.task_list]
-    n = len(goals)
+    n = len(batch.children)  # running children; refused tasks are listed under "refused"
     first_id = units[0][1] if units else ""
     dispatch_id = batch.controller_deleg_id if batch.required else (batch.live_deleg_id or first_id)
     payload = {
@@ -488,6 +499,8 @@ def _dispatched_payload(batch: _Batch, units: List[tuple[_Batch, str]]) -> dict:
     if any(isinstance(s, str) and s for s in sids):
         payload["subagent_ids"] = sids
         payload["control_hint"] = _BACKGROUND_NOTES["control_hint"]
+    if batch.refused:
+        payload["refused"] = batch.refused
     if batch.live_paths:
         payload["live_transcripts"] = list(batch.live_paths)
         payload["live_transcripts_hint"] = _BACKGROUND_NOTES["live_transcripts_hint"]
@@ -537,10 +550,12 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
             _signal_child_stop(child, "Async delegation cancelled")
 
     return dispatch_async_delegation_batch(
-        # Call-wide goals let completion formatting retain each task_index.
-        goals=[task["goal"] for task in unit.task_list], context=unit.context,
-        toolsets=None,  # children inherit the parent's toolsets
-        role=unit.top_role, model=unit.creds["model"],
+        # Call-wide goals: completion formatting indexes them by task_index.
+        goals=[t["goal"] for t in unit.task_list], context=unit.context,
+        toolsets=None,  # metadata for the completion block only; subagents inherit the parent's toolsets
+        # creds["model"] is None when delegation.model is blank (children inherit): report what the child runs on.
+        role=unit.top_role, model=unit.creds["model"] or next(
+            (getattr(c, "model", None) for c in child_agents if getattr(c, "model", None)), None),
         runner=lambda: _execute_and_aggregate(unit, honor_parent_interrupt=False),
         interrupt_fn=_interrupt, delegation_id=unit_id, slot_key=slot_key,
         task_indexes=[i for (i, _, _) in unit.children] if len(unit.children) < len(unit.task_list) else None,
@@ -572,7 +587,8 @@ def _dispatch_background(batch: _Batch) -> str:
     )
     from tools.async_delegation import dispatch_async_delegation_batch
     wake_sid = "" if batch.required else _resolve_async_wake_sid(
-        batch.origin_wake_sid, batch.origin_session_history_delivery
+        batch.origin_wake_sid, batch.origin_session_history_delivery,
+        oneshot_session=getattr(batch.parent_agent, "_oneshot_session", None) is True,
     )
     if wake_sid is None:
         logger.info("delegate_task: async delivery unsupported on this session runtime; running the batch synchronously instead.")
@@ -700,7 +716,8 @@ def _dispatch_background(batch: _Batch) -> str:
         session_key=session_key, origin_ui_session_id=origin_ui_session_id, origin_session_id=wake_sid,
         parent_session_id=getattr(parent_agent, "session_id", None), max_async_children=_get_max_async_children(),
     )
-    units = _units_of(batch)
+
+    units = [replace(unit, refused=[]) for unit in _units_of(batch)]
     dispatched: list[tuple[_Batch, str]] = []
     inline_results: list[dict] = []
     slot_key: Optional[str] = None

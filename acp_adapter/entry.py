@@ -98,7 +98,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--setup", action="store_true",
                         help="Run interactive Hermes provider/model setup for ACP terminal auth")
     parser.add_argument("--setup-browser", action="store_true",
-                        help="Prepare PM's pinned browser tools and Chromium.")
+                        help="Prepare PM's pinned Chromium for browser_exec.")
     parser.add_argument("--yes", "-y", action="store_true", dest="assume_yes",
                         help="Accept setup prompts.")
     return parser.parse_args(argv)
@@ -132,7 +132,7 @@ def _run_setup() -> None:
     if not sys.stdin.isatty():
         return
     try:
-        reply = input("\nInstall browser tools? Downloads the pinned browser and "
+        reply = input("\nInstall browser tools? Downloads the pinned "
                       "Chromium through PM. [y/N] ").strip().lower()
     except (EOFError, KeyboardInterrupt):
         return
@@ -141,11 +141,11 @@ def _run_setup() -> None:
 
 
 def _run_setup_browser(assume_yes: bool = False) -> int:
-    """The setup command is an explicit request for PM's browser closure."""
+    """The setup command is an explicit request for PM's Chromium (browser_exec's local browser)."""
     import pm
 
     try:
-        pm.ensure("agent-browser", explicit=True)
+        pm.ensure("chromium", explicit=True)
     except (pm.InstallError, OSError) as exc:
         print(f"Browser setup failed: {exc}", file=sys.stderr)
         return 1
@@ -193,20 +193,12 @@ def main(argv: list[str] | None = None) -> None:
     from .server import HermesACPAgent
 
     # Windows: import the configured memory provider (and numpy) on the main thread before
-    # the MCP-discovery and ACP stdin-reader threads start (hermes_cli's ~150 ms
-    # plugin-discovery thread is the only one already running). A first-time
-    # native-extension import (numpy via holographic / mnemosyne / hindsight) racing another
-    # thread's import chain deadlocked in create_module and session/new never answered
-    # (#58083). After this the off-loop agent build finds the modules in sys.modules.
+    # the ACP stdin-reader thread starts. A first-time native-extension import racing another
+    # thread's import chain deadlocked in create_module and session/new never answered (#58083).
     if sys.platform == "win32":
         _warm_memory_provider_import(logger)
 
-    # MCP discovery from config.yaml runs in a background daemon thread so the ACP server is
-    # responsive immediately (blocking here cost 2-5 s); per-session MCP servers registered via
-    # asyncio.to_thread are unaffected. Metadata-only hosts can opt out of the global startup.
-    # Previously this blocked asyncio.run() for 2-5 s. (ACP also registers per-session MCP servers
-    # dynamically via asyncio.to_thread inside the event loop; that path is unaffected.)  Moved from
-    # model_tools.py module scope to avoid freezing the gateway's loop on lazy import (#16856).
+    # Switchboard owns one direct ACP process per session, without a Hermes daemon.
     if os.environ.get("HERMES_ACP_SKIP_CONFIGURED_MCP", "").strip() != "1":
         try:
             from hermes_cli.mcp_startup import start_background_mcp_discovery
@@ -215,7 +207,9 @@ def main(argv: list[str] | None = None) -> None:
         except Exception:
             logger.debug("MCP tool discovery failed at ACP startup", exc_info=True)
 
-    agent = HermesACPAgent()
+    from .session import SessionManager
+
+    agent = HermesACPAgent(session_manager=SessionManager())
     try:
         asyncio.run(acp.run_agent(agent, use_unstable_protocol=True))
     except KeyboardInterrupt:
@@ -224,10 +218,7 @@ def main(argv: list[str] | None = None) -> None:
         logger.exception("ACP agent crashed")
         sys.exit(1)
     finally:
-        # The stdio client that drove these conversations is gone. Without an
-        # ended_at writer here, source='acp' rows stay open forever and the
-        # ended-session guard keeps prune/archive away from them (#118216). A
-        # later load/resume reopens the row (acp_adapter.session._restore).
+        # The stdio owner is gone; a later load/resume reopens its persisted row.
         agent.session_manager.end_all_sessions()
 
 

@@ -189,6 +189,21 @@ def _expand_acp_enabled_toolsets(
     return list(dict.fromkeys(names))
 
 
+def _parse_model_config(mc: Any) -> dict:
+    """Decode a persisted model_config JSON blob; ``{}`` when absent/invalid/non-dict."""
+    try:
+        meta = json.loads(mc) if mc else None
+    except (json.JSONDecodeError, TypeError):
+        meta = None
+    return meta if isinstance(meta, dict) else {}
+
+
+def _session_info(sid: str, cwd: str, model: Any, history_len: int, title: Any, preview: Any,
+                  updated_at: Any) -> dict[str, Any]:
+    return {"session_id": sid, "cwd": cwd, "model": model, "history_len": history_len,
+            "title": _build_session_title(title, preview, cwd), "updated_at": _format_updated_at(updated_at)}
+
+
 def _clear_task_cwd(task_id: str) -> None:
     """Remove task-specific cwd overrides for an ACP session."""
     if not task_id:
@@ -445,15 +460,7 @@ class SessionManager:
     def list_sessions(self, cwd: str | None = None) -> list[dict[str, Any]]:
         """Return lightweight info dicts for all sessions (memory + database)."""
         normalized_cwd = _normalize_cwd_for_compare(cwd) if cwd else None
-        db = self._get_db()
-        persisted_rows: dict[str, dict[str, Any]] = {}
-
-        if db is not None:
-            try:
-                for row in db.list_sessions_rich(source="acp", limit=1000):
-                    persisted_rows[str(row["id"])] = dict(row)
-            except Exception:
-                logger.debug("Failed to load ACP sessions from DB", exc_info=True)
+        persisted_rows = self._catalog_rows()
 
         # Collect in-memory sessions first.
         with self._lock:
@@ -515,6 +522,13 @@ class SessionManager:
 
         results.sort(key=lambda item: _updated_at_sort_key(item.get("updated_at")), reverse=True)
         return results
+
+    def _catalog_rows(self) -> dict[str, dict[str, Any]]:
+        from acp_adapter.catalog import read_catalog_rows
+        from pathlib import Path
+
+        path = Path(self._db_instance.db_path) if self._db_instance is not None else get_hermes_home() / "state.db"
+        return read_catalog_rows(path)
 
     def update_cwd(self, session_id: str, cwd: str) -> Optional[SessionState]:
         """Update the working directory for a session and its tool overrides."""

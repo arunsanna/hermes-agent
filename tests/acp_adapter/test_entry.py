@@ -10,6 +10,10 @@ def test_main_enables_unstable_protocol(monkeypatch):
     calls = {}
 
     async def fake_run_agent(agent, **kwargs):
+        from acp_adapter.server import HermesACPAgent
+
+        assert isinstance(agent, HermesACPAgent)
+        assert agent.session_manager is not None
         calls["kwargs"] = kwargs
 
     monkeypatch.setattr(entry, "_setup_logging", lambda: None)
@@ -98,4 +102,4 @@ def test_setup_browser_is_one_explicit_package_request(monkeypatch):
 
     entry.main(["--setup-browser", "--yes"])
 
-    assert calls == [("agent-browser", {"explicit": True})]
+    assert calls == [("chromium", {"explicit": True})]
