@@ -370,6 +370,18 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
         apply_row_annotations(messages, result['annotations'])
         return result['count']
 
+    def append_messages_atomic(self, session_id, messages):
+        # transcript.append already inserts the whole protocol group in the owner receipt transaction.
+        return self.append_messages_batch(session_id, [dict(message) for message in messages])
+
+    def rewrite_message_content(self, session_id, tool_call_id, content, *, expected_content):
+        self._session(session_id)
+        if not tool_call_id:
+            return False
+        return self._apply('transcript.rewrite_tool_result', {
+            'tool_call_id': tool_call_id, 'content': content, 'expected_content': expected_content,
+        })['value']
+
     def try_acquire_session_turn_lease(self, session_id, holder, *, ttl_seconds=300.0, patience_s=None):
         self._session(session_id)
         return self._apply('turn.acquire', {'holder': holder, 'ttl_seconds': ttl_seconds})['value']

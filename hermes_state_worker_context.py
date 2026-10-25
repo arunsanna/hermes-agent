@@ -87,3 +87,17 @@ def worker_row_role(db, conn, session_id, payload):
     row = conn.execute('SELECT role FROM messages WHERE id=? AND session_id=? AND active=1',
                        (payload['row_id'], session_id)).fetchone()
     return {'value': row[0] if row else None}
+
+
+def worker_rewrite_tool_result(db, conn, session_id, payload):
+    """Compare-and-swap an owned active tool result inside its durable receipt."""
+    if (set(payload) != {'tool_call_id', 'content', 'expected_content'}
+            or not isinstance(payload['tool_call_id'], str) or not payload['tool_call_id']):
+        raise RuntimeStoreError('invalid_params')
+    changed = conn.execute(
+        "UPDATE messages SET content=?, api_content=NULL "
+        "WHERE session_id=? AND tool_call_id=? AND role='tool' AND active=1 AND content=?",
+        (db._encode_content(payload['content']), session_id, payload['tool_call_id'],
+         db._encode_content(payload['expected_content'])),
+    )
+    return {'value': changed.rowcount > 0}

@@ -3,15 +3,16 @@ the agent core calls must exist on the store, accept the same keywords, and answ
 owner's SessionDB (Adolanium reg-1 was one missing keyword; the sweep found two missing reads:
 the failed-turn boundary's tail role and in-place compaction's held-row liveness)."""
 import ast
+import copy
 import inspect
 from pathlib import Path
 import re
 
 import pytest
 
-from agent.runtime_session_store import RuntimeSessionStore
+from agent.runtime_session_store import RuntimeSessionStore, WorkerPersistenceError
 from hermes_state import SessionDB
-from hermes_state_runtime import begin_runtime_epoch, mutate_worker_execution, register_worker_execution
+from hermes_state_runtime import RuntimeStoreError, begin_runtime_epoch, mutate_worker_execution, register_worker_execution
 
 ROOT = Path(__file__).resolve().parents[2]
 # The agent core: everything a worker's AIAgent runs (tools open their own handles, or refuse).
@@ -66,3 +67,84 @@ def test_tail_reads_answer_like_the_owner(tmp_path):
             store.close()
     finally:
         db.close()
+
+
+@pytest.fixture
+def worker_store(tmp_path):
+    db = SessionDB(tmp_path / 'state.db')
+    db.create_session('s', 'cli')
+    db.create_session('other', 'cli')
+    epoch = begin_runtime_epoch(db, instance_id='fixture')
+    scope = dict(epoch=epoch, execution_id='worker', session_id='s', generation=0)
+    register_worker_execution(db, **scope, kind='compute', adoption_secret='fixture')
+    calls = []
+
+    def rpc(method, **params):
+        calls.append(copy.deepcopy(params))
+        return mutate_worker_execution(db, **params)
+
+    store = RuntimeSessionStore(rpc, scope, tmp_path / 'outbox')
+    try:
+        yield db, store, calls
+    finally:
+        store.close()
+        db.close()
+
+
+def test_atomic_observation_rolls_back_and_replays_without_mutating_input(worker_store, monkeypatch):
+    db, store, calls = worker_store
+    db.append_messages_batch('s', [{'role': 'user', 'content': 'question'}])
+    pair = [
+        {'role': 'assistant', 'content': None, 'tool_calls': [
+            {'id': 'required', 'type': 'function', 'function': {'name': 'observe', 'arguments': '{}'}}]},
+        {'role': 'tool', 'tool_call_id': 'required', 'content': 'observed'},
+    ]
+    original = copy.deepcopy(pair)
+
+    def fail_after_insert(*args, **kwargs):
+        raise RuntimeError('injected before owner commit')
+
+    with monkeypatch.context() as patch:
+        patch.setattr(db, '_bump_session_counters', fail_after_insert)
+        with pytest.raises(RuntimeError, match='injected before owner commit'):
+            store.append_messages_atomic('s', pair)
+    assert [m['role'] for m in db.get_messages('s')] == ['user']
+    assert pair == original
+    assert store.retry_pending()[0]['count'] == 2
+    assert [m['role'] for m in db.get_messages('s')] == ['user', 'assistant', 'tool']
+    assert pair == original
+    assert mutate_worker_execution(db, **calls[-1])['count'] == 2
+    assert len(db.get_messages('s')) == 3
+    with pytest.raises(WorkerPersistenceError, match='permission_denied'):
+        store.append_messages_atomic('other', pair)
+
+
+def test_tool_result_cas_is_owned_active_and_receipt_idempotent(worker_store):
+    db, store, calls = worker_store
+    for sid in ['s', 'other']:
+        db.append_messages_batch(sid, [
+            {'role': 'user', 'content': 'question'},
+            {'role': 'assistant', 'content': None, 'tool_calls': [
+                {'id': 'tool', 'type': 'function', 'function': {'name': 'observe', 'arguments': '{}'}}]},
+            {'role': 'tool', 'tool_call_id': 'tool', 'content': 'pixels', 'api_content': 'sidecar'},
+        ])
+    assert store.rewrite_message_content('s', 'tool', 'stub', expected_content='wrong') is False
+    assert db.get_messages('s')[-1]['content'] == 'pixels'
+    assert store.rewrite_message_content('s', 'tool', 'stub', expected_content='pixels') is True
+    receipt = calls[-1]
+    assert mutate_worker_execution(db, **receipt) == {'value': True}
+    assert store.rewrite_message_content('s', 'tool', 'again', expected_content='pixels') is False
+    assert db.get_messages('s')[-1]['content'] == 'stub'
+    assert db.get_messages('other')[-1]['content'] == 'pixels'
+    with db._read_ctx() as conn:
+        row = conn.execute("SELECT api_content FROM messages WHERE session_id='s' AND role='tool'").fetchone()
+    assert row[0] is None
+    with pytest.raises(WorkerPersistenceError, match='permission_denied'):
+        store.rewrite_message_content('other', 'tool', 'stolen', expected_content='pixels')
+    with pytest.raises(RuntimeStoreError):
+        mutate_worker_execution(db, **dict(receipt, session_id='other'))
+    db._execute_write(lambda conn: conn.execute("UPDATE messages SET active=0 WHERE session_id='s' AND role='tool'"))
+    assert store.rewrite_message_content('s', 'tool', 'inactive', expected_content='stub') is False
+    db.append_message('s', 'user', 'pixels', tool_call_id='not-tool')
+    assert store.rewrite_message_content('s', 'not-tool', 'stub', expected_content='pixels') is False
+    assert db.get_messages('s')[-1]['content'] == 'pixels'
