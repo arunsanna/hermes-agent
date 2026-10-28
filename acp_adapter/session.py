@@ -378,6 +378,11 @@ class SessionManager:
         agent = self._make_agent(session_id=session_id, cwd=cwd)
         self._owned_sessions.add(session_id)
         state = self._install_state(session_id, agent, cwd, getattr(agent, "model", "") or "", [])
+        # Switchboard keeps new sessions across gateway restarts, even before
+        # their first prompt. Other ACP editor probes remain ephemeral.
+        if os.environ.get("HERMES_SESSION_PLATFORM") == "switchboard":
+            if self._get_db() is None or not self._persist(state, persist_history=False, persist_empty=True):
+                raise RuntimeError("Could not persist new Switchboard ACP session")
         logger.info("Created ACP session %s (cwd=%s)", session_id, cwd)
         return state
 
@@ -669,6 +674,7 @@ class SessionManager:
         state: SessionState,
         *,
         persist_history: bool = True,
+        persist_empty: bool = False,
     ) -> bool:
         """Write session state to the database.
 
@@ -698,7 +704,7 @@ class SessionManager:
         try:
             existing = db.get_session(state.session_id)
             if existing is None:
-                if not state.history:
+                if not state.history and not persist_empty:
                     # Empty editor probes stay ephemeral; copied fork history persists.
                     return True
                 db.create_session(
