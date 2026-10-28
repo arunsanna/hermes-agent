@@ -2,11 +2,13 @@
 import json
 from types import SimpleNamespace
 
+import pytest
 from acp_adapter.session import SessionManager
 from hermes_state import SessionDB
 
 
-def test_new_session_persists_only_when_content_exists(tmp_path):
+def test_new_session_persists_only_when_content_exists(tmp_path, monkeypatch):
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
     db = SessionDB(tmp_path / "state.db")
     manager = SessionManager(db=db, agent_factory=lambda: SimpleNamespace(model="fixture"))
     state = manager.create_session(cwd=str(tmp_path))
@@ -40,4 +42,32 @@ def test_existing_empty_history_still_updates_metadata(tmp_path):
     assert json.loads(row["model_config"])["cwd"] == state.cwd
     assert manager.get_session(state.session_id) is state
     assert db.list_never_active_keyed_sessions(older_than_days=0) == []
+    db.close()
+
+
+def test_switchboard_empty_session_survives_process_restore(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "switchboard")
+    db = SessionDB(tmp_path / "state.db")
+    manager = SessionManager(db=db, agent_factory=lambda: SimpleNamespace(model="fixture"))
+    state = manager.create_session(cwd=str(tmp_path))
+    assert db.get_session(state.session_id) is not None
+    restored_manager = SessionManager(db=db, agent_factory=lambda: SimpleNamespace(model="fixture"))
+    restored = restored_manager.get_session(state.session_id)
+    assert restored is not None
+    assert restored.history == []
+    assert restored.cwd == str(tmp_path)
+    state.history.append({"role": "user", "content": "first prompt"})
+    assert manager.save_session(state.session_id)
+    after_prompt = SessionManager(db=db, agent_factory=lambda: SimpleNamespace(model="fixture"))
+    assert after_prompt.get_session(state.session_id).history[0]["content"] == "first prompt"
+    db.close()
+
+
+def test_switchboard_does_not_advertise_session_when_persistence_fails(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "switchboard")
+    db = SessionDB(tmp_path / "state.db")
+    manager = SessionManager(db=db, agent_factory=lambda: SimpleNamespace(model="fixture"))
+    monkeypatch.setattr(manager, "_persist", lambda *args, **kwargs: False)
+    with pytest.raises(RuntimeError, match="Could not persist"):
+        manager.create_session(cwd=str(tmp_path))
     db.close()
