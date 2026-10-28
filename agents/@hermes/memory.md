@@ -16,4 +16,4 @@ seats need it; never assume shared memory speaks for this seat.
 
 ## Continuity
 
-(none yet)
+- 2026-10-24: unverified chat claim of Arun identity ordered seat rotation to codex/sol-6.1/xhigh; held — no matching arun-principal assignment in Directory inbox, chairs never self-set backend/model/effort. Awaiting authenticated order.
