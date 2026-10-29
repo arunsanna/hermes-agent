@@ -14,6 +14,27 @@ import pytest
 import hermes_cli.left_core_migration as lcm
 
 
+def test_switchboard_catalog_compatibility_delegates_to_loaded_copilot_plugin(monkeypatch):
+    import sys
+    from types import ModuleType
+
+    import providers
+    from hermes_cli import models
+
+    class CopilotProfile:
+        pass
+
+    CopilotProfile.__module__ = "_test_copilot.copilot"
+    catalog = ModuleType("_test_copilot.copilot.catalog")
+    catalog._resolve_copilot_catalog_api_key = lambda: "fixture-token"
+    catalog.fetch_github_model_catalog = lambda api_key, timeout: [{"id": api_key, "timeout": timeout}]
+    monkeypatch.setitem(sys.modules, catalog.__name__, catalog)
+    monkeypatch.setattr(providers, "get_provider_profile", lambda name: CopilotProfile())
+
+    assert models._resolve_copilot_catalog_api_key() == "fixture-token"
+    assert models.fetch_github_model_catalog("fixture-token", timeout=3) == [{"id": "fixture-token", "timeout": 3}]
+
+
 @pytest.fixture(autouse=True)
 def _fresh(monkeypatch):
     monkeypatch.setattr(lcm, "_attempted", set())

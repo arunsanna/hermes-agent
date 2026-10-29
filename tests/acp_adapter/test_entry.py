@@ -6,6 +6,16 @@ import pytest
 from acp_adapter import entry
 
 
+def test_print_runtime_command_exposes_switchboard_bootstrap(capsys):
+    import json
+
+    entry.main(["--print-runtime-command"])
+    command = json.loads(capsys.readouterr().out)
+    assert len(command) == 4
+    assert command[1:3] == ["-I", "-c"]
+    assert command[3].endswith("runpy.run_module('hermes_cli.main', run_name='__main__', alter_sys=True)")
+
+
 @pytest.mark.parametrize("failure", [None, KeyboardInterrupt, RuntimeError])
 def test_main_enables_unstable_protocol(monkeypatch, failure):
     calls = {}

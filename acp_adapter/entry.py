@@ -162,6 +162,12 @@ def _warm_memory_provider_import(logger: logging.Logger) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     """Entry point: load env, configure logging, run the ACP agent."""
+    arguments = sys.argv[1:] if argv is None else argv
+    if arguments[:1] == ["--print-runtime-command"]:
+        # Switchboard's catalog and headless helpers need this source-launcher contract too.
+        from hermes_cli._launchers import print_runtime_command
+
+        return print_runtime_command(Path(__file__).resolve().parent.parent, arguments[1:])
     args = _parse_args(argv)
     for flag, action in (("version", _print_version), ("check", _run_check), ("setup", _run_setup)):
         if getattr(args, flag):

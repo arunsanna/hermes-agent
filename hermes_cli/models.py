@@ -665,6 +665,25 @@ def _fetch_synapse_capabilities(
     return capabilities
 
 
+def _switchboard_copilot_catalog():
+    """Resolve the installed provider's catalog for older Switchboard gateways."""
+    import importlib
+    from providers import get_provider_profile
+
+    profile = get_provider_profile("copilot")
+    if profile is None:
+        raise RuntimeError("Copilot provider plugin is not installed")
+    return importlib.import_module(f"{type(profile).__module__}.catalog")
+
+
+def _resolve_copilot_catalog_api_key() -> str:
+    return _switchboard_copilot_catalog()._resolve_copilot_catalog_api_key()
+
+
+def fetch_github_model_catalog(api_key: Optional[str] = None, timeout: float = 5.0):
+    return _switchboard_copilot_catalog().fetch_github_model_catalog(api_key=api_key, timeout=timeout)
+
+
 def synapse_model_reasoning_capabilities(
     model: Optional[str], base_url: Optional[str], *, timeout: float = 6.0
 ) -> Optional[dict[str, Any]]:
