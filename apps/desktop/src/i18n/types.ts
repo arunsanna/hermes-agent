@@ -652,6 +652,10 @@ catalog: CatalogTranslations
         versionLabel: string
         reviewedPin: (sha: string) => string
         latestCommit: string
+        sourceMoved: (sha: string) => string
+        legacyBackendConfirm: string
+        installAnyway: string
+        partialInstall: (sha: string) => string
         nothingToInstall: string
         includesHeading: string
         agentLabel: string

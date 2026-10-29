@@ -844,6 +844,17 @@ export const frOverrides = {
         versionLabel: 'Version',
         reviewedPin: sha => (sha ? `Pin examiné ${sha}` : 'Pin examiné'),
         latestCommit: 'Dernier commit',
+        sourceMoved: sha =>
+          sha
+            ? `Le dépôt a changé depuis votre examen. Examinez la nouvelle version (commit ${sha}) avant de l'installer.`
+            : 'Le dépôt a changé depuis votre examen. Lecture de la nouvelle version…',
+        legacyBackendConfirm:
+          'Ce backend est plus ancien que cette application : il ne peut pas garantir que la version examinée est celle qui sera installée. Si le dépôt a changé depuis, c\'est la version plus récente qui s\'installe. Mettez à jour le backend pour obtenir cette garantie.',
+        installAnyway: 'Installer quand même',
+        partialInstall: sha =>
+          sha
+            ? `Le plugin n'est installé qu'en partie : la partie agent est installée au commit ${sha}, mais la partie bureau n'a pas pu suivre car le dépôt a changé depuis votre examen. Activez Forcer la réinstallation dans Avancé pour remplacer les deux parties par la version affichée, ou annulez pour ne garder que la partie agent.`
+            : 'Le plugin n\'est installé qu\'en partie : la partie agent est installée, mais la partie bureau n\'a pas pu suivre car le dépôt a changé depuis votre examen. Activez Forcer la réinstallation dans Avancé pour remplacer les deux parties par la version affichée, ou annulez pour ne garder que la partie agent.',
         nothingToInstall: 'Ce paquet n’a rien à installer ici.'
       }
     },
