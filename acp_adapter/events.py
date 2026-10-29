@@ -17,7 +17,7 @@ from contextvars import ContextVar
 from typing import Any, Callable, Deque, Dict
 
 import acp
-from acp.schema import AgentPlanUpdate, PlanEntry
+from acp.schema import AgentPlanUpdate, PlanEntry, SessionInfoUpdate
 
 from .tools import (
     _json_loads_maybe,
@@ -286,6 +286,7 @@ def make_tool_progress_cb(
     child_calls: Dict[str, str] = {}
     child_last_activity: Dict[str, str] = {}
     child_early_terminals: Dict[str, tuple[str, Dict[str, Any]]] = {}
+    child_transcript_refs: Dict[str, SessionInfoUpdate] = {}
     child_lock = threading.Lock()
 
     def _send_child_terminal(
@@ -372,6 +373,9 @@ def make_tool_progress_cb(
                 value = kwargs.get(key)
                 if value is not None:
                     raw_arguments[out_key] = value
+            is_runtime_child = bool(kwargs.get("parent_tool_call_id")) and "transcript_path" in kwargs
+            if is_runtime_child:
+                raw_arguments["expectsReference"] = True
             terminal = None
             with child_lock:
                 if sid in child_calls:
@@ -387,9 +391,26 @@ def make_tool_progress_cb(
                 # Preserve wire order against a controller timeout racing this
                 # start: the start is scheduled before a terminal can claim it.
                 _send_update(conn, session_id, loop, update)
+                if is_runtime_child:
+                    reference = SessionInfoUpdate(
+                        session_update="session_info_update",
+                        field_meta={"hermes": {"subagentTranscript": {
+                            "parentToolCallId": kwargs["parent_tool_call_id"],
+                            "childToolCallId": tc_id,
+                            "subagentId": sid,
+                            "taskIndex": kwargs.get("task_index"),
+                            "delegationId": kwargs.get("delegation_id"),
+                            "transcriptPath": kwargs["transcript_path"],
+                            "parentProfileHome": kwargs.get("parent_profile_home"),
+                        }}},
+                    )
+                    child_transcript_refs[sid] = reference
+                    _send_update(conn, session_id, loop, reference)
                 pending = child_early_terminals.pop(sid, None)
                 if pending is not None:
                     child_calls.pop(sid, None)
+                    if reference := child_transcript_refs.pop(sid, None):
+                        _send_update(conn, session_id, loop, reference)
                     terminal = (
                         tc_id,
                         pending[0],
@@ -431,12 +452,16 @@ def make_tool_progress_cb(
                 # Keep an in-progress heartbeat from overtaking a terminal
                 # update claimed concurrently on another worker thread.
                 _send_update(conn, session_id, loop, update)
+                if reference := child_transcript_refs.get(sid):
+                    _send_update(conn, session_id, loop, reference)
             return
 
         if event_type == "subagent.complete":
             with child_lock:
                 tc_id = child_calls.pop(sid, None)
                 last_activity = child_last_activity.pop(sid, None)
+                if reference := child_transcript_refs.pop(sid, None):
+                    _send_update(conn, session_id, loop, reference)
                 if (
                     tc_id is None
                     and kwargs.get("supervision_terminal")

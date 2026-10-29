@@ -505,12 +505,15 @@ def _route_overrides(route: Any) -> dict[str, Any]:
 def _build_children(
     task_list: list[dict[str, Any]], task_schemas: list[Optional[dict[str, Any]]], routes: list[Any], *,
     top_role: str, max_iterations: int, parent_agent,
-    live_deleg_id: Optional[str], live_writers: list, task_images: Optional[list[Optional[list[str]]]] = None,
+    live_deleg_id: Optional[str], live_writers: list, live_home: Optional[Path] = None,
+    task_images: Optional[list[Optional[list[str]]]] = None,
 ) -> tuple[list[tuple], Optional[str]]:
     """Build every child on the main thread (construction is not thread-safe), each on its task's route;
     ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure."""
     from tools.delegation_live_log import wrap_progress_callback
     from tools.delegation_output_schema import append_output_contract
+    from agent.tool_progress_relay import current_tool_call_id
+    parent_tool_call_id = current_tool_call_id()
     children = []
     for i, t in enumerate(task_list):
         route = routes[i]
@@ -548,11 +551,15 @@ def _build_children(
         if _writer is not None:
             child.tool_progress_callback = wrap_progress_callback(getattr(child, "tool_progress_callback", None), _writer)
             child._live_transcript_path = str(_writer.path)
+        _ident_ref = getattr(child, "_progress_identity_ref", None)
+        if isinstance(_ident_ref, dict) and parent_tool_call_id:
+            _ident_ref["parent_tool_call_id"] = parent_tool_call_id
+            _ident_ref["transcript_path"] = str(_writer.path) if _writer is not None else None
+            _ident_ref["parent_profile_home"] = str(live_home) if live_home and live_home.is_absolute() else None
         if route.report() is not None:
             child._delegate_route = route.report()
         if live_deleg_id:
             child._delegation_id = live_deleg_id
-            _ident_ref = getattr(child, "_progress_identity_ref", None)
             if isinstance(_ident_ref, dict):
                 _ident_ref["delegation_id"] = live_deleg_id
         children.append((i, t, child))
@@ -738,7 +745,8 @@ def delegate_task(
 
     children, err = _build_children(
         task_list, task_schemas, routes, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
-        live_deleg_id=controller_deleg_id if required else live_deleg_id, live_writers=live_writers, task_images=task_images,
+        live_deleg_id=controller_deleg_id if required else live_deleg_id, live_writers=live_writers,
+        live_home=_live_home, task_images=task_images,
     )
     if err:
         return tool_error(err)

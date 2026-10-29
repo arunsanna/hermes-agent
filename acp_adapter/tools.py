@@ -890,6 +890,9 @@ def _delegate_raw_input(arguments: Args) -> Dict[str, Any]:
     out: Dict[str, Any] = {"tool": "delegate_task"}
     raw_args: Dict[str, Any] = {}
     tasks = arguments.get("tasks")
+    if isinstance(tasks, str):
+        from tools.delegate_tool_tasks import _recover_tasks_from_json_string
+        tasks, _ = _recover_tasks_from_json_string(tasks)
     if isinstance(tasks, list) and tasks:
         bounded = []
         for task in tasks:

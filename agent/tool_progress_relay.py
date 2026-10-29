@@ -23,6 +23,7 @@ _MIN_INTERVAL_S = 0.5
 
 ProgressReporter = Callable[[float, Optional[float], Optional[str]], None]
 _current: contextvars.ContextVar[Optional[ProgressReporter]] = contextvars.ContextVar("tool_progress_reporter", default=None)
+_current_call_id: contextvars.ContextVar[str] = contextvars.ContextVar("tool_progress_call_id", default="")
 
 
 def _reporter(callback, tool_name: str, tool_call_id: str) -> ProgressReporter:
@@ -49,15 +50,22 @@ def _reporter(callback, tool_name: str, tool_call_id: str) -> ProgressReporter:
 def bound_tool_progress(callback, tool_name: str, tool_call_id: str) -> Iterator[None]:
     """Bind this call's relay for the block (no-op when the agent has no progress callback)."""
     token = _current.set(_reporter(callback, tool_name, tool_call_id or "") if callback else None)
+    call_token = _current_call_id.set(tool_call_id or "")
     try:
         yield
     finally:
+        _current_call_id.reset(call_token)
         _current.reset(token)
 
 
 def current_tool_progress() -> Optional[ProgressReporter]:
     """The running call's reporter, or None outside a dispatched tool call."""
     return _current.get()
+
+
+def current_tool_call_id() -> str:
+    """Call identity captured by tools before child work moves to another thread."""
+    return _current_call_id.get()
 
 
 def tool_progress_payload(name: Optional[str], message: Optional[str], kwargs: dict) -> dict:

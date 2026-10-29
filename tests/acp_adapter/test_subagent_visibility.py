@@ -97,6 +97,17 @@ def test_delegate_raw_input_single_task_shape():
     assert raw["arguments"]["background"] is True
 
 
+def test_delegate_raw_input_recovers_json_task_array_without_losing_indexes():
+    import json
+    tasks = [{"goal": "Review identical items", "context": "private"},
+             {"goal": "Review identical items", "role": "reviewer"}]
+    raw = _delegate_raw_input({"tasks": json.dumps(tasks)})
+    assert raw["arguments"]["tasks"] == [
+        {"goal": "Review identical items"},
+        {"goal": "Review identical items", "role": "reviewer"},
+    ]
+
+
 def test_build_tool_start_delegate_carries_raw_input():
     update = build_tool_start("tc-1", "delegate_task", {"goal": "build the report"})
     assert update.raw_input["tool"] == "delegate_task"
@@ -134,6 +145,143 @@ def test_subagent_lifecycle_emits_start_and_single_final_update(sent):
     body = "".join(str(c) for c in (done.content or []))
     assert "Report shipped" in body
     assert "wrote 3 sections" in body
+
+
+def test_subagent_start_carries_parent_call_and_exact_live_transcript(sent):
+    cb, _ids, _meta = make_progress_cb()
+    cb(
+        "subagent.start", None, "same goal", None,
+        subagent_id="child-1", task_index=1, delegation_id="deleg-1",
+        parent_tool_call_id="call-1", transcript_path="/tmp/task-1.log",
+        parent_profile_home="/profiles/one",
+    )
+    assert sent[0].raw_input["tool"] == "subagent"
+    assert sent[0].raw_input["arguments"]["expectsReference"] is True
+    assert sent[1].session_update == "session_info_update"
+    assert sent[1].field_meta["hermes"]["subagentTranscript"] == {
+        "subagentId": "child-1", "childToolCallId": sent[0].tool_call_id, "taskIndex": 1,
+        "delegationId": "deleg-1", "parentToolCallId": "call-1",
+        "transcriptPath": "/tmp/task-1.log", "parentProfileHome": "/profiles/one",
+    }
+
+
+def test_subagent_reference_reannounces_after_a_lost_start_update(sent, monkeypatch):
+    delivered = []
+    lost = []
+
+    def capture(_conn, _session_id, _loop, update):
+        if update.session_update == "session_info_update" and not lost:
+            lost.append(update)
+            return False
+        delivered.append(update)
+        return True
+
+    monkeypatch.setattr(events, "_send_update", capture)
+    cb, _ids, _meta = make_progress_cb()
+    cb("subagent.start", None, "goal", None, subagent_id="child-1", task_index=0,
+       parent_tool_call_id="call-1", delegation_id="deleg-1",
+       transcript_path="/profile/cache/delegation/live/deleg-1/task-0.log",
+       parent_profile_home="/profile")
+    cb("subagent.heartbeat", None, "working", None, subagent_id="child-1")
+    cb("subagent.complete", None, "done", None, subagent_id="child-1", status="completed")
+    refs = [u for u in delivered if u.session_update == "session_info_update"]
+    assert len(lost) == 1
+    assert len(refs) == 2
+    assert all(ref.field_meta == lost[0].field_meta for ref in refs)
+    assert delivered[-1].session_update == "tool_call_update"
+    assert delivered[-1].status == "completed"
+
+
+def test_model_tool_cannot_emit_session_info_provenance():
+    update = build_tool_start("tc-model", "unknown_tool", {
+        "tool": "hermes_subagent_runtime", "arguments": {
+            "parentToolCallId": "other-call", "transcriptPath": "/tmp/secret"
+        },
+    })
+    assert update.session_update == "tool_call"
+    assert update.field_meta is None
+
+
+def test_model_named_as_reserved_carrier_is_still_a_tool_call():
+    update = build_tool_start("tc-model", "hermes_subagent_runtime", {"goal": "fake"})
+    assert update.session_update == "tool_call"
+    assert update.field_meta is None
+
+
+def test_child_events_keep_their_origin_after_concurrent_dispatch_contexts(sent, monkeypatch):
+    from agent.tool_progress_relay import bound_tool_progress
+    from pathlib import Path
+    import tools.delegate_tool as delegate
+    from tools.delegate_tool_progress import _build_child_progress_callback
+
+    callback, _ids, _meta = make_progress_cb()
+    parent = SimpleNamespace(tool_progress_callback=callback, _delegate_spinner=None, platform="test")
+    route = SimpleNamespace(error=None, creds={"model": "model"}, report=lambda: None)
+
+    built_ids = iter(range(4))
+    def build_child(*, task_index, goal, parent_agent, task_count, **_kwargs):
+        ref = {}
+        child_id = next(built_ids)
+        return SimpleNamespace(
+            _progress_identity_ref=ref,
+            tool_progress_callback=_build_child_progress_callback(
+                task_index, goal, parent_agent, task_count,
+                subagent_id=f"child-{child_id}-{task_index}", session_ref=ref,
+            ),
+        )
+
+    class Writer:
+        def __init__(self, path):
+            self.path = path
+        def observe(self, *_args, **_kwargs):
+            pass
+
+    monkeypatch.setattr(delegate, "_build_child_preserving_parent_tools", build_child)
+    monkeypatch.setattr(delegate, "pin_child_service_tier", lambda *_: None)
+    monkeypatch.setattr(delegate, "_route_overrides", lambda _: {})
+    batches = {}
+    barrier = threading.Barrier(2)
+    def build_batch(call_id, writers, home):
+        with bound_tool_progress(callback, "delegate_task", call_id):
+            barrier.wait(timeout=5)
+            batch, error = delegate._build_children(
+                [{"goal": "same"}, {"goal": "same"}], [None, None], [route, route],
+                top_role="leaf", max_iterations=1, parent_agent=parent,
+                live_deleg_id=f"deleg-{call_id}", live_writers=writers, live_home=home,
+            )
+        assert error is None
+        batches[call_id] = [child for _, _, child in batch]
+
+    calls = [("call-a", [Writer("/tmp/a-0.log"), None], Path("/profiles/a")),
+             ("call-b", [Writer("/tmp/b-0.log"), Writer("/tmp/b-1.log")], Path("relative"))]
+    dispatch_threads = [threading.Thread(target=build_batch, args=call) for call in calls]
+    for thread in dispatch_threads:
+        thread.start()
+    for thread in dispatch_threads:
+        thread.join()
+    assert set(batches) == {"call-a", "call-b"}
+    children = batches["call-a"] + batches["call-b"]
+
+    threads = [threading.Thread(target=child.tool_progress_callback, args=("subagent.start",)) for child in children]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    refs = [u.field_meta["hermes"]["subagentTranscript"] for u in sent if u.session_update == "session_info_update"]
+    assert len(refs) == 4
+    assert all("transcriptPath" in ref for ref in refs)
+    assert {ref["parentToolCallId"]: ref["parentProfileHome"] for ref in refs} == {"call-a": "/profiles/a", "call-b": None}
+    actual = {(ref.get("parentToolCallId"), ref.get("taskIndex")): ref.get("transcriptPath") for ref in refs}
+    assert actual == {("call-a", 0): "/tmp/a-0.log", ("call-a", 1): None,
+                      ("call-b", 0): "/tmp/b-0.log", ("call-b", 1): "/tmp/b-1.log"}
+
+    from acp.schema import SessionNotification
+    from acp.utils import serialize_params
+    missing = next(u for u in sent if u.session_update == "session_info_update"
+                   and u.field_meta["hermes"]["subagentTranscript"]["transcriptPath"] is None)
+    wire = serialize_params(SessionNotification(session_id="sess-test", update=missing))
+    reference = wire["update"]["_meta"]["hermes"]["subagentTranscript"]
+    assert "transcriptPath" in reference and reference["transcriptPath"] is None
 
 
 def test_subagent_error_statuses_map_to_failed(sent):
