@@ -190,7 +190,6 @@ def main(argv: list[str] | None = None) -> None:
     install_truststore()
 
     import acp
-    from .server import HermesACPAgent
 
     # Windows: import the configured memory provider (and numpy) on the main thread before
     # the ACP stdin-reader thread starts. A first-time native-extension import racing another
@@ -198,28 +197,44 @@ def main(argv: list[str] | None = None) -> None:
     if sys.platform == "win32":
         _warm_memory_provider_import(logger)
 
-    # Switchboard owns one direct ACP process per session, without a Hermes daemon.
-    if os.environ.get("HERMES_ACP_SKIP_CONFIGURED_MCP", "").strip() != "1":
+    switchboard = os.environ.get("HERMES_SESSION_PLATFORM", "").strip().lower() == "switchboard"
+    if switchboard:
+        # Switchboard owns one direct ACP process per session, without a Hermes daemon.
+        if os.environ.get("HERMES_ACP_SKIP_CONFIGURED_MCP", "").strip() != "1":
+            try:
+                from hermes_cli.mcp_startup import start_background_mcp_discovery
+
+                start_background_mcp_discovery(logger=logger, thread_name="acp-mcp-discovery")
+            except Exception:
+                logger.debug("MCP tool discovery failed at ACP startup", exc_info=True)
+        from .server import HermesACPAgent
+        from .session import SessionManager
+
+        agent = HermesACPAgent(session_manager=SessionManager())
+    else:
+        # Other ACP clients use upstream's gateway-owned execution lifecycle.
+        from .gateway_server import GatewayACPAgent
+
+        agent = GatewayACPAgent()
+
+    async def serve():
         try:
-            from hermes_cli.mcp_startup import start_background_mcp_discovery
+            await acp.run_agent(agent, use_unstable_protocol=True)
+        finally:
+            if not switchboard:
+                await agent.aclose()
 
-            start_background_mcp_discovery(logger=logger, thread_name="acp-mcp-discovery")
-        except Exception:
-            logger.debug("MCP tool discovery failed at ACP startup", exc_info=True)
-
-    from .session import SessionManager
-
-    agent = HermesACPAgent(session_manager=SessionManager())
     try:
-        asyncio.run(acp.run_agent(agent, use_unstable_protocol=True))
+        asyncio.run(serve())
     except KeyboardInterrupt:
         logger.info("Shutting down (KeyboardInterrupt)")
     except Exception:
         logger.exception("ACP agent crashed")
         sys.exit(1)
     finally:
-        # The stdio owner is gone; a later load/resume reopens its persisted row.
-        agent.session_manager.end_all_sessions()
+        if switchboard:
+            # The direct stdio owner is gone; a later load/resume reopens its persisted row.
+            agent.session_manager.end_all_sessions()
 
 
 if __name__ == "__main__":

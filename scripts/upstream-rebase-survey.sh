@@ -26,10 +26,12 @@ echo "  our patches replayed on top: $(git rev-list --count "$BASE".."$BRANCH")"
 
 echo
 echo "== conflict surface (merge-tree preview of $BRANCH onto $NEWTAG) =="
-if git merge-tree --write-tree --name-only "$NEWTAG" "$BRANCH" >/tmp/_mt 2>&1; then
+MERGE_PREVIEW="$(mktemp)"
+trap 'rm -f "$MERGE_PREVIEW"' EXIT
+if git merge-tree --write-tree --name-only "$NEWTAG" "$BRANCH" >"$MERGE_PREVIEW" 2>&1; then
   echo "  CLEAN — no conflicts. Rebase should be trivial."
 else
-  grep -E '^CONFLICT|^[a-z].*\.py$' /tmp/_mt | grep -viE '^auto-merging' | sed 's/^/  /' || true
+  grep -E '^CONFLICT|^[a-z].*\.py$' "$MERGE_PREVIEW" | grep -viE '^auto-merging' | sed 's/^/  /' || true
 fi
 
 echo

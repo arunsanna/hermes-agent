@@ -10,6 +10,7 @@ from acp_adapter import entry
 def test_main_enables_unstable_protocol(monkeypatch, failure):
     calls = {}
     ended = []
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "switchboard")
     from acp_adapter.session import SessionManager
     monkeypatch.setattr(SessionManager, "end_all_sessions", lambda self: ended.append(self))
     monkeypatch.setattr(SessionManager, "cleanup", lambda self: pytest.fail("entry must not delete sessions"))
@@ -40,6 +41,7 @@ def test_main_enables_unstable_protocol(monkeypatch, failure):
 
 def test_main_skips_configured_mcp_discovery_when_requested(monkeypatch):
     discovery_calls = []
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "switchboard")
 
     async def fake_run_agent(agent, **kwargs):
         pass

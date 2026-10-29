@@ -44,6 +44,24 @@ EXPECTED_TEXT = "| Fruit | Count |\n|---|---|\n| apple | 1 |\n\nTotal: 1 fruit."
 
 
 class TestProvisionalStreamNewlinePreservation:
+    def test_held_output_never_reaches_display_even_after_provisional_flush(self):
+        for provisional in (False, True):
+            agent = _make_agent()
+            agent._hold_stream = True
+            agent._acp_provisional_stream_active = provisional
+            agent._acp_provisional_stream_buffer = []
+            delivered = []
+            agent.stream_delta_callback = delivered.append
+            agent.interim_assistant_callback = lambda text, **_: delivered.append(text)
+
+            agent._fire_stream_delta("raw response")
+            agent._fire_streamed_codex_commentary("raw commentary")
+            agent._emit_interim_assistant_message({"role": "assistant", "content": "raw interim"})
+            agent._finish_acp_provisional_stream(discard=False)
+
+            assert delivered == [], f"held output leaked with provisional={provisional}"
+            assert agent._current_streamed_assistant_text == ""
+
     def test_standalone_newline_deltas_survive_provisional_buffering(self):
         agent = _make_agent()
         agent._acp_provisional_stream_active = True

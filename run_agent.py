@@ -451,7 +451,9 @@ class AIAgent(
         self._compaction_prompt_drift_logged = False
         # Who wrote the current turn. build_turn_context() sets it at the start of every turn.
         self._turn_author = None
-        # Copilot x-initiator: True for the first API call of a user turn, False for tool-loop follow-ups.
+        # Provider hooks that failed in the old session (agent.provider_route_hooks) are asked again.
+        self._provider_hook_failures = set()
+        # True for the first API call of a user turn, False for tool-loop follow-ups (provider request_headers).
         self._is_user_initiated_turn = False
 
         self._transition_context_engine_session(
@@ -573,11 +575,6 @@ class AIAgent(
         url = str(base_url).lower() if base_url is not None else (getattr(self, "_base_url_lower", "") or "")
         return base_url_host_matches(url, "openai.azure.com")
 
-    def _is_github_copilot_url(self, base_url: str | None = None) -> bool:
-        """Return True when a base URL targets GitHub Copilot's OpenAI-compatible API."""
-        hostname = self._hostname_for(base_url)
-        return bool(hostname) and (hostname == "api.githubcopilot.com" or hostname.endswith(".githubcopilot.com"))
-
     def _resolved_api_call_timeout(self) -> float:
         """Per-call request timeout: per-model ``timeout_seconds`` > provider ``request_timeout_seconds`` >
         ``HERMES_API_TIMEOUT`` > 1800s."""
@@ -664,15 +661,6 @@ class AIAgent(
         """Return True when the base URL targets OpenRouter."""
         return base_url_host_matches(self._base_url_lower, "openrouter.ai")
 
-    def _is_copilot_url(self) -> bool:
-        """Return True when the base URL targets GitHub Copilot or GitHub Models."""
-        return any(base_url_host_matches(self._base_url_lower, h) for h in ("api.githubcopilot.com", "models.github.ai"))
-
-    def _is_copilot_provider(self) -> bool:
-        """True when the active provider is GitHub Copilot under any alias (``copilot`` / ``github-copilot`` /
-        ``github``) or by base URL; a bare equality check would silently skip credential recovery."""
-        return (self.provider or "").strip().lower() in {"copilot", "github-copilot", "github"} or self._is_copilot_url()
-
     def _is_codex_backend(self) -> bool:
         """Return True for the ChatGPT OAuth Codex Responses backend."""
         return (getattr(self, "api_mode", None) == "codex_responses"
@@ -704,19 +692,26 @@ class AIAgent(
         from hermes_cli.runtime_provider_backends import _is_external_process_provider
         if _is_external_process_provider(normalized_provider):
             return False
-        if normalized_provider == "copilot":
-            try:
-                from hermes_cli.models import _should_use_copilot_responses_api
-                return _should_use_copilot_responses_api(model)
-            except Exception:
-                pass  # fall back to the generic GPT-5 rule
+        # A provider serving several wires behind one endpoint decides per model (pure, no I/O).
+        from providers import get_provider_profile
+        profile = get_provider_profile(normalized_provider) if normalized_provider else None
+        from agent.provider_route_hooks import model_api_mode
+        derived = model_api_mode(profile, model) if profile is not None else None
+        if derived is not None:
+            return derived == "codex_responses"
         return AIAgent._model_requires_responses_api(model)
 
     def _max_tokens_param(self, value: int) -> dict:
-        """``max_completion_tokens`` for newer OpenAI families (and Azure / Copilot serving them), else
-        ``max_tokens``. URL-first, then model-name fallback for third-party endpoints fronting those models."""
-        if (self._is_direct_openai_url() or self._is_azure_openai_url() or self._is_github_copilot_url()
-                or model_forces_max_completion_tokens(self.model)):
+        """``max_completion_tokens`` for newer OpenAI families (and Azure / provider routes declaring it),
+        else ``max_tokens``. URL-first, then model-name fallback for third-party endpoints fronting those models."""
+        if self._is_direct_openai_url() or self._is_azure_openai_url():
+            return {"max_completion_tokens": value}
+        from agent.provider_route_hooks import route_answer
+        declared = route_answer("max_tokens_param", provider=getattr(self, "provider", "") or "", scope=self,
+                                base_url=getattr(self, "base_url", "") or "", model=self.model or "")
+        if declared:
+            return {declared: value}
+        if model_forces_max_completion_tokens(self.model):
             return {"max_completion_tokens": value}
         return {"max_tokens": value}
 
@@ -997,6 +992,8 @@ class AIAgent(
         _quietly(self._close_codex_session)
         if getattr(self, "_memory_manager", None) is not None:
             _quietly(self._memory_manager.release_soft)
+        from agent.prepared_compaction import release_for_agent
+        _quietly(release_for_agent, self)
 
     def close(self) -> None:
         """Release every resource this agent holds (idempotent); each phase is guarded so one failure never
@@ -1005,6 +1002,8 @@ class AIAgent(
         _quietly(self.shutdown_memory_provider, session_messages if isinstance(session_messages, list) else None)
         self._close_task_resources(getattr(self, "session_id", None) or "")
         self._close_active_children(soft=False)
+        from agent.prepared_compaction import release_for_agent
+        _quietly(release_for_agent, self)
         _quietly(self._drop_shared_client, lambda c: self._close_openai_client(c, reason="agent_close", shared=True))
         self._close_request_clients("agent_close")
         _quietly(self._close_codex_session)
@@ -1237,7 +1236,7 @@ class AIAgent(
 
     def _deliver_scrubbed_stream_delta(self, text: str) -> None:
         """Deliver scrubbed text, or hold it until the ACP response is classified."""
-        if not text or self._has_unconsumed_required_delegations():
+        if not text or getattr(self, "_hold_stream", False) or self._has_unconsumed_required_delegations():
             return
         if self._stream_writer_superseded():
             self._note_dropped_stream_writer("_deliver_scrubbed_stream_delta")
@@ -1319,7 +1318,7 @@ class AIAgent(
                 pass
 
     def _fire_streamed_codex_commentary(self, text: str) -> None:
-        if self._has_unconsumed_required_delegations():
+        if getattr(self, "_hold_stream", False) or self._has_unconsumed_required_delegations():
             return
         if getattr(self, "_acp_provisional_stream_active", False):
             buffer = list(getattr(self, "_acp_provisional_stream_buffer", []))
@@ -1343,7 +1342,7 @@ class AIAgent(
             logger.debug("interim_assistant_callback error", exc_info=True)
 
     def _emit_interim_assistant_message(self, assistant_msg: Dict[str, Any]) -> None:
-        if self._has_unconsumed_required_delegations():
+        if getattr(self, "_hold_stream", False) or self._has_unconsumed_required_delegations():
             return
         if getattr(self, "_acp_provisional_stream_active", False):
             buffer = list(getattr(self, "_acp_provisional_stream_buffer", []))
